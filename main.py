@@ -18,6 +18,12 @@ MIN_EXPECTED_RETURN = 0.01
 STOP_LOSS_RATE = -0.03
 CONDITION_PROCESS_INTERVAL_MS = 2000
 CONDITION_COOLDOWN_SECONDS = 60
+MAX_DAILY_CANDLE_COUNT = 120
+TR_REQUEST_INTERVAL_SECONDS = 0.35
+ORDER_REQUEST_INTERVAL_SECONDS = 0.25
+ACCOUNT_CACHE_SECONDS = 20
+DEPOSIT_CACHE_SECONDS = 10
+REALTIME_CODES_PER_SCREEN = 100
 
 FID_CODES = {
     "10": "현재가",
@@ -321,6 +327,14 @@ class Kiwoom(QAxWidget):
         self.bought_codes = set()
         self.order_prices = {}
         self.realtime_registered_codes = set()
+        self.realtime_code_screens = {}
+        self.last_tr_request_at = 0
+        self.last_order_request_at = 0
+        self.cached_deposit = None
+        self.deposit_updated_at = 0
+        self.cached_balance = []
+        self.cached_orders = []
+        self.account_updated_at = 0
         self.condition_timer = QTimer()
         self.condition_timer.timeout.connect(self.process_next_condition_stock)
 
@@ -493,8 +507,25 @@ class Kiwoom(QAxWidget):
         code_name = self.dynamicCall("GetMasterCodeName(QString)", code)
         return code_name
 
+    def wait_for_tr_slot(self):
+        elapsed = time.time() - self.last_tr_request_at
+        if elapsed < TR_REQUEST_INTERVAL_SECONDS:
+            time.sleep(TR_REQUEST_INTERVAL_SECONDS - elapsed)
+        self.last_tr_request_at = time.time()
+
+    def wait_for_order_slot(self):
+        elapsed = time.time() - self.last_order_request_at
+        if elapsed < ORDER_REQUEST_INTERVAL_SECONDS:
+            time.sleep(ORDER_REQUEST_INTERVAL_SECONDS - elapsed)
+        self.last_order_request_at = time.time()
+
+    def request_tr(self, rqname, trcode, next, screen_no):
+        self.wait_for_tr_slot()
+        return self.dynamicCall("CommRqData(QString, QString, int, QString)", rqname, trcode, next, screen_no)
+
     def load_conditions(self):
         self.condition_event_loop = QEventLoop()
+        self.wait_for_tr_slot()
         self.dynamicCall("GetConditionLoad()")
         self.condition_event_loop.exec_()
         return self.conditions
@@ -537,6 +568,7 @@ class Kiwoom(QAxWidget):
             return False
 
         name, index = selected
+        self.wait_for_tr_slot()
         result = self.dynamicCall(
             "SendCondition(QString, QString, int, int)",
             CONDITION_SCREEN_NO,
@@ -565,53 +597,73 @@ class Kiwoom(QAxWidget):
     def get_price(self, code):
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
         self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10081", "opt10081", 0, "0020")
+        self.request_tr("opt10081", "opt10081", 0, "0020")
         self.tr_event_loop.exec_()
-        time.sleep(1)
 
         total = self.tr_data
 
-        while self.isnext:
+        while self.isnext and len(total) < MAX_DAILY_CANDLE_COUNT:
             self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
             self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-            self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10081", "opt10081", 2, "0020")
+            self.request_tr("opt10081", "opt10081", 2, "0020")
             self.tr_event_loop.exec_()
             total += self.tr_data
-            time.sleep(1)
+
+        if len(total) > MAX_DAILY_CANDLE_COUNT:
+            total = total[:MAX_DAILY_CANDLE_COUNT]
         
         df = pd.DataFrame(total, columns=['date', 'open', 'high', 'low', 'close', 'volume']).set_index('date')
         df = df.drop_duplicates()
         df = df.sort_index()
         return df
 
-    def get_deposit(self):
+    def get_deposit(self, force=False):
+        now = time.time()
+        if not force and self.cached_deposit is not None and now - self.deposit_updated_at < DEPOSIT_CACHE_SECONDS:
+            return self.cached_deposit
+
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
         self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opw00001", "opw00001", 0, "0002")
+        self.request_tr("opw00001", "opw00001", 0, "0002")
         self.tr_event_loop.exec_()
-        return self.tr_data
+        self.cached_deposit = self.tr_data
+        self.deposit_updated_at = time.time()
+        return self.cached_deposit
 
     def send_order(self, rqname, screen_no, order_type, code, order_quantity, order_price, order_gubun, order_no = ""):
+        self.wait_for_order_slot()
         order_result = self.dynamicCall("SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)", [rqname, screen_no, self.account_number, order_type, code, order_quantity, order_price, order_gubun, order_no])
+        self.account_updated_at = 0
+        self.deposit_updated_at = 0
         return order_result
     
-    def get_order(self):
+    def get_order(self, force=False):
+        now = time.time()
+        if not force and now - self.account_updated_at < ACCOUNT_CACHE_SECONDS:
+            return self.cached_orders
+
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.dynamicCall("SetInputValue(QString, QString)", "전체종목구분", "0")
         self.dynamicCall("SetInputValue(QString, QString)", "체결구분", "0")
         self.dynamicCall("SetInputValue(QString, QString)", "매매구분", "0")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10075", "opt10075", 0, "0002")
+        self.request_tr("opt10075", "opt10075", 0, "0002")
         self.tr_event_loop.exec_()
-        return self.tr_data
+        self.cached_orders = self.tr_data
+        return self.cached_orders
 
-    def get_balance(self):
+    def get_balance(self, force=False):
+        now = time.time()
+        if not force and now - self.account_updated_at < ACCOUNT_CACHE_SECONDS:
+            return self.cached_balance
+
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
         self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opw00018", "opw00018", 0, "0002")
+        self.request_tr("opw00018", "opw00018", 0, "0002")
         self.tr_event_loop.exec_()
-        return self.tr_data
+        self.cached_balance = self.tr_data
+        return self.cached_balance
 
     def _on_receive_real_data(self, s_code, real_type, real_data):
         if real_type == "장시작시간":
@@ -676,12 +728,16 @@ class Kiwoom(QAxWidget):
             print("best.dat 로드 실패:", e)
             self.best = {}
 
-    def update_account_status(self):
+    def update_account_status(self, force=False):
+        now = time.time()
+        if not force and now - self.account_updated_at < ACCOUNT_CACHE_SECONDS:
+            return
+
         self.holding_codes = set()
         self.pending_order_codes = set()
 
         try:
-            for balance in self.get_balance():
+            for balance in self.get_balance(force=True):
                 code = self.normalize_code(balance[0])
                 self.holding_codes.add(code)
                 self.order_prices[code] = balance[3]
@@ -689,13 +745,15 @@ class Kiwoom(QAxWidget):
             print("잔고 조회 실패:", e)
 
         try:
-            for order in self.get_order():
+            for order in self.get_order(force=True):
                 code = self.normalize_code(order[0])
                 left_quantity = order[8]
                 if left_quantity > 0:
                     self.pending_order_codes.add(code)
         except Exception as e:
             print("미체결 조회 실패:", e)
+
+        self.account_updated_at = time.time()
 
     def should_skip_buy(self, code):
         if code in self.holding_codes:
@@ -756,6 +814,7 @@ class Kiwoom(QAxWidget):
         if code in self.realtime_registered_codes:
             return
 
+        screen_no = self.get_realtime_screen_no()
         fids = ";".join([
             get_fid("체결시간"),
             get_fid("현재가"),
@@ -766,12 +825,20 @@ class Kiwoom(QAxWidget):
             get_fid("(최우선)매수호가"),
             get_fid("누적거래량"),
         ])
-        opt_type = "0" if not self.realtime_registered_codes else "1"
-        self.set_real_reg(REALTIME_SCREEN_NO, code, fids, opt_type)
+        opt_type = "0" if screen_no not in self.realtime_code_screens.values() else "1"
+        self.set_real_reg(screen_no, code, fids, opt_type)
         self.realtime_registered_codes.add(code)
+        self.realtime_code_screens[code] = screen_no
+
+    def get_realtime_screen_no(self):
+        screen_offset = len(self.realtime_registered_codes) // REALTIME_CODES_PER_SCREEN
+        return str(int(REALTIME_SCREEN_NO) + screen_offset).zfill(4)
 
     def check_sell_signal(self, code, current_price):
         code = self.normalize_code(code)
+        if code in self.pending_order_codes:
+            return
+
         target_price = self.best.get(code)
         if target_price is None:
             return
@@ -786,7 +853,7 @@ class Kiwoom(QAxWidget):
         self.update_account_status()
 
         sell_quantity = 0
-        for balance in self.get_balance():
+        for balance in self.cached_balance:
             balance_code = self.normalize_code(balance[0])
             if balance_code == code:
                 sell_quantity = balance[7]
