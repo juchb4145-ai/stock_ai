@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+stock_ai-1/
+stock_ai/
