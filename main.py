@@ -1,21 +1,51 @@
 from PyQt5.QAxContainer import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
+import csv
+import json
+import os
 import sys
 import time
+import urllib.error
+import urllib.request
+import uuid
 
-from sklearn.ensemble import RandomForestRegressor
 import pandas as pd
-import numpy as np
 import pickle
 
 CONDITION_NAME = "단테떡상이"  # 비워두면 저장된 조건식 중 첫 번째 조건식을 사용합니다.
 CONDITION_SCREEN_NO = "0150"
 REALTIME_SCREEN_NO = "0160"
 ORDER_SCREEN_NO = "0001"
+AI_SERVER_ENABLED = True
+AI_SERVER_URL = "http://127.0.0.1:8000"
+AI_SERVER_TIMEOUT_SECONDS = 0.35
+TRAINING_DATA_ENABLED = True
+TRAINING_DATA_DIR = "data"
+TRAINING_ENTRY_CSV = os.path.join(TRAINING_DATA_DIR, "entry_training.csv")
+TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
+TRAINING_SAMPLE_COOLDOWN_SECONDS = 30
+TRAINING_LABEL_HORIZONS = (300, 600, 1200)
 BUY_QUANTITY = 1
-MIN_EXPECTED_RETURN = 0.01
-STOP_LOSS_RATE = -0.03
+MIN_EXPECTED_RETURN = 0.006
+OPENING_BUY_START = 90300
+OPENING_BUY_END = 94500
+OPENING_FORCE_EXIT = 100000
+OPENING_MIN_TICKS = 5
+OPENING_TICK_LIMIT = 40
+OPENING_MIN_SCORE = 0.62
+OPENING_TAKE_PROFIT_RATE = 0.012
+OPENING_STOP_LOSS_RATE = -0.008
+OPENING_MAX_HOLD_SECONDS = 20 * 60
+OPENING_MIN_HOLD_SECONDS = 5 * 60
+OPENING_MAX_SPREAD_RATE = 0.006
+EXIT_MIN_PROFIT_RATE = 0.007
+EXIT_STRONG_PROFIT_RATE = 0.018
+EXIT_TRAILING_DROP_RATE = 0.0035
+EXIT_HOLD_SCORE_MIN = 0.45
+EXIT_STALL_SECONDS = 7 * 60
+MAX_CONCURRENT_POSITIONS = 3
+MAX_DAILY_BUY_COUNT = 5
 CONDITION_PROCESS_INTERVAL_MS = 2000
 CONDITION_COOLDOWN_SECONDS = 60
 MAX_DAILY_CANDLE_COUNT = 120
@@ -24,6 +54,58 @@ ORDER_REQUEST_INTERVAL_SECONDS = 0.25
 ACCOUNT_CACHE_SECONDS = 20
 DEPOSIT_CACHE_SECONDS = 10
 REALTIME_CODES_PER_SCREEN = 100
+ENTRY_FEATURE_NAMES = [
+    "price_momentum",
+    "open_return",
+    "box_position",
+    "direction_score",
+    "volume_speed",
+    "spread_rate",
+]
+TRAINING_ENTRY_FIELDS = [
+    "sample_id",
+    "captured_at",
+    "captured_time",
+    "code",
+    "name",
+    "entry_price",
+    "score",
+    "expected_return",
+    "target_price",
+    "model_name",
+    "status",
+    "reason",
+] + ENTRY_FEATURE_NAMES + [
+    "return_5m",
+    "return_10m",
+    "return_20m",
+    "success_10m",
+]
+TRADE_LOG_FIELDS = [
+    "logged_at",
+    "event",
+    "code",
+    "name",
+    "side",
+    "order_type",
+    "order_status",
+    "order_no",
+    "order_result",
+    "quantity",
+    "order_price",
+    "current_price",
+    "executed_price",
+    "executed_quantity",
+    "entry_price",
+    "target_price",
+    "score",
+    "expected_return",
+    "model_name",
+    "reason",
+    "hold_seconds",
+    "profit_rate",
+    "message",
+]
 
 FID_CODES = {
     "10": "현재가",
@@ -326,8 +408,15 @@ class Kiwoom(QAxWidget):
         self.pending_order_codes = set()
         self.bought_codes = set()
         self.order_prices = {}
+        self.entry_times = {}
+        self.highest_prices = {}
         self.realtime_registered_codes = set()
         self.realtime_code_screens = {}
+        self.realtime_ticks = {}
+        self.condition_registered_at = {}
+        self.pending_training_samples = {}
+        self.last_training_sample_at = {}
+        self.order_context = {}
         self.last_tr_request_at = 0
         self.last_order_request_at = 0
         self.cached_deposit = None
@@ -355,25 +444,63 @@ class Kiwoom(QAxWidget):
     
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
         print(screen_no, rqname, trcode, msg)
+
+    def get_chejan_value(self, fid, default=""):
+        value = self.dynamicCall("GetChejanData(int)", fid).strip()
+        value = value.lstrip("+")
+        return value if value != "" else default
     
     def _on_receive_chejan(self, gubun, cnt, fid_list):
         print(gubun, cnt, fid_list)
+        raw_code = self.get_chejan_value("9001")
+        code = self.normalize_code(raw_code)
 
         for fid in fid_list.split(';'):
             if not fid:
                 continue
-            code = self.dynamicCall("GetChejanData(int)", "9001")[1:]
             data = self.dynamicCall("GetChejanData(int)", fid).lstrip("+").lstrip("-")
             if data.isdigit():
                 data = int(data)
             name = FID_CODES.get(fid, fid)
             print('{}: {}'.format(name, data))
             if fid == "913":
-                code = self.normalize_code(code)
                 if data == "체결":
                     self.pending_order_codes.discard(code)
                 elif data in ("접수", "확인"):
                     self.pending_order_codes.add(code)
+
+        order_status = self.get_chejan_value("913")
+        order_no = self.get_chejan_value("9203")
+        order_type = self.get_chejan_value("905")
+        order_price = self.get_chejan_value("901")
+        order_quantity = self.get_chejan_value("900")
+        executed_price = self.get_chejan_value("910")
+        executed_quantity = self.get_chejan_value("911")
+        current_price = self.get_chejan_value("10")
+        context = self.order_context.get(code, {})
+        self.append_trade_log(
+            "chejan",
+            code=code,
+            name=context.get("name", self.get_code_name(code) if code else ""),
+            side=context.get("side", ""),
+            order_type=order_type,
+            order_status=order_status,
+            order_no=order_no,
+            quantity=order_quantity,
+            order_price=order_price,
+            current_price=current_price,
+            executed_price=executed_price,
+            executed_quantity=executed_quantity,
+            entry_price=context.get("entry_price", self.order_prices.get(code, "")),
+            target_price=context.get("target_price", self.best.get(code, "")),
+            score=context.get("score", ""),
+            expected_return=context.get("expected_return", ""),
+            model_name=context.get("model_name", ""),
+            reason=context.get("reason", ""),
+            hold_seconds=context.get("hold_seconds", ""),
+            profit_rate=context.get("profit_rate", ""),
+            message="gubun {}".format(gubun),
+        )
 
     def _on_receive_condition_ver(self, ret, msg):
         print("조건식 로드 결과:", ret, msg)
@@ -665,33 +792,46 @@ class Kiwoom(QAxWidget):
         self.cached_balance = self.tr_data
         return self.cached_balance
 
+    def get_real_int(self, code, fid_name):
+        value = self.dynamicCall("GetCommRealData(QString, QString)", code, get_fid(fid_name)).strip()
+        if not value:
+            return 0
+        return abs(int(value))
+
+    def append_realtime_tick(self, code, signed_at, close, high, open, low, ask, bid, accum_volume):
+        code = self.normalize_code(code)
+        tick = {
+            "received_at": time.time(),
+            "signed_at": signed_at,
+            "close": close,
+            "high": high,
+            "open": open,
+            "low": low,
+            "ask": ask,
+            "bid": bid,
+            "accum_volume": accum_volume,
+        }
+        ticks = self.realtime_ticks.setdefault(code, [])
+        ticks.append(tick)
+        if len(ticks) > OPENING_TICK_LIMIT:
+            del ticks[:-OPENING_TICK_LIMIT]
+        self.update_training_labels(code, close, tick["received_at"])
+
     def _on_receive_real_data(self, s_code, real_type, real_data):
         if real_type == "장시작시간":
             pass
         elif real_type == "주식체결":
             signed_at = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("체결시간"))
-            close = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("현재가"))
-            close = abs(int(close))
-
-            high = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("고가"))
-            high = abs(int(high))
-
-            open = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("시가"))
-            open = abs(int(open))
-
-            low = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("저가"))
-            low = abs(int(low))
-
-            top_priority_ask = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("(최우선)매도호가"))
-            top_priority_ask = abs(int(top_priority_ask))
-
-            top_priority_bid = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("(최우선)매수호가"))
-            top_priority_bid = abs(int(top_priority_bid))
-
-            accum_volume = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("누적거래량"))
-            accum_volume = abs(int(accum_volume))
+            close = self.get_real_int(s_code, "현재가")
+            high = self.get_real_int(s_code, "고가")
+            open = self.get_real_int(s_code, "시가")
+            low = self.get_real_int(s_code, "저가")
+            top_priority_ask = self.get_real_int(s_code, "(최우선)매도호가")
+            top_priority_bid = self.get_real_int(s_code, "(최우선)매수호가")
+            accum_volume = self.get_real_int(s_code, "누적거래량")
 
             self.universe_realtime_transaction_info.append([s_code, signed_at, close, high, open, low, top_priority_ask, top_priority_bid, accum_volume])
+            self.append_realtime_tick(s_code, signed_at, close, high, open, low, top_priority_ask, top_priority_bid, accum_volume)
             self.check_sell_signal(s_code, close)
     
     def set_real_reg(self, str_screen_no, str_code_list, str_fid_list, str_opt_type):
@@ -765,21 +905,333 @@ class Kiwoom(QAxWidget):
         if code in self.bought_codes:
             print("[매수 제외] {} 오늘 이미 매수 주문 처리".format(code))
             return True
+        if len(self.holding_codes) + len(self.pending_order_codes) >= MAX_CONCURRENT_POSITIONS:
+            print("[매수 제외] 최대 보유/주문 종목 수 도달: {}".format(MAX_CONCURRENT_POSITIONS))
+            return True
+        if len(self.bought_codes) >= MAX_DAILY_BUY_COUNT:
+            print("[매수 제외] 일일 매수 횟수 한도 도달: {}".format(MAX_DAILY_BUY_COUNT))
+            return True
         return False
+
+    def current_hhmmss(self):
+        return int(time.strftime("%H%M%S"))
+
+    def is_opening_buy_time(self):
+        now = self.current_hhmmss()
+        return OPENING_BUY_START <= now <= OPENING_BUY_END
+
+    def clamp(self, value, low=0.0, high=1.0):
+        return max(low, min(high, value))
+
+    def requeue_condition_stock(self, code):
+        if code not in self.pending_condition_codes:
+            self.pending_condition_codes.append(code)
+
+    def ensure_training_data_file(self):
+        if not TRAINING_DATA_ENABLED:
+            return
+        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+        if os.path.exists(TRAINING_ENTRY_CSV):
+            return
+        with open(TRAINING_ENTRY_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
+            writer.writeheader()
+
+    def append_training_row(self, row):
+        if not TRAINING_DATA_ENABLED:
+            return
+        self.ensure_training_data_file()
+        with open(TRAINING_ENTRY_CSV, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
+            writer.writerow(row)
+
+    def ensure_trade_log_file(self):
+        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+        if os.path.exists(TRADE_LOG_CSV):
+            return
+        with open(TRADE_LOG_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
+            writer.writeheader()
+
+    def append_trade_log(self, event, **kwargs):
+        self.ensure_trade_log_file()
+        row = {field: "" for field in TRADE_LOG_FIELDS}
+        row["logged_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        row["event"] = event
+        for key, value in kwargs.items():
+            if key in row:
+                row[key] = value
+        with open(TRADE_LOG_CSV, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
+            writer.writerow(row)
+
+    def register_training_sample(self, code, name, entry_price, features, prediction):
+        if not TRAINING_DATA_ENABLED:
+            return
+        now = time.time()
+        last_at = self.last_training_sample_at.get(code, 0)
+        if now - last_at < TRAINING_SAMPLE_COOLDOWN_SECONDS:
+            return
+
+        sample_id = uuid.uuid4().hex
+        row = {
+            "sample_id": sample_id,
+            "captured_at": now,
+            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "name": name,
+            "entry_price": entry_price,
+            "score": prediction.get("score", 0),
+            "expected_return": prediction.get("expected_return", 0),
+            "target_price": prediction.get("target_price", entry_price),
+            "model_name": prediction.get("model_name", ""),
+            "status": prediction.get("status", ""),
+            "reason": prediction.get("reason", ""),
+        }
+        for feature_name in ENTRY_FEATURE_NAMES:
+            row[feature_name] = features.get(feature_name, 0)
+        for horizon in TRAINING_LABEL_HORIZONS:
+            row["return_{}m".format(horizon // 60)] = ""
+        row["success_10m"] = ""
+
+        self.pending_training_samples[sample_id] = {
+            "code": code,
+            "captured_at": now,
+            "entry_price": entry_price,
+            "row": row,
+            "labeled_horizons": set(),
+        }
+        self.last_training_sample_at[code] = now
+        print("[학습데이터 후보] {} {} 기준가 {} sample {}".format(name, code, entry_price, sample_id[:8]))
+
+    def update_training_labels(self, code, current_price, received_at):
+        if not TRAINING_DATA_ENABLED:
+            return
+        code = self.normalize_code(code)
+        completed = []
+        for sample_id, sample in list(self.pending_training_samples.items()):
+            if sample["code"] != code:
+                continue
+            elapsed = received_at - sample["captured_at"]
+            for horizon in TRAINING_LABEL_HORIZONS:
+                if horizon in sample["labeled_horizons"] or elapsed < horizon:
+                    continue
+                return_rate = current_price / sample["entry_price"] - 1
+                sample["row"]["return_{}m".format(horizon // 60)] = return_rate
+                sample["labeled_horizons"].add(horizon)
+            if len(sample["labeled_horizons"]) == len(TRAINING_LABEL_HORIZONS):
+                return_10m = sample["row"].get("return_10m", 0)
+                sample["row"]["success_10m"] = 1 if return_10m >= MIN_EXPECTED_RETURN else 0
+                self.append_training_row(sample["row"])
+                completed.append(sample_id)
+                print("[학습데이터 저장] {} sample {} 10분수익률 {:.2%}".format(code, sample_id[:8], return_10m))
+
+        for sample_id in completed:
+            self.pending_training_samples.pop(sample_id, None)
+
+    def call_ai_server(self, endpoint, payload):
+        if not AI_SERVER_ENABLED:
+            return None
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                AI_SERVER_URL + endpoint,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=AI_SERVER_TIMEOUT_SECONDS) as response:
+                if response.status != 200:
+                    print("[AI서버 fallback] {} HTTP {}".format(endpoint, response.status))
+                    return None
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, ValueError) as e:
+            print("[AI서버 fallback] {} {}".format(endpoint, e))
+            return None
+
+    def serialize_ticks(self, ticks):
+        return [
+            {
+                "received_at": tick["received_at"],
+                "signed_at": tick["signed_at"],
+                "close": tick["close"],
+                "high": tick["high"],
+                "open": tick["open"],
+                "low": tick["low"],
+                "ask": tick["ask"],
+                "bid": tick["bid"],
+                "accum_volume": tick["accum_volume"],
+            }
+            for tick in ticks
+        ]
+
+    def score_opening_trade(self, code):
+        code = self.normalize_code(code)
+        now = self.current_hhmmss()
+        if now < OPENING_BUY_START:
+            return {
+                "status": "wait",
+                "reason": "장초반 매수 시작 전",
+            }
+        if now > OPENING_BUY_END:
+            return {
+                "status": "blocked",
+                "reason": "장초반 매수 시간 아님",
+            }
+
+        ticks = self.realtime_ticks.get(code, [])
+        if len(ticks) < OPENING_MIN_TICKS:
+            return {
+                "status": "wait",
+                "reason": "실시간 틱 부족 {}/{}".format(len(ticks), OPENING_MIN_TICKS),
+            }
+
+        first = ticks[0]
+        last = ticks[-1]
+        current_price = last["close"]
+        open_price = last["open"]
+        highs = [tick["high"] for tick in ticks if tick["high"] > 0]
+        lows = [tick["low"] for tick in ticks if tick["low"] > 0]
+        if not highs or not lows:
+            return {
+                "status": "wait",
+                "reason": "고가/저가 데이터 부족",
+            }
+        high = max(highs)
+        low = min(lows)
+        ask = last["ask"]
+        bid = last["bid"]
+        if current_price <= 0 or open_price <= 0 or high <= low or ask <= 0 or bid <= 0:
+            return {
+                "status": "wait",
+                "reason": "실시간 가격 데이터 부족",
+            }
+
+        spread_rate = (ask - bid) / current_price
+        elapsed = max(last["received_at"] - first["received_at"], 1)
+        price_momentum = current_price / first["close"] - 1 if first["close"] > 0 else 0
+        open_return = current_price / open_price - 1
+        box_position = (current_price - low) / (high - low)
+        recent_ticks = ticks[-min(5, len(ticks)):]
+        up_count = 0
+        for prev, cur in zip(recent_ticks, recent_ticks[1:]):
+            if cur["close"] > prev["close"]:
+                up_count += 1
+        direction_score = up_count / max(len(recent_ticks) - 1, 1)
+        volume_delta = max(last["accum_volume"] - first["accum_volume"], 0)
+        volume_speed = volume_delta / elapsed
+        features = {
+            "price_momentum": price_momentum,
+            "open_return": open_return,
+            "box_position": box_position,
+            "direction_score": direction_score,
+            "volume_speed": volume_speed,
+            "spread_rate": spread_rate,
+        }
+
+        server_prediction = self.call_ai_server("/predict-entry", {
+            "code": code,
+            "name": self.get_code_name(code),
+            "current_price": current_price,
+            "open_price": open_price,
+            "high": high,
+            "low": low,
+            "ask": ask,
+            "bid": bid,
+            "ticks": self.serialize_ticks(ticks),
+        })
+        if server_prediction is not None:
+            server_prediction["code"] = code
+            server_prediction["name"] = self.get_code_name(code)
+            server_prediction["current_price"] = current_price
+            print("[AI서버 매수판단] {} 현재가 {} 점수 {:.2f} 기대수익률 {:.2%} 모델 {} 사유 {}".format(
+                server_prediction["name"],
+                current_price,
+                server_prediction.get("score", 0),
+                server_prediction.get("expected_return", 0),
+                server_prediction.get("model_name", "unknown"),
+                server_prediction.get("reason", ""),
+            ))
+            self.register_training_sample(code, server_prediction["name"], current_price, features, server_prediction)
+            return server_prediction
+
+        if spread_rate < 0 or spread_rate > OPENING_MAX_SPREAD_RATE:
+            return {
+                "status": "blocked",
+                "reason": "호가 스프레드 과다 {:.2%}".format(spread_rate),
+            }
+
+        momentum_score = self.clamp((price_momentum + 0.004) / 0.024)
+        open_return_score = self.clamp((open_return + 0.003) / 0.035)
+        box_score = self.clamp(box_position)
+        spread_score = self.clamp(1 - spread_rate / OPENING_MAX_SPREAD_RATE)
+        volume_score = self.clamp(volume_speed / 3000)
+
+        score = (
+            momentum_score * 0.28
+            + open_return_score * 0.20
+            + box_score * 0.18
+            + direction_score * 0.18
+            + volume_score * 0.10
+            + spread_score * 0.06
+        )
+        expected_return = (score - 0.5) * 0.04
+        target_return = min(max(expected_return, OPENING_TAKE_PROFIT_RATE * 0.6), OPENING_TAKE_PROFIT_RATE)
+        target_price = round(int(current_price * (1 + target_return)), -1)
+        name = self.get_code_name(code)
+        print("[장초반점수] {} 현재가 {} 점수 {:.2f} 기대수익률 {:.2%} 모멘텀 {:.2%} 시가대비 {:.2%} 스프레드 {:.2%}".format(
+            name,
+            current_price,
+            score,
+            expected_return,
+            price_momentum,
+            open_return,
+            spread_rate,
+        ))
+        prediction = {
+            "status": "ready",
+            "code": code,
+            "name": name,
+            "current_price": current_price,
+            "target_price": target_price,
+            "expected_return": expected_return,
+            "score": score,
+            "model_name": "OpeningRealtimeScore",
+        }
+        self.register_training_sample(code, name, current_price, features, prediction)
+        return prediction
 
     def handle_condition_stock(self, code):
         code = self.normalize_code(code)
-        self.update_account_status()
-        if self.should_skip_buy(code):
+        if code not in self.realtime_registered_codes:
+            self.register_realtime_stock(code)
+            self.condition_registered_at[code] = time.time()
+            self.requeue_condition_stock(code)
+            print("[조건검색 관찰] {} 실시간 등록 후 장초반 점수 대기".format(code))
             return
 
         prediction = self.predict_stock(code)
         if prediction is None:
             return
 
+        if prediction.get("status") == "wait":
+            self.requeue_condition_stock(code)
+            print("[매수 대기] {} {}".format(code, prediction["reason"]))
+            return
+        if prediction.get("status") == "blocked":
+            print("[매수 제외] {} {}".format(code, prediction["reason"]))
+            return
+
+        self.update_account_status()
+        if self.should_skip_buy(code):
+            return
+
         expected_return = prediction["expected_return"]
         if expected_return < MIN_EXPECTED_RETURN:
             print("[매수 보류] {} 기대수익률 {:.2%} < 기준 {:.2%}".format(code, expected_return, MIN_EXPECTED_RETURN))
+            return
+        if prediction["score"] < OPENING_MIN_SCORE:
+            print("[매수 보류] {} 장초반점수 {:.2f} < 기준 {:.2f}".format(code, prediction["score"], OPENING_MIN_SCORE))
             return
 
         self.place_buy_order(code, prediction)
@@ -790,21 +1242,65 @@ class Kiwoom(QAxWidget):
         needed_cash = current_price * BUY_QUANTITY
         if deposit < needed_cash:
             print("[매수 보류] {} 예수금 부족: 필요 {}, 가능 {}".format(code, needed_cash, deposit))
+            self.append_trade_log(
+                "buy_skip",
+                code=code,
+                name=prediction.get("name", ""),
+                side="buy",
+                quantity=BUY_QUANTITY,
+                current_price=current_price,
+                target_price=prediction.get("target_price", ""),
+                score=prediction.get("score", ""),
+                expected_return=prediction.get("expected_return", ""),
+                model_name=prediction.get("model_name", ""),
+                reason="예수금 부족",
+                message="필요 {}, 가능 {}".format(needed_cash, deposit),
+            )
             return
 
         result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, BUY_QUANTITY, 0, "03")
+        self.order_context[code] = {
+            "side": "buy",
+            "name": prediction.get("name", ""),
+            "score": prediction.get("score", ""),
+            "expected_return": prediction.get("expected_return", ""),
+            "model_name": prediction.get("model_name", ""),
+            "target_price": prediction.get("target_price", ""),
+            "reason": "매수 조건 통과",
+        }
+        self.append_trade_log(
+            "buy_order",
+            code=code,
+            name=prediction.get("name", ""),
+            side="buy",
+            order_type="시장가",
+            order_result=result,
+            quantity=BUY_QUANTITY,
+            order_price=0,
+            current_price=current_price,
+            entry_price=current_price,
+            target_price=prediction.get("target_price", ""),
+            score=prediction.get("score", ""),
+            expected_return=prediction.get("expected_return", ""),
+            model_name=prediction.get("model_name", ""),
+            reason="매수 조건 통과",
+        )
         if result == 0:
-            self.best[code] = prediction["predict_price"]
+            self.best[code] = prediction["target_price"]
             self.order_prices[code] = current_price
+            self.entry_times[code] = time.time()
+            self.highest_prices[code] = current_price
             self.pending_order_codes.add(code)
             self.bought_codes.add(code)
             self.save_best()
             self.register_realtime_stock(code)
-            print("[매수 주문] {} 현재가 {} 예측가 {} 기대수익률 {:.2%}".format(
+            print("[매수 주문] {} 현재가 {} 목표가 {} 기대수익률 {:.2%} 장초반점수 {:.2f} 모델 {}".format(
                 prediction["name"],
                 current_price,
-                prediction["predict_price"],
+                prediction["target_price"],
                 prediction["expected_return"],
+                prediction["score"],
+                prediction["model_name"],
             ))
         else:
             print("[매수 실패] {} SendOrder 결과 {}".format(code, result))
@@ -834,6 +1330,133 @@ class Kiwoom(QAxWidget):
         screen_offset = len(self.realtime_registered_codes) // REALTIME_CODES_PER_SCREEN
         return str(int(REALTIME_SCREEN_NO) + screen_offset).zfill(4)
 
+    def score_exit_timing(self, code, current_price):
+        code = self.normalize_code(code)
+        entry_price = self.order_prices.get(code)
+        entry_time = self.entry_times.get(code)
+        if not entry_price or not entry_time:
+            return {
+                "action": "hold",
+                "score": 1.0,
+                "reason": "진입 정보 부족",
+            }
+
+        now = time.time()
+        hold_seconds = now - entry_time
+        profit_rate = current_price / entry_price - 1
+        highest_price = max(self.highest_prices.get(code, current_price), current_price)
+        self.highest_prices[code] = highest_price
+        trailing_drop = current_price / highest_price - 1 if highest_price > 0 else 0
+
+        if self.current_hhmmss() >= OPENING_FORCE_EXIT:
+            return {
+                "action": "sell",
+                "score": 0.0,
+                "reason": "장초반 전략 종료 시간 도달",
+            }
+        if profit_rate <= OPENING_STOP_LOSS_RATE:
+            return {
+                "action": "sell",
+                "score": 0.0,
+                "reason": "장초반 손절가 도달",
+            }
+        if hold_seconds >= OPENING_MAX_HOLD_SECONDS:
+            return {
+                "action": "sell",
+                "score": 0.0,
+                "reason": "장초반 최대 보유시간 도달",
+            }
+
+        server_decision = self.call_ai_server("/predict-exit", {
+            "code": code,
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "highest_price": highest_price,
+            "hold_seconds": hold_seconds,
+            "ticks": self.serialize_ticks(self.realtime_ticks.get(code, [])),
+        })
+        if server_decision is not None:
+            print("[AI서버 익절판단] {} action {} 점수 {:.2f} 모델 {} 사유 {}".format(
+                code,
+                server_decision.get("action", "hold"),
+                server_decision.get("score", 0),
+                server_decision.get("model_name", "unknown"),
+                server_decision.get("reason", ""),
+            ))
+            return server_decision
+
+        ticks = self.realtime_ticks.get(code, [])
+        recent_ticks = ticks[-min(8, len(ticks)):]
+        direction_score = 0.5
+        volume_score = 0.5
+        high_hold_score = 0.5
+        spread_score = 0.5
+
+        if len(recent_ticks) >= 3:
+            up_count = 0
+            for prev, cur in zip(recent_ticks, recent_ticks[1:]):
+                if cur["close"] >= prev["close"]:
+                    up_count += 1
+            direction_score = up_count / max(len(recent_ticks) - 1, 1)
+
+            first_recent = recent_ticks[0]
+            last_recent = recent_ticks[-1]
+            elapsed = max(last_recent["received_at"] - first_recent["received_at"], 1)
+            volume_delta = max(last_recent["accum_volume"] - first_recent["accum_volume"], 0)
+            volume_speed = volume_delta / elapsed
+            volume_score = self.clamp(volume_speed / 2500)
+
+            recent_high = max(tick["close"] for tick in recent_ticks if tick["close"] > 0)
+            recent_low = min(tick["close"] for tick in recent_ticks if tick["close"] > 0)
+            if recent_high > recent_low:
+                high_hold_score = self.clamp((current_price - recent_low) / (recent_high - recent_low))
+
+            ask = last_recent["ask"]
+            bid = last_recent["bid"]
+            if ask > 0 and bid > 0 and current_price > 0:
+                spread_rate = (ask - bid) / current_price
+                spread_score = self.clamp(1 - spread_rate / OPENING_MAX_SPREAD_RATE)
+
+        profit_score = self.clamp((profit_rate - EXIT_MIN_PROFIT_RATE) / (EXIT_STRONG_PROFIT_RATE - EXIT_MIN_PROFIT_RATE))
+        time_penalty = self.clamp((hold_seconds - EXIT_STALL_SECONDS) / max(OPENING_MAX_HOLD_SECONDS - EXIT_STALL_SECONDS, 1))
+        drawdown_penalty = self.clamp(abs(min(trailing_drop, 0)) / (EXIT_TRAILING_DROP_RATE * 2))
+
+        hold_score = (
+            direction_score * 0.30
+            + volume_score * 0.20
+            + high_hold_score * 0.20
+            + spread_score * 0.10
+            + profit_score * 0.20
+            - time_penalty * 0.20
+            - drawdown_penalty * 0.25
+        )
+        hold_score = self.clamp(hold_score)
+
+        if profit_rate >= EXIT_STRONG_PROFIT_RATE:
+            return {
+                "action": "sell",
+                "score": hold_score,
+                "reason": "강한 수익 구간 도달 {:.2%}".format(profit_rate),
+            }
+        if profit_rate >= EXIT_MIN_PROFIT_RATE and trailing_drop <= -EXIT_TRAILING_DROP_RATE:
+            return {
+                "action": "sell",
+                "score": hold_score,
+                "reason": "고점 대비 밀림 {:.2%}".format(trailing_drop),
+            }
+        if profit_rate >= EXIT_MIN_PROFIT_RATE and hold_seconds >= EXIT_STALL_SECONDS and hold_score < EXIT_HOLD_SCORE_MIN:
+            return {
+                "action": "sell",
+                "score": hold_score,
+                "reason": "상승 지속 점수 약화 {:.2f}".format(hold_score),
+            }
+
+        return {
+            "action": "hold",
+            "score": hold_score,
+            "reason": "상승 지속 점수 {:.2f}".format(hold_score),
+        }
+
     def check_sell_signal(self, code, current_price):
         code = self.normalize_code(code)
         if code in self.pending_order_codes:
@@ -843,11 +1466,14 @@ class Kiwoom(QAxWidget):
         if target_price is None:
             return
 
-        entry_price = self.order_prices.get(code)
-        if current_price >= target_price:
-            self.place_sell_order(code, target_price, "00", "목표가 도달")
-        elif entry_price and current_price <= int(entry_price * (1 + STOP_LOSS_RATE)):
-            self.place_sell_order(code, 0, "03", "손절가 도달")
+        exit_decision = self.score_exit_timing(code, current_price)
+        if exit_decision["action"] == "sell":
+            self.place_sell_order(code, 0, "03", exit_decision["reason"])
+            return
+        if current_price >= target_price and exit_decision["score"] < 0.65:
+            self.place_sell_order(code, 0, "03", "목표가 도달 후 보유 점수 약화 {:.2f}".format(exit_decision["score"]))
+        elif current_price >= target_price:
+            print("[익절 보류] {} 목표가 도달, 보유 지속 점수 {:.2f}".format(code, exit_decision["score"]))
 
     def place_sell_order(self, code, order_price, order_gubun, reason):
         self.update_account_status()
@@ -861,59 +1487,67 @@ class Kiwoom(QAxWidget):
 
         if sell_quantity <= 0:
             print("[매도 보류] {} 매매가능수량 없음".format(code))
+            self.append_trade_log(
+                "sell_skip",
+                code=code,
+                name=self.get_code_name(code),
+                side="sell",
+                quantity=sell_quantity,
+                order_price=order_price,
+                entry_price=self.order_prices.get(code, ""),
+                target_price=self.best.get(code, ""),
+                reason=reason,
+                message="매매가능수량 없음",
+            )
             return
 
+        entry_price = self.order_prices.get(code)
+        hold_seconds = ""
+        profit_rate = ""
+        if code in self.entry_times:
+            hold_seconds = time.time() - self.entry_times[code]
+        if entry_price:
+            last_price = self.realtime_ticks.get(code, [{}])[-1].get("close", order_price)
+            if last_price:
+                profit_rate = last_price / entry_price - 1
         result = self.send_order("sell", ORDER_SCREEN_NO, 2, code, sell_quantity, order_price, order_gubun)
+        self.order_context[code] = {
+            "side": "sell",
+            "name": self.get_code_name(code),
+            "reason": reason,
+            "entry_price": entry_price or "",
+            "target_price": self.best.get(code, ""),
+            "hold_seconds": hold_seconds,
+            "profit_rate": profit_rate,
+        }
+        self.append_trade_log(
+            "sell_order",
+            code=code,
+            name=self.get_code_name(code),
+            side="sell",
+            order_type="시장가" if order_gubun == "03" else "지정가",
+            order_result=result,
+            quantity=sell_quantity,
+            order_price=order_price,
+            entry_price=entry_price or "",
+            target_price=self.best.get(code, ""),
+            reason=reason,
+            hold_seconds=hold_seconds,
+            profit_rate=profit_rate,
+        )
         if result == 0:
             self.pending_order_codes.add(code)
             self.best.pop(code, None)
+            self.entry_times.pop(code, None)
+            self.order_prices.pop(code, None)
+            self.highest_prices.pop(code, None)
             self.save_best()
             print("[매도 주문] {} {} 수량 {} 가격 {} 구분 {}".format(code, reason, sell_quantity, order_price, order_gubun))
         else:
             print("[매도 실패] {} SendOrder 결과 {}".format(code, result))
 
     def predict_stock(self, code):
-
-        # 종목코드를 가져와서 해당 종목의 모든 주식 가격 데이터 가져와서 데이터 프레임으로 만들기
-        df = self.get_price(code)
-        if len(df) < 2:
-            print("[예측 실패] {} 학습 데이터 부족".format(code))
-            return None
-
-        data = []
-        target = []
-
-        # 특정일의 주식 가격은 data, 특정일 다음날의 종가 가격은 target에 할당
-        for i in range(len(df) - 1):
-            a = list(df.iloc[i])
-            b = df.iloc[i + 1, 3]
-            data.append(a)
-            target.append(b)
-        
-        data = np.array(data)
-        target = np.array(target)
-
-        # 랜덤 포레스트 머신러닝 모델 활용
-        rf = RandomForestRegressor(oob_score=True, random_state=1234)
-        # 모델 학습
-        rf.fit(data, target)
-
-        # 현재 날짜의 주식 가격을 today_price 변수에 할당
-        today_price = list(df.iloc[-1])
-
-        # 현재 날짜의 가격을 통해 다음날 종가 예측
-        predict_price = round(int(rf.predict([today_price])[0]), -2)
-        current_price = int(df.iloc[-1]['close'])
-        expected_return = (predict_price - current_price) / current_price
-        name = self.get_code_name(code)
-        print("[예측] {} 현재가 {} 예측가 {} 기대수익률 {:.2%}".format(name, current_price, predict_price, expected_return))
-        return {
-            "code": code,
-            "name": name,
-            "current_price": current_price,
-            "predict_price": predict_price,
-            "expected_return": expected_return,
-        }
+        return self.score_opening_trade(code)
 
 app = QApplication(sys.argv)
 kiwoom = Kiwoom()
