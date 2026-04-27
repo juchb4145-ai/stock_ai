@@ -26,7 +26,7 @@ TRAINING_ENTRY_CSV = os.path.join(TRAINING_DATA_DIR, "entry_training.csv")
 TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
 TRAINING_SAMPLE_COOLDOWN_SECONDS = 30
 TRAINING_LABEL_HORIZONS = (300, 600, 1200)
-BUY_QUANTITY = 1
+BUY_CASH_BUFFER_RATE = 0.98
 MIN_EXPECTED_RETURN = 0.006
 OPENING_BUY_START = 90300
 OPENING_BUY_END = 94500
@@ -48,12 +48,16 @@ MAX_CONCURRENT_POSITIONS = 3
 MAX_DAILY_BUY_COUNT = 5
 CONDITION_PROCESS_INTERVAL_MS = 2000
 CONDITION_COOLDOWN_SECONDS = 60
+WAIT_LOG_COOLDOWN_SECONDS = 30
+REALTIME_TICK_WAIT_TIMEOUT_SECONDS = 60
 MAX_DAILY_CANDLE_COUNT = 120
 TR_REQUEST_INTERVAL_SECONDS = 0.35
 ORDER_REQUEST_INTERVAL_SECONDS = 0.25
 ACCOUNT_CACHE_SECONDS = 20
 DEPOSIT_CACHE_SECONDS = 10
 REALTIME_CODES_PER_SCREEN = 100
+POSITION_CHECK_INTERVAL_MS = 10000
+SELL_QUANTITY_RETRY_SECONDS = 1.0
 ENTRY_FEATURE_NAMES = [
     "price_momentum",
     "open_return",
@@ -404,10 +408,13 @@ class Kiwoom(QAxWidget):
         self.pending_condition_codes = []
         self.processing_condition = False
         self.last_signal_at = {}
+        self.last_wait_log_at = {}
+        self.no_tick_codes = set()
         self.holding_codes = set()
         self.pending_order_codes = set()
         self.bought_codes = set()
         self.order_prices = {}
+        self.position_quantities = {}
         self.entry_times = {}
         self.highest_prices = {}
         self.realtime_registered_codes = set()
@@ -426,6 +433,8 @@ class Kiwoom(QAxWidget):
         self.account_updated_at = 0
         self.condition_timer = QTimer()
         self.condition_timer.timeout.connect(self.process_next_condition_stock)
+        self.position_check_timer = QTimer()
+        self.position_check_timer.timeout.connect(self.check_open_positions)
 
     
     def _make_kiwoom_instance(self):
@@ -449,6 +458,14 @@ class Kiwoom(QAxWidget):
         value = self.dynamicCall("GetChejanData(int)", fid).strip()
         value = value.lstrip("+")
         return value if value != "" else default
+
+    def parse_int(self, value, default=0):
+        try:
+            if value is None or value == "":
+                return default
+            return abs(int(str(value).strip().lstrip("+").lstrip("-")))
+        except (TypeError, ValueError):
+            return default
     
     def _on_receive_chejan(self, gubun, cnt, fid_list):
         print(gubun, cnt, fid_list)
@@ -501,6 +518,37 @@ class Kiwoom(QAxWidget):
             profit_rate=context.get("profit_rate", ""),
             message="gubun {}".format(gubun),
         )
+
+        if order_status == "체결" and code:
+            side = context.get("side", "")
+            executed_quantity_int = self.parse_int(executed_quantity)
+            executed_price_int = self.parse_int(executed_price)
+            if side == "buy" and executed_quantity_int > 0:
+                entry_price = executed_price_int or self.order_prices.get(code) or self.parse_int(current_price)
+                self.pending_order_codes.discard(code)
+                self.holding_codes.add(code)
+                self.position_quantities[code] = self.position_quantities.get(code, 0) + executed_quantity_int
+                if entry_price:
+                    self.order_prices[code] = entry_price
+                    self.highest_prices[code] = max(self.highest_prices.get(code, entry_price), entry_price)
+                self.entry_times.setdefault(code, time.time())
+                target_price = self.parse_int(context.get("target_price", ""))
+                if target_price:
+                    self.best[code] = target_price
+                    self.save_best()
+                self.register_realtime_stock(code)
+                self.account_updated_at = 0
+            elif side == "sell" and executed_quantity_int > 0:
+                remaining_quantity = max(self.position_quantities.get(code, 0) - executed_quantity_int, 0)
+                self.position_quantities[code] = remaining_quantity
+                if remaining_quantity <= 0:
+                    self.holding_codes.discard(code)
+                    self.best.pop(code, None)
+                    self.entry_times.pop(code, None)
+                    self.order_prices.pop(code, None)
+                    self.highest_prices.pop(code, None)
+                    self.save_best()
+                self.account_updated_at = 0
 
     def _on_receive_condition_ver(self, ret, msg):
         print("조건식 로드 결과:", ret, msg)
@@ -800,6 +848,9 @@ class Kiwoom(QAxWidget):
 
     def append_realtime_tick(self, code, signed_at, close, high, open, low, ask, bid, accum_volume):
         code = self.normalize_code(code)
+        if code in self.no_tick_codes:
+            self.no_tick_codes.discard(code)
+            self.requeue_condition_stock(code)
         tick = {
             "received_at": time.time(),
             "signed_at": signed_at,
@@ -873,14 +924,19 @@ class Kiwoom(QAxWidget):
         if not force and now - self.account_updated_at < ACCOUNT_CACHE_SECONDS:
             return
 
-        self.holding_codes = set()
+        holding_codes = set()
         self.pending_order_codes = set()
 
         try:
             for balance in self.get_balance(force=True):
                 code = self.normalize_code(balance[0])
-                self.holding_codes.add(code)
+                holding_codes.add(code)
+                self.position_quantities[code] = balance[2]
                 self.order_prices[code] = balance[3]
+            self.holding_codes = holding_codes
+            for code in list(self.position_quantities.keys()):
+                if code not in holding_codes and code not in self.pending_order_codes:
+                    self.position_quantities.pop(code, None)
         except Exception as e:
             print("잔고 조회 실패:", e)
 
@@ -924,8 +980,19 @@ class Kiwoom(QAxWidget):
         return max(low, min(high, value))
 
     def requeue_condition_stock(self, code):
+        code = self.normalize_code(code)
+        if code in self.no_tick_codes:
+            return
         if code not in self.pending_condition_codes:
             self.pending_condition_codes.append(code)
+
+    def should_print_wait_log(self, code):
+        now = time.time()
+        last_at = self.last_wait_log_at.get(code, 0)
+        if now - last_at < WAIT_LOG_COOLDOWN_SECONDS:
+            return False
+        self.last_wait_log_at[code] = now
+        return True
 
     def ensure_training_data_file(self):
         if not TRAINING_DATA_ENABLED:
@@ -1203,6 +1270,8 @@ class Kiwoom(QAxWidget):
 
     def handle_condition_stock(self, code):
         code = self.normalize_code(code)
+        if code in self.no_tick_codes:
+            return
         if code not in self.realtime_registered_codes:
             self.register_realtime_stock(code)
             self.condition_registered_at[code] = time.time()
@@ -1215,8 +1284,15 @@ class Kiwoom(QAxWidget):
             return
 
         if prediction.get("status") == "wait":
+            ticks = self.realtime_ticks.get(code, [])
+            registered_at = self.condition_registered_at.get(code, time.time())
+            if len(ticks) == 0 and time.time() - registered_at >= REALTIME_TICK_WAIT_TIMEOUT_SECONDS:
+                self.no_tick_codes.add(code)
+                print("[매수 제외] {} 실시간 틱 수신 없음 {}초".format(code, REALTIME_TICK_WAIT_TIMEOUT_SECONDS))
+                return
             self.requeue_condition_stock(code)
-            print("[매수 대기] {} {}".format(code, prediction["reason"]))
+            if self.should_print_wait_log(code):
+                print("[매수 대기] {} {}".format(code, prediction["reason"]))
             return
         if prediction.get("status") == "blocked":
             print("[매수 제외] {} {}".format(code, prediction["reason"]))
@@ -1238,27 +1314,31 @@ class Kiwoom(QAxWidget):
 
     def place_buy_order(self, code, prediction):
         current_price = prediction["current_price"]
-        deposit = self.get_deposit()
-        needed_cash = current_price * BUY_QUANTITY
-        if deposit < needed_cash:
-            print("[매수 보류] {} 예수금 부족: 필요 {}, 가능 {}".format(code, needed_cash, deposit))
+        deposit = self.get_deposit(force=True)
+        position_count = len(self.holding_codes) + len(self.pending_order_codes)
+        remaining_slots = max(MAX_CONCURRENT_POSITIONS - position_count, 1)
+        order_budget = int(deposit * BUY_CASH_BUFFER_RATE / remaining_slots)
+        order_quantity = order_budget // current_price if current_price > 0 else 0
+        needed_cash = current_price * order_quantity
+        if order_quantity <= 0:
+            print("[매수 보류] {} 예수금 부족: 종목당 예산 {}, 현재가 {}, 가능 예수금 {}".format(code, order_budget, current_price, deposit))
             self.append_trade_log(
                 "buy_skip",
                 code=code,
                 name=prediction.get("name", ""),
                 side="buy",
-                quantity=BUY_QUANTITY,
+                quantity=0,
                 current_price=current_price,
                 target_price=prediction.get("target_price", ""),
                 score=prediction.get("score", ""),
                 expected_return=prediction.get("expected_return", ""),
                 model_name=prediction.get("model_name", ""),
                 reason="예수금 부족",
-                message="필요 {}, 가능 {}".format(needed_cash, deposit),
+                message="종목당 예산 {}, 현재가 {}, 가능 {}".format(order_budget, current_price, deposit),
             )
             return
 
-        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, BUY_QUANTITY, 0, "03")
+        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, 0, "03")
         self.order_context[code] = {
             "side": "buy",
             "name": prediction.get("name", ""),
@@ -1275,7 +1355,7 @@ class Kiwoom(QAxWidget):
             side="buy",
             order_type="시장가",
             order_result=result,
-            quantity=BUY_QUANTITY,
+            quantity=order_quantity,
             order_price=0,
             current_price=current_price,
             entry_price=current_price,
@@ -1294,9 +1374,11 @@ class Kiwoom(QAxWidget):
             self.bought_codes.add(code)
             self.save_best()
             self.register_realtime_stock(code)
-            print("[매수 주문] {} 현재가 {} 목표가 {} 기대수익률 {:.2%} 장초반점수 {:.2f} 모델 {}".format(
+            print("[매수 주문] {} 수량 {} 현재가 {} 주문예산 {} 목표가 {} 기대수익률 {:.2%} 장초반점수 {:.2f} 모델 {}".format(
                 prediction["name"],
+                order_quantity,
                 current_price,
+                needed_cash,
                 prediction["target_price"],
                 prediction["expected_return"],
                 prediction["score"],
@@ -1334,19 +1416,6 @@ class Kiwoom(QAxWidget):
         code = self.normalize_code(code)
         entry_price = self.order_prices.get(code)
         entry_time = self.entry_times.get(code)
-        if not entry_price or not entry_time:
-            return {
-                "action": "hold",
-                "score": 1.0,
-                "reason": "진입 정보 부족",
-            }
-
-        now = time.time()
-        hold_seconds = now - entry_time
-        profit_rate = current_price / entry_price - 1
-        highest_price = max(self.highest_prices.get(code, current_price), current_price)
-        self.highest_prices[code] = highest_price
-        trailing_drop = current_price / highest_price - 1 if highest_price > 0 else 0
 
         if self.current_hhmmss() >= OPENING_FORCE_EXIT:
             return {
@@ -1354,6 +1423,23 @@ class Kiwoom(QAxWidget):
                 "score": 0.0,
                 "reason": "장초반 전략 종료 시간 도달",
             }
+        if not entry_price:
+            return {
+                "action": "hold",
+                "score": 0.0,
+                "reason": "진입가 정보 부족",
+            }
+
+        now = time.time()
+        if not entry_time:
+            self.entry_times[code] = now
+            entry_time = now
+        hold_seconds = now - entry_time
+        profit_rate = current_price / entry_price - 1
+        highest_price = max(self.highest_prices.get(code, current_price), current_price)
+        self.highest_prices[code] = highest_price
+        trailing_drop = current_price / highest_price - 1 if highest_price > 0 else 0
+
         if profit_rate <= OPENING_STOP_LOSS_RATE:
             return {
                 "action": "sell",
@@ -1470,20 +1556,54 @@ class Kiwoom(QAxWidget):
         if exit_decision["action"] == "sell":
             self.place_sell_order(code, 0, "03", exit_decision["reason"])
             return
-        if current_price >= target_price and exit_decision["score"] < 0.65:
+        if target_price is not None and current_price >= target_price and exit_decision["score"] < 0.65:
             self.place_sell_order(code, 0, "03", "목표가 도달 후 보유 점수 약화 {:.2f}".format(exit_decision["score"]))
-        elif current_price >= target_price:
+        elif target_price is not None and current_price >= target_price:
             print("[익절 보류] {} 목표가 도달, 보유 지속 점수 {:.2f}".format(code, exit_decision["score"]))
 
+    def get_balance_current_price(self, code):
+        for balance in self.cached_balance:
+            if self.normalize_code(balance[0]) == code:
+                return balance[5]
+        return 0
+
+    def check_open_positions(self):
+        self.update_account_status(force=True)
+        for code in list(self.best.keys()):
+            if code not in self.holding_codes:
+                continue
+            self.register_realtime_stock(code)
+            last_tick = self.realtime_ticks.get(code, [{}])[-1]
+            current_price = last_tick.get("close") or self.get_balance_current_price(code)
+            if current_price:
+                self.check_sell_signal(code, current_price)
+
     def place_sell_order(self, code, order_price, order_gubun, reason):
-        self.update_account_status()
+        self.update_account_status(force=True)
 
         sell_quantity = 0
+        held_quantity = self.position_quantities.get(code, 0)
         for balance in self.cached_balance:
             balance_code = self.normalize_code(balance[0])
             if balance_code == code:
                 sell_quantity = balance[7]
+                held_quantity = balance[2]
                 break
+
+        if sell_quantity <= 0 and held_quantity > 0:
+            print("[매도 수량 재확인] {} 매매가능수량 0, {}초 후 재조회".format(code, SELL_QUANTITY_RETRY_SECONDS))
+            time.sleep(SELL_QUANTITY_RETRY_SECONDS)
+            self.update_account_status(force=True)
+            for balance in self.cached_balance:
+                balance_code = self.normalize_code(balance[0])
+                if balance_code == code:
+                    sell_quantity = balance[7]
+                    held_quantity = balance[2]
+                    break
+
+        if sell_quantity <= 0 and held_quantity > 0:
+            sell_quantity = held_quantity
+            print("[매도 수량 대체] {} 매매가능수량 0, 보유수량 {}로 매도 시도".format(code, sell_quantity))
 
         if sell_quantity <= 0:
             print("[매도 보류] {} 매매가능수량 없음".format(code))
@@ -1541,6 +1661,7 @@ class Kiwoom(QAxWidget):
             self.entry_times.pop(code, None)
             self.order_prices.pop(code, None)
             self.highest_prices.pop(code, None)
+            self.position_quantities.pop(code, None)
             self.save_best()
             print("[매도 주문] {} {} 수량 {} 가격 {} 구분 {}".format(code, reason, sell_quantity, order_price, order_gubun))
         else:
@@ -1563,6 +1684,9 @@ print("미체결 종목: {}".format(kiwoom.pending_order_codes))
 for code in list(kiwoom.best.keys()):
     if code in kiwoom.holding_codes:
         kiwoom.register_realtime_stock(code)
+
+kiwoom.check_open_positions()
+kiwoom.position_check_timer.start(POSITION_CHECK_INTERVAL_MS)
 
 if not kiwoom.start_realtime_condition(CONDITION_NAME):
     print("실시간 조건검색을 시작하지 못했습니다. 조건식 설정을 확인해주세요.")
