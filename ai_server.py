@@ -1,3 +1,4 @@
+import json
 import os
 from typing import List, Optional
 
@@ -5,6 +6,8 @@ import joblib
 import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+import scoring
 
 try:
     import lightgbm as lgb
@@ -14,25 +17,24 @@ except ImportError:
 
 MODEL_PKL_PATH = os.path.join("models", "opening_lgbm.pkl")
 MODEL_TXT_PATH = os.path.join("models", "opening_lgbm.txt")
+MODEL_META_PATH = os.path.join("models", "opening_lgbm_meta.json")
 OPENING_TAKE_PROFIT_RATE = 0.012
 OPENING_MAX_SPREAD_RATE = 0.006
 EXIT_MIN_PROFIT_RATE = 0.007
 EXIT_STRONG_PROFIT_RATE = 0.018
 EXIT_TRAILING_DROP_RATE = 0.0035
+EXIT_STALL_SECONDS = 7 * 60
 EXIT_HOLD_SCORE_MIN = 0.45
-ENTRY_FEATURES = [
-    "price_momentum",
-    "open_return",
-    "box_position",
-    "direction_score",
-    "volume_speed",
-    "spread_rate",
-]
+OPENING_MAX_HOLD_SECONDS = 20 * 60
+DEFAULT_ENTRY_THRESHOLD = 0.5
+ENTRY_FEATURES = list(scoring.ENTRY_FEATURE_NAMES)
 
 
 app = FastAPI(title="Kiwoom LightGBM AI Server")
 model = None
 model_name = "ServerFallbackScore"
+model_threshold = DEFAULT_ENTRY_THRESHOLD
+model_meta = {}
 
 
 class Tick(BaseModel):
@@ -84,59 +86,62 @@ class ExitResponse(BaseModel):
     model_name: str
 
 
-def clamp(value, low=0.0, high=1.0):
-    return max(low, min(high, value))
-
-
 def load_model():
-    global model, model_name
+    global model, model_name, model_threshold, model_meta
     if os.path.exists(MODEL_PKL_PATH):
         model = joblib.load(MODEL_PKL_PATH)
         model_name = "LightGBM"
-        return
-    if lgb is not None and os.path.exists(MODEL_TXT_PATH):
+    elif lgb is not None and os.path.exists(MODEL_TXT_PATH):
         model = lgb.Booster(model_file=MODEL_TXT_PATH)
         model_name = "LightGBM"
 
-
-def tick_dict(tick):
-    return tick.dict()
-
-
-def build_entry_features(req):
-    ticks = [tick_dict(tick) for tick in req.ticks]
-    first = ticks[0]
-    last = ticks[-1]
-    highs = [tick["high"] for tick in ticks if tick["high"] > 0]
-    lows = [tick["low"] for tick in ticks if tick["low"] > 0]
-    high = max(highs) if highs else req.high
-    low = min(lows) if lows else req.low
-    current_price = req.current_price
-    open_price = req.open_price
-    spread_rate = (req.ask - req.bid) / current_price if current_price > 0 else 1
-    elapsed = max(last["received_at"] - first["received_at"], 1)
-    price_momentum = current_price / first["close"] - 1 if first["close"] > 0 else 0
-    open_return = current_price / open_price - 1 if open_price > 0 else 0
-    box_position = (current_price - low) / (high - low) if high > low else 0.5
-    recent_ticks = ticks[-min(5, len(ticks)):]
-    up_count = 0
-    for prev, cur in zip(recent_ticks, recent_ticks[1:]):
-        if cur["close"] > prev["close"]:
-            up_count += 1
-    direction_score = up_count / max(len(recent_ticks) - 1, 1)
-    volume_delta = max(last["accum_volume"] - first["accum_volume"], 0)
-    volume_speed = volume_delta / elapsed
-    return {
-        "price_momentum": price_momentum,
-        "open_return": open_return,
-        "box_position": box_position,
-        "direction_score": direction_score,
-        "volume_speed": volume_speed,
-        "spread_rate": spread_rate,
-    }
+    if os.path.exists(MODEL_META_PATH):
+        try:
+            with open(MODEL_META_PATH, "r", encoding="utf-8") as f:
+                model_meta = json.load(f)
+            threshold = model_meta.get("threshold")
+            if isinstance(threshold, (int, float)) and 0 < float(threshold) < 1:
+                model_threshold = float(threshold)
+        except Exception as exc:
+            print("[메타 로드 실패]", exc)
 
 
-def fallback_entry(req, features):
+def _ticks_as_dicts(ticks):
+    # pydantic v1/v2 호환
+    out = []
+    for tick in ticks:
+        if hasattr(tick, "model_dump"):
+            out.append(tick.model_dump())
+        else:
+            out.append(tick.dict())
+    return out
+
+
+def build_entry_features(req: EntryRequest):
+    ticks = _ticks_as_dicts(req.ticks)
+    if not ticks:
+        return None
+    return scoring.build_entry_features(
+        ticks=ticks,
+        current_price=req.current_price,
+        open_price=req.open_price,
+        high=req.high,
+        low=req.low,
+        ask=req.ask,
+        bid=req.bid,
+    )
+
+
+def fallback_entry(req: EntryRequest, features) -> EntryResponse:
+    if features is None:
+        return EntryResponse(
+            status="wait",
+            score=0.0,
+            expected_return=0.0,
+            target_price=req.current_price,
+            model_name="ServerFallbackScore",
+            reason="실시간 가격 데이터 부족",
+        )
     spread_rate = features["spread_rate"]
     if spread_rate < 0 or spread_rate > OPENING_MAX_SPREAD_RATE:
         return EntryResponse(
@@ -148,22 +153,9 @@ def fallback_entry(req, features):
             reason="호가 스프레드 과다 {:.2%}".format(spread_rate),
         )
 
-    momentum_score = clamp((features["price_momentum"] + 0.004) / 0.024)
-    open_return_score = clamp((features["open_return"] + 0.003) / 0.035)
-    box_score = clamp(features["box_position"])
-    spread_score = clamp(1 - spread_rate / OPENING_MAX_SPREAD_RATE)
-    volume_score = clamp(features["volume_speed"] / 3000)
-    score = (
-        momentum_score * 0.28
-        + open_return_score * 0.20
-        + box_score * 0.18
-        + features["direction_score"] * 0.18
-        + volume_score * 0.10
-        + spread_score * 0.06
-    )
-    expected_return = (score - 0.5) * 0.04
-    target_return = min(max(expected_return, OPENING_TAKE_PROFIT_RATE * 0.6), OPENING_TAKE_PROFIT_RATE)
-    target_price = round(int(req.current_price * (1 + target_return)), -1)
+    score = scoring.compute_entry_score(features, OPENING_MAX_SPREAD_RATE)
+    expected_return = scoring.expected_return_from_score(score)
+    target_price = scoring.compute_target_price(req.current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
     return EntryResponse(
         status="ready",
         score=score,
@@ -174,81 +166,61 @@ def fallback_entry(req, features):
     )
 
 
-def predict_lightgbm_entry(req, features):
+def predict_lightgbm_entry(req: EntryRequest, features) -> EntryResponse:
     values = np.array([[features[name] for name in ENTRY_FEATURES]])
     if hasattr(model, "predict_proba"):
         prediction = model.predict_proba(values)
-        score = clamp(float(prediction[0][1]))
+        score = scoring.clamp(float(prediction[0][1]))
     else:
         prediction = model.predict(values)
-        score = clamp(float(prediction[0]))
-    expected_return = (score - 0.5) * 0.04
-    target_return = min(max(expected_return, OPENING_TAKE_PROFIT_RATE * 0.6), OPENING_TAKE_PROFIT_RATE)
-    target_price = round(int(req.current_price * (1 + target_return)), -1)
+        score = scoring.clamp(float(prediction[0]))
+    expected_return = scoring.expected_return_from_score(score)
+    target_price = scoring.compute_target_price(req.current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
+
+    # 학습 시 결정된 threshold 미만이면 매수 차단 신호로 응답해 main.py가 곧바로 회피하도록 한다.
+    if score < model_threshold:
+        return EntryResponse(
+            status="blocked",
+            score=score,
+            expected_return=expected_return,
+            target_price=target_price,
+            model_name=model_name,
+            reason="lightgbm score {:.3f} < threshold {:.3f}".format(score, model_threshold),
+        )
     return EntryResponse(
         status="ready",
         score=score,
         expected_return=expected_return,
         target_price=target_price,
         model_name=model_name,
-        reason="lightgbm",
+        reason="lightgbm score {:.3f} >= threshold {:.3f}".format(score, model_threshold),
     )
 
 
-def fallback_exit(req):
+def fallback_exit(req: ExitRequest) -> ExitResponse:
     profit_rate = req.current_price / req.entry_price - 1 if req.entry_price > 0 else 0
     trailing_drop = req.current_price / req.highest_price - 1 if req.highest_price > 0 else 0
-    ticks = [tick_dict(tick) for tick in req.ticks]
-    recent_ticks = ticks[-min(8, len(ticks)):]
-    direction_score = 0.5
-    volume_score = 0.5
-    high_hold_score = 0.5
-    spread_score = 0.5
+    ticks = _ticks_as_dicts(req.ticks)
 
-    if len(recent_ticks) >= 3:
-        up_count = 0
-        for prev, cur in zip(recent_ticks, recent_ticks[1:]):
-            if cur["close"] >= prev["close"]:
-                up_count += 1
-        direction_score = up_count / max(len(recent_ticks) - 1, 1)
-
-        first_recent = recent_ticks[0]
-        last_recent = recent_ticks[-1]
-        elapsed = max(last_recent["received_at"] - first_recent["received_at"], 1)
-        volume_delta = max(last_recent["accum_volume"] - first_recent["accum_volume"], 0)
-        volume_score = clamp((volume_delta / elapsed) / 2500)
-
-        closes = [tick["close"] for tick in recent_ticks if tick["close"] > 0]
-        if closes:
-            recent_high = max(closes)
-            recent_low = min(closes)
-            if recent_high > recent_low:
-                high_hold_score = clamp((req.current_price - recent_low) / (recent_high - recent_low))
-
-        ask = last_recent["ask"]
-        bid = last_recent["bid"]
-        if ask > 0 and bid > 0 and req.current_price > 0:
-            spread_rate = (ask - bid) / req.current_price
-            spread_score = clamp(1 - spread_rate / OPENING_MAX_SPREAD_RATE)
-
-    profit_score = clamp((profit_rate - EXIT_MIN_PROFIT_RATE) / (EXIT_STRONG_PROFIT_RATE - EXIT_MIN_PROFIT_RATE))
-    time_penalty = clamp(req.hold_seconds / (20 * 60))
-    drawdown_penalty = clamp(abs(min(trailing_drop, 0)) / (EXIT_TRAILING_DROP_RATE * 2))
-    hold_score = clamp(
-        direction_score * 0.30
-        + volume_score * 0.20
-        + high_hold_score * 0.20
-        + spread_score * 0.10
-        + profit_score * 0.20
-        - time_penalty * 0.20
-        - drawdown_penalty * 0.25
+    hold_score = scoring.compute_exit_hold_score(
+        ticks=ticks,
+        current_price=req.current_price,
+        profit_rate=profit_rate,
+        trailing_drop=trailing_drop,
+        hold_seconds=req.hold_seconds,
+        opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
+        exit_min_profit_rate=EXIT_MIN_PROFIT_RATE,
+        exit_strong_profit_rate=EXIT_STRONG_PROFIT_RATE,
+        exit_trailing_drop_rate=EXIT_TRAILING_DROP_RATE,
+        exit_stall_seconds=EXIT_STALL_SECONDS,
+        opening_max_hold_seconds=OPENING_MAX_HOLD_SECONDS,
     )
 
     if profit_rate >= EXIT_STRONG_PROFIT_RATE:
         return ExitResponse(action="sell", score=hold_score, reason="강한 수익 구간 도달 {:.2%}".format(profit_rate), model_name="ServerFallbackScore")
     if profit_rate >= EXIT_MIN_PROFIT_RATE and trailing_drop <= -EXIT_TRAILING_DROP_RATE:
         return ExitResponse(action="sell", score=hold_score, reason="고점 대비 밀림 {:.2%}".format(trailing_drop), model_name="ServerFallbackScore")
-    if profit_rate >= EXIT_MIN_PROFIT_RATE and hold_score < EXIT_HOLD_SCORE_MIN:
+    if profit_rate >= EXIT_MIN_PROFIT_RATE and req.hold_seconds >= EXIT_STALL_SECONDS and hold_score < EXIT_HOLD_SCORE_MIN:
         return ExitResponse(action="sell", score=hold_score, reason="상승 지속 점수 약화 {:.2f}".format(hold_score), model_name="ServerFallbackScore")
     return ExitResponse(action="hold", score=hold_score, reason="상승 지속 점수 {:.2f}".format(hold_score), model_name="ServerFallbackScore")
 
@@ -264,13 +236,27 @@ def health():
         "ok": True,
         "model_loaded": model is not None,
         "model_name": model_name,
+        "threshold": model_threshold,
+        "meta": {
+            k: model_meta.get(k)
+            for k in (
+                "train_rows",
+                "valid_rows",
+                "valid_auc",
+                "valid_accuracy_tuned",
+                "valid_f1_tuned",
+                "cv_auc_mean",
+                "cv_f1_mean",
+            )
+            if k in model_meta
+        },
     }
 
 
 @app.post("/predict-entry", response_model=EntryResponse)
 def predict_entry(req: EntryRequest):
     features = build_entry_features(req)
-    if model is None:
+    if features is None or model is None:
         return fallback_entry(req, features)
     try:
         return predict_lightgbm_entry(req, features)
