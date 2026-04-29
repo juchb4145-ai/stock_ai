@@ -154,7 +154,11 @@ def fallback_entry(req: EntryRequest, features) -> EntryResponse:
         )
 
     score = scoring.compute_entry_score(features, OPENING_MAX_SPREAD_RATE)
-    expected_return = scoring.expected_return_from_score(score)
+    expected_return = scoring.expected_return_from_score(
+        score,
+        features=features,
+        opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
+    )
     target_price = scoring.compute_target_price(req.current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
     return EntryResponse(
         status="ready",
@@ -174,7 +178,11 @@ def predict_lightgbm_entry(req: EntryRequest, features) -> EntryResponse:
     else:
         prediction = model.predict(values)
         score = scoring.clamp(float(prediction[0]))
-    expected_return = scoring.expected_return_from_score(score)
+    expected_return = scoring.expected_return_from_score(
+        score,
+        features=features,
+        opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
+    )
     target_price = scoring.compute_target_price(req.current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
 
     # 학습 시 결정된 threshold 미만이면 매수 차단 신호로 응답해 main.py가 곧바로 회피하도록 한다.

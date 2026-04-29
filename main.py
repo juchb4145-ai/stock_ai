@@ -16,6 +16,10 @@ import pandas as pd
 import pickle
 
 import scoring
+import entry_strategy
+import exit_strategy
+from bars import FiveMinIndicatorCache, MinuteBarAggregator
+from portfolio import Position, PortfolioState
 
 
 def _setup_logging():
@@ -48,47 +52,89 @@ def _setup_logging():
 
 logger = _setup_logging()
 
-CONDITION_NAME = "단테떡상이"  # 비워두면 저장된 조건식 중 첫 번째 조건식을 사용합니다.
+# ===== 단테조건식 추세전략 =====
+# 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 단테조건식.xls 의 본 조건은
+# 5분봉 BB(45,2)/BB(55,2) 및 Envelope(13,2.5)/Envelope(22,2.5) 동시 상향돌파 +
+# 일거래량 5만 + 체결강도 100% 게이트로 구성된다. 영웅문에서 저장된 실제 이름이
+# 다르다면 이 한 줄만 수정한다.
+CONDITION_NAME = "단테떡상이"
 CONDITION_SCREEN_NO = "0150"
 REALTIME_SCREEN_NO = "0160"
 ORDER_SCREEN_NO = "0001"
-AI_SERVER_ENABLED = True
+# 단테 룰 기반 전환 직후에는 AI 서버/구식 학습 트랙(entry_training.csv) 의 의사결정을
+# 따르지 않는다. 새 전략 데이터가 충분히 쌓일 때까지 두 트랙 모두 비활성화한다.
+AI_SERVER_ENABLED = False
 AI_SERVER_URL = "http://127.0.0.1:8000"
 AI_SERVER_TIMEOUT_SECONDS = 0.35
-TRAINING_DATA_ENABLED = True
+TRAINING_DATA_ENABLED = False
 TRAINING_DATA_DIR = "data"
 TRAINING_ENTRY_CSV = os.path.join(TRAINING_DATA_DIR, "entry_training.csv")
 TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
 TRAINING_SAMPLE_COOLDOWN_SECONDS = 30
 TRAINING_LABEL_HORIZONS = (300, 600, 1200)
+# === 단테 전용 학습 트랙(Phase A) ===
+# 룰 기반 운용을 유지한 채 1차/2차 진입 후보의 피처/사후 라벨만 별도 CSV 로 누적한다.
+# 충분한 표본이 쌓이면 train_dante_lgbm.py 가 같은 헤더를 읽어 모델을 학습한다.
+DANTE_TRAINING_DATA_ENABLED = True
+DANTE_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_entry_training.csv")
+DANTE_TRAINING_LABEL_HORIZONS = (300, 600, 1200)  # 5/10/20분 단순 수익률
+DANTE_TRAINING_FINAL_HORIZON_SECONDS = 25 * 60  # 25분 후 reached_1r/2r/hit_stop/time_exit 확정
+DANTE_TRAINING_SAMPLE_COOLDOWN_SECONDS = 60  # 같은 종목 연속 등록 방지(중복 표본 줄이기)
+DANTE_TRAINING_FIELDS = [
+    "sample_id",
+    "captured_at",
+    "captured_time",
+    "code",
+    "name",
+    "entry_stage",
+    "entry_price",
+    "ratio",
+    "reason",
+] + list(scoring.DANTE_ENTRY_FEATURE_NAMES) + [
+    "return_5m",
+    "return_10m",
+    "return_20m",
+    "max_return_25m",
+    "min_return_25m",
+    "reached_1r",
+    "reached_2r",
+    "hit_stop",
+    "time_exit",
+    "labeled_at",
+]
 BUY_CASH_BUFFER_RATE = 0.98
 BUY_PRICE_MARGIN_RATE = 1.005
 MIN_EXPECTED_RETURN = 0.006
-OPENING_BUY_START = 90300
-# 9:03~15:20
-OPENING_BUY_END = 152000
-OPENING_FORCE_EXIT = 152000
-
-OPENING_MIN_TICKS = 5
+# 비용 반영 순기대수익률 기준(매수/목표가/로그에 사용)
+ESTIMATED_BUY_FEE_RATE = 0.00015
+ESTIMATED_SELL_FEE_RATE = 0.00015
+ESTIMATED_SELL_TAX_RATE = 0.0018
+ESTIMATED_SLIPPAGE_RATE = 0.0015
+ESTIMATED_ROUND_TRIP_COST_RATE = (
+    ESTIMATED_BUY_FEE_RATE
+    + ESTIMATED_SELL_FEE_RATE
+    + ESTIMATED_SELL_TAX_RATE
+    + ESTIMATED_SLIPPAGE_RATE
+)
+MIN_NET_EXPECTED_RETURN = 0.006
+DYNAMIC_MIN_NET_RETURN_PERCENTILE = 0.5
+DYNAMIC_MIN_NET_RETURN_CEILING = 0.015
+# 매수 가능 시간(장 마감 직전 강제 청산 시점은 OPENING_FORCE_EXIT 동일).
+OPENING_BUY_START = 90500
+OPENING_BUY_END = 101000
+OPENING_FORCE_EXIT = 151500
+# 실시간 틱 버퍼 크기 / 최소 틱 수 (단테 1차 게이트가 사용)
+OPENING_MIN_TICKS = entry_strategy.DANTE_MIN_TICKS
 OPENING_TICK_LIMIT = 40
-OPENING_MIN_SCORE = 0.68
-OPENING_TAKE_PROFIT_RATE = 0.012
-OPENING_STOP_LOSS_RATE = -0.008
-OPENING_STOP_LOSS_GRACE_SECONDS = 45
-OPENING_STOP_LOSS_FORCE_RATE = -0.012
-OPENING_STOP_LOSS_CONFIRM_TICKS = 3
-OPENING_MAX_HOLD_SECONDS = 20 * 60
-OPENING_MIN_HOLD_SECONDS = 5 * 60
-OPENING_MAX_SPREAD_RATE = 0.006
-ENTRY_OVERHEAT_BOX_POSITION = 0.95
-ENTRY_OVERHEAT_DIRECTION_MAX = 0.25
-EXIT_MIN_PROFIT_RATE = 0.007
-EXIT_STRONG_PROFIT_RATE = 0.018
-EXIT_TRAILING_DROP_RATE = 0.0035
-EXIT_HOLD_SCORE_MIN = 0.45
-EXIT_STALL_SECONDS = 7 * 60
-MAX_CONCURRENT_POSITIONS = 3
-MAX_DAILY_BUY_COUNT = 5
+# 호가 스프레드 상한
+OPENING_MAX_SPREAD_RATE = entry_strategy.MAX_SPREAD_RATE
+# 손절/시간 손절 등은 exit_strategy 모듈로 이전했다. 호환을 위해 alias 만 남긴다.
+OPENING_STOP_LOSS_RATE = -exit_strategy.R_UNIT_PCT  # -1R
+OPENING_MAX_HOLD_SECONDS = exit_strategy.EXIT_TIME_LIMIT_SECONDS
+# 단테 전략은 1차 추격(소량) + 2차 본진입(본물량) 분할매수 방식이라 동시 보유 종목을
+# 보수적으로 1개로 시작한다. 검증 후 점진적으로 늘린다.
+MAX_CONCURRENT_POSITIONS = 1
+MAX_DAILY_BUY_COUNT = 20
 CONDITION_PROCESS_INTERVAL_MS = 2000
 CONDITION_COOLDOWN_SECONDS = 60
 WAIT_LOG_COOLDOWN_SECONDS = 30
@@ -479,6 +525,9 @@ class Kiwoom(QAxWidget):
         self.condition_registered_at = {}
         self.pending_training_samples = {}
         self.last_training_sample_at = {}
+        # 단테 학습 트랙(Phase A) 의 sample_id → 진행 정보. 5/10/20분 horizon 라벨링 후 CSV flush.
+        self.pending_dante_samples = {}
+        self.last_dante_sample_at = {}
         self.order_context = {}
         self.last_tr_request_at = 0
         self.last_order_request_at = 0
@@ -493,6 +542,17 @@ class Kiwoom(QAxWidget):
         self.cached_orders = []
         self.account_updated_at = 0
         self.trading_day = ""
+        # 점진적 dataclass 마이그레이션용 새 컨테이너. 현재는 기존 dict들과 병행 운영된다.
+        # Phase 3: write 경로에서 parallel write, 추후 read 경로도 portfolio 기반으로 전환.
+        self.portfolio = PortfolioState()
+        # 단테 추세전략용 1분봉 집계기 + 5분봉 BB/Envelope 캐시.
+        # 1분봉은 실시간 틱(append_realtime_tick) 에서, 5분봉은 opt10080 TR 응답에서 push 된다.
+        self.minute_aggregator = MinuteBarAggregator(max_bars=60)
+        self.five_min_cache = FiveMinIndicatorCache()
+        # 학습 데이터(entry_training.csv) 기반 보정값.
+        # 단테 룰 전환 직후에는 사용하지 않으므로 None 상태로 둔다.
+        self.dynamic_min_net_return = None
+        self.entry_calibration = self.load_entry_calibration()
         self.ai_server_failure_count = 0
         self.ai_server_cooldown_until = 0.0
         self.condition_timer = QTimer()
@@ -530,6 +590,14 @@ class Kiwoom(QAxWidget):
             if value is None or value == "":
                 return default
             return abs(int(str(value).strip().lstrip("+").lstrip("-")))
+        except (TypeError, ValueError):
+            return default
+
+    def parse_float(self, value, default=0.0):
+        try:
+            if value is None or value == "":
+                return default
+            return float(str(value).strip().replace("%", ""))
         except (TypeError, ValueError):
             return default
     
@@ -627,28 +695,77 @@ class Kiwoom(QAxWidget):
                     self.order_prices[code] = entry_price
                     self.highest_prices[code] = max(self.highest_prices.get(code, entry_price), entry_price)
                 self.entry_times.setdefault(code, time.time())
-                target_return = context.get("target_return")
-                if not isinstance(target_return, (int, float)):
-                    target_return = self.estimate_target_return(entry_price, context.get("target_price", ""))
-                if target_return > 0:
-                    self.target_returns[code] = target_return
-                    target_price = self.compute_target_price(entry_price, target_return)
-                else:
-                    target_price = self.parse_int(context.get("target_price", ""))
-                if target_price:
-                    self.best[code] = target_price
-                    self.save_best()
+
+                # Portfolio dataclass 마이그레이션: 매수 체결 시점에 Position을 동기 갱신.
+                position = self.portfolio.get_or_create(code, name=context.get("name", "") or self.get_code_name(code))
+                position.quantity = total_quantity
+                if entry_price:
+                    position.entry_price = entry_price
+                    position.update_highest(entry_price)
+                if not position.entry_time:
+                    position.entry_time = time.time()
+                position.bought_today = True
+                position.pending_buy = left_quantity_int > 0
+                if isinstance(context, dict):
+                    position.order_context = dict(context)
+
+                # === 단테 분할매수 상태 갱신 ===
+                stage_executed = int(context.get("stage", 1) or 1) if isinstance(context, dict) else 1
+                planned_from_ctx = self.parse_int(context.get("planned_quantity", 0)) if isinstance(context, dict) else 0
+                grade_from_ctx = (
+                    str(context.get("grade", "") or "") if isinstance(context, dict) else ""
+                )
+                if planned_from_ctx > 0 and position.planned_quantity <= 0:
+                    position.planned_quantity = planned_from_ctx
+                if grade_from_ctx and not position.breakout_grade:
+                    position.breakout_grade = grade_from_ctx
+                # 부분체결 중에는 stage 를 올리지 않는다(잔여 0이 되어야 단계 완료).
+                if left_quantity_int <= 0:
+                    if stage_executed >= 2:
+                        position.entry_stage = 2
+                        position.entry2_time = time.time()
+                        # B급 일괄 체결 — entry1_time 도 함께 채워야 시간손절 anchor 가 잡힌다.
+                        if not position.entry1_time:
+                            position.entry1_time = position.entry2_time
+                    elif position.entry_stage < 1:
+                        position.entry_stage = 1
+                        position.entry1_time = time.time()
+                        position.pullback_window_deadline = (
+                            position.entry1_time + entry_strategy.PULLBACK_WINDOW_MAX_SECONDS
+                        )
+                # 1차 체결 시점에 R-multiple 트레일링 초기 셋업.
+                if position.entry_stage >= 1:
+                    if position.r_unit_pct <= 0:
+                        position.r_unit_pct = exit_strategy.R_UNIT_PCT
+                    # 평단(체결가 기반) 대비 -1R 로 stop 초기화. 가중평균이 변하면 다시 잡는다.
+                    initial_stop = int(position.entry_price * (1 - position.r_unit_pct))
+                    if position.stop_price <= 0 or position.stop_price < initial_stop:
+                        position.stop_price = initial_stop
+                    if position.breakout_high <= 0:
+                        position.breakout_high = position.entry_price
+
                 self.register_realtime_stock(code)
                 if left_quantity_int <= 0:
                     self.pending_order_codes.discard(code)
                 self.account_updated_at = 0
                 self.deposit_updated_at = 0
                 self.process_pending_sell_intents([code])
+
+                # 1차 체결 직후 즉시 2차 평가가 돌도록 condition 큐에 다시 등록.
+                if left_quantity_int <= 0 and position.entry_stage == 1:
+                    self.requeue_condition_stock(code)
             elif side == "sell" and executed_quantity_int > 0:
                 remaining_quantity = max(self.position_quantities.get(code, 0) - executed_quantity_int, 0)
                 self.position_quantities[code] = remaining_quantity
                 if remaining_quantity <= 0 and left_quantity_int <= 0:
+                    # _discard_position이 portfolio에서도 제거하므로 별도 동기화 불필요.
                     self._discard_position(code)
+                else:
+                    # Portfolio dataclass 마이그레이션: 부분 체결 시 수량/대기 플래그만 갱신.
+                    position = self.portfolio.get(code)
+                    if position is not None:
+                        position.quantity = remaining_quantity
+                        position.pending_sell = left_quantity_int > 0
                 if left_quantity_int <= 0:
                     self.pending_sell_order_codes.discard(code)
                 self.account_updated_at = 0
@@ -670,6 +787,8 @@ class Kiwoom(QAxWidget):
                         if target_price > 0:
                             self.best[code] = target_price
                             self.save_best()
+                # Portfolio dataclass 마이그레이션: 잔고 변경 통보 시 Position도 동기화.
+                self._sync_position_from_dicts(code)
             else:
                 self._discard_position(code)
             self.account_updated_at = 0
@@ -680,6 +799,9 @@ class Kiwoom(QAxWidget):
         # 부분체결 중에는 컨텍스트가 필요하므로 유지한다.
         if order_terminated and code:
             self.order_context.pop(code, None)
+            position = self.portfolio.get(code)
+            if position is not None:
+                position.order_context = {}
 
     def _on_receive_condition_ver(self, ret, msg):
         logger.info("조건식 로드 결과: ret=%s msg=%s", ret, msg)
@@ -720,6 +842,38 @@ class Kiwoom(QAxWidget):
                 volume = int(self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "거래량").strip())
                 total.append([date, open, high, low, close, volume])
             self.tr_data = total
+        elif rqname == "opt10080":
+            # 분봉 TR. 응답 순서는 최신→과거이므로 OHLCV 튜플로 뒤집어 둔다.
+            # 마지막 항목이 진행봉(0봉전), 그 직전이 1봉전 완성봉.
+            bars = []
+            for i in range(cnt):
+                close_str = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가"
+                ).strip()
+                if not close_str:
+                    continue
+                close_int = abs(int(close_str.lstrip("+").lstrip("-")))
+                if close_int <= 0:
+                    continue
+                open_str = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)", trcode, rqname, i, "시가"
+                ).strip()
+                high_str = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)", trcode, rqname, i, "고가"
+                ).strip()
+                low_str = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)", trcode, rqname, i, "저가"
+                ).strip()
+                vol_str = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)", trcode, rqname, i, "거래량"
+                ).strip()
+                open_int = abs(int(open_str.lstrip("+").lstrip("-"))) if open_str else close_int
+                high_int = abs(int(high_str.lstrip("+").lstrip("-"))) if high_str else close_int
+                low_int = abs(int(low_str.lstrip("+").lstrip("-"))) if low_str else close_int
+                vol_int = abs(int(vol_str.lstrip("+").lstrip("-"))) if vol_str else 0
+                bars.append((open_int, high_int, low_int, close_int, vol_int))
+            bars.reverse()
+            self.tr_data = bars
         elif rqname == "opw00001":
             deposit = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, 0, "주문가능금액")
             self.tr_data = int(deposit)
@@ -958,6 +1112,66 @@ class Kiwoom(QAxWidget):
         finally:
             self._tr_busy = False
 
+    def get_5min_chart(self, code, count=80):
+        """opt10080 5분봉 OHLCV 튜플 리스트(과거→최신).
+
+        각 항목 = (open, high, low, close, volume). 마지막 항목이 진행봉(0봉전).
+        데이터 없거나 TR 분주 시 빈 리스트.
+        """
+        if self._tr_busy:
+            return []
+        self._tr_busy = True
+        try:
+            self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+            self.dynamicCall("SetInputValue(QString, QString)", "틱범위", "5")
+            self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
+            self.tr_data = []
+            self.request_tr("opt10080", "opt10080", 0, "0021")
+            self._wait_tr_event()
+            data = self.tr_data if isinstance(self.tr_data, list) else []
+            if count > 0 and len(data) > count:
+                data = data[-count:]
+            return data
+        finally:
+            self._tr_busy = False
+
+    def refresh_five_min_indicators(self, code, refresh_seconds=60.0):
+        """opt10080 응답으로 5분봉 BB/Envelope/OHLC 캐시를 갱신한다.
+
+        TR 빈도 제한(초 5회) 안에서 동작하도록 needs_refresh 로 주기를 제한한다.
+        TR 가 분주(_tr_busy)하면 다음 호출에서 다시 시도한다.
+        진행봉 close 는 실시간 마지막 틱으로 덮어써 stale 을 보정한다.
+        """
+        code = self.normalize_code(code)
+        if not code:
+            return
+        if not self.five_min_cache.needs_refresh(code, refresh_seconds=refresh_seconds):
+            return
+        if self._tr_busy:
+            return
+        try:
+            bars = self.get_5min_chart(code, count=80)
+        except Exception as exc:
+            logger.warning("[5분봉 조회 실패] %s %s", code, exc)
+            return
+        if not bars:
+            return
+
+        # 진행봉 close 를 실시간 마지막 틱으로 덮어쓰기 (TR 응답이 60초 stale 이어도 진행봉만큼은 최신).
+        ticks = self.realtime_ticks.get(code, [])
+        if ticks:
+            last_close = self.parse_int(ticks[-1].get("close", 0))
+            if last_close > 0 and bars:
+                o, h, l, _c, v = bars[-1]
+                if not o:
+                    o = last_close
+                new_h = max(h or last_close, last_close)
+                new_l = min(l or last_close, last_close) if l else last_close
+                bars[-1] = (o, new_h, new_l, last_close, v)
+
+        self.five_min_cache.update_bars(code, bars)
+        self.five_min_cache.mark_refreshed(code)
+
     def get_deposit(self, force=False):
         now = time.time()
         if not force and self.cached_deposit is not None and now - self.deposit_updated_at < DEPOSIT_CACHE_SECONDS:
@@ -1036,13 +1250,14 @@ class Kiwoom(QAxWidget):
             return 0
         return abs(int(value))
 
-    def append_realtime_tick(self, code, signed_at, close, high, open, low, ask, bid, accum_volume):
+    def append_realtime_tick(self, code, signed_at, close, high, open, low, ask, bid, accum_volume, chejan_strength=0.0):
         code = self.normalize_code(code)
         if code in self.no_tick_codes:
             self.no_tick_codes.discard(code)
             self.requeue_condition_stock(code)
+        received_at = time.time()
         tick = {
-            "received_at": time.time(),
+            "received_at": received_at,
             "signed_at": signed_at,
             "close": close,
             "high": high,
@@ -1051,12 +1266,32 @@ class Kiwoom(QAxWidget):
             "ask": ask,
             "bid": bid,
             "accum_volume": accum_volume,
+            "chejan_strength": chejan_strength,
         }
         ticks = self.realtime_ticks.setdefault(code, [])
         ticks.append(tick)
         if len(ticks) > OPENING_TICK_LIMIT:
             del ticks[:-OPENING_TICK_LIMIT]
-        self.update_training_labels(code, close, tick["received_at"])
+
+        # 1분봉 집계기에도 동일 틱을 push 한다. open 이 변수 그림자 문제로 read-only 인 점을 명확히 처리.
+        self.minute_aggregator.push(
+            code,
+            received_at=received_at,
+            close=close,
+            high=high,
+            low=low,
+            open_=open,
+            accum_volume=accum_volume,
+        )
+
+        # 1차 진입 후 갱신되는 고점을 Position 에 기록한다(2차 눌림 판정 기준).
+        position = self.portfolio.get(code)
+        if position is not None and position.entry_stage >= 1 and close > 0:
+            position.update_breakout_high(int(close))
+            position.update_highest(int(close))
+
+        self.update_training_labels(code, close, received_at)
+        self.update_dante_training_labels(code, close, received_at)
 
     def _on_receive_real_data(self, s_code, real_type, real_data):
         if real_type == "장시작시간":
@@ -1070,9 +1305,17 @@ class Kiwoom(QAxWidget):
             top_priority_ask = self.get_real_int(s_code, "(최우선)매도호가")
             top_priority_bid = self.get_real_int(s_code, "(최우선)매수호가")
             accum_volume = self.get_real_int(s_code, "누적거래량")
+            chejan_strength_str = self.dynamicCall(
+                "GetCommRealData(QString, QString)", s_code, get_fid("체결강도")
+            ).strip()
+            chejan_strength = self.parse_float(chejan_strength_str, 0.0)
 
             self.universe_realtime_transaction_info.append([s_code, signed_at, close, high, open, low, top_priority_ask, top_priority_bid, accum_volume])
-            self.append_realtime_tick(s_code, signed_at, close, high, open, low, top_priority_ask, top_priority_bid, accum_volume)
+            self.append_realtime_tick(
+                s_code, signed_at, close, high, open, low,
+                top_priority_ask, top_priority_bid, accum_volume,
+                chejan_strength=chejan_strength,
+            )
     
     def set_real_reg(self, str_screen_no, str_code_list, str_fid_list, str_opt_type):
         self.dynamicCall("SetRealReg(QString, QString, QString, QString)", str_screen_no, str_code_list, str_fid_list, str_opt_type)
@@ -1105,10 +1348,42 @@ class Kiwoom(QAxWidget):
         self.pending_sell_order_codes.clear()
         self.condition_registered_at.clear()
         self.last_training_sample_at.clear()
+        self.last_dante_sample_at.clear()
+        # 전날 미라벨링된 단테 샘플은 표본 신뢰도가 낮으므로 폐기한다.
+        self.pending_dante_samples.clear()
         logger.info("[일일초기화] {} 매수 후보/대기 상태 초기화".format(today))
 
     def normalize_code(self, code):
         return code.strip().lstrip("A")
+
+    def _sync_position_from_dicts(self, code):
+        """기존 dict 상태로부터 portfolio Position을 재구성/갱신한다.
+
+        아직 portfolio 마이그레이션이 끝나지 않은 write 경로(예: update_account_status에서
+        잔고 TR 응답으로 dict를 갱신하는 부분) 직후에 호출해, portfolio가 항상 dict와
+        동일한 종목 상태를 갖도록 한다. 모든 read 경로가 portfolio 기반으로 옮겨가면
+        이 헬퍼는 필요 없어진다.
+        """
+        code = self.normalize_code(code)
+        if not code:
+            return None
+        position = self.portfolio.get_or_create(code, name=self.get_code_name(code) or "")
+        position.quantity = self.parse_int(self.position_quantities.get(code, 0))
+        position.available_quantity = self.parse_int(self.available_quantities.get(code, 0))
+        position.entry_price = self.parse_int(self.order_prices.get(code, 0))
+        position.target_price = self.parse_int(self.best.get(code, 0))
+        target_return = self.target_returns.get(code, 0.0)
+        position.target_return = float(target_return) if isinstance(target_return, (int, float)) else 0.0
+        entry_time = self.entry_times.get(code, 0.0)
+        position.entry_time = float(entry_time) if isinstance(entry_time, (int, float)) else 0.0
+        position.highest_price = self.parse_int(self.highest_prices.get(code, 0))
+        position.bought_today = code in self.bought_codes
+        position.pending_buy = code in self.pending_order_codes and code not in self.pending_sell_order_codes
+        position.pending_sell = code in self.pending_sell_order_codes
+        position.pending_sell_intent = self.pending_sell_intents.get(code)
+        order_context = self.order_context.get(code, {})
+        position.order_context = order_context if isinstance(order_context, dict) else {}
+        return position
 
     def _discard_position(self, code, *, save=True, drop_pending_sell=True):
         # 종목 청산 시 흩어진 상태 dict/set을 한 번에 정리한다. 한 군데라도 빠지면 정합성이 깨지므로 항상 이 헬퍼를 사용한다.
@@ -1127,6 +1402,11 @@ class Kiwoom(QAxWidget):
         if drop_pending_sell:
             self.pending_sell_order_codes.discard(code)
         self.order_context.pop(code, None)
+        # Portfolio dataclass 마이그레이션: 기존 dict 정리와 동시에 portfolio에서도 제거.
+        self.portfolio.remove(code)
+        # 단테 전략 캐시도 함께 정리(메모리/오랜 보유 방지).
+        self.minute_aggregator.discard(code)
+        self.five_min_cache.discard(code)
         if save:
             self.save_best()
 
@@ -1203,20 +1483,73 @@ class Kiwoom(QAxWidget):
         if balance_ok and order_ok:
             self.account_updated_at = time.time()
 
-    def should_skip_buy(self, code):
-        if code in self.holding_codes:
-            logger.info("[매수 제외] {} 이미 보유 중".format(code))
-            return True
-        if code in self.pending_order_codes:
-            logger.info("[매수 제외] {} 미체결 주문 존재".format(code))
-            return True
-        if code in self.bought_codes:
-            logger.info("[매수 제외] {} 오늘 이미 매수 주문 처리".format(code))
-            return True
-        if len(self.holding_codes) + len(self.pending_order_codes) >= MAX_CONCURRENT_POSITIONS:
+        # Portfolio dataclass 마이그레이션: dict 갱신 직후 portfolio도 동기화한다.
+        # dict에서 사라진 종목은 portfolio에서도 제거되고, 살아 있는 종목은 최신 정보로 갱신된다.
+        if balance_ok or order_ok:
+            tracked_codes = self.holding_codes | self.pending_order_codes
+            for code in tracked_codes:
+                self._sync_position_from_dicts(code)
+            for stale_code in list(self.portfolio.codes() - tracked_codes - set(self.best.keys())):
+                self.portfolio.remove(stale_code)
+
+    def should_skip_buy(self, code, *, stage=1, grade=""):
+        """매수를 건너뛰어야 하는지 판단.
+
+        stage:
+          1 = 1차 추격 매수 (A급 0봉 돌파)
+          2 = 본진입 — A급 75% 분할 본진입 또는 B급 100% 일괄 본진입
+        grade:
+          "A" 또는 "B". B급 stage=2 는 신규 종목에서 한 번에 매수하므로 Position 미존재가 정상.
+        """
+        position = self.portfolio.get(code)
+        if stage == 2:
+            # B급 일괄 매수: position 미존재가 정상.
+            if grade == "B" and (position is None or position.entry_stage == 0):
+                if position is not None and position.entry_stage >= 2:
+                    logger.info("[B급 매수 제외] {} 이미 본진입 완료".format(code))
+                    return True
+                if position is not None and position.pending_sell:
+                    logger.info("[B급 매수 제외] {} 매도 진행 중".format(code))
+                    return True
+                # 신규 종목으로 취급 — 동시보유/일일한도 게이트는 stage=1 분기와 동일하게 적용.
+                position_count = (
+                    len(self.portfolio.holding_codes())
+                    + len(self.portfolio.pending_order_codes())
+                )
+                if position_count >= MAX_CONCURRENT_POSITIONS:
+                    logger.info("[B급 매수 제외] 최대 보유/주문 종목 수 도달: {}".format(MAX_CONCURRENT_POSITIONS))
+                    return True
+                if len(self.portfolio.bought_today_codes()) >= MAX_DAILY_BUY_COUNT:
+                    logger.info("[B급 매수 제외] 일일 매수 횟수 한도 도달: {}".format(MAX_DAILY_BUY_COUNT))
+                    return True
+                return False
+            # A급 본진입: 1차 보유/미체결 상태가 정상.
+            if position is None:
+                logger.info("[2차 매수 제외] {} 1차 Position 없음".format(code))
+                return True
+            if position.entry_stage >= 2:
+                logger.info("[2차 매수 제외] {} 본진입 완료".format(code))
+                return True
+            if position.pending_sell:
+                logger.info("[2차 매수 제외] {} 매도 진행 중".format(code))
+                return True
+            return False
+
+        if position is not None:
+            if position.is_holding() or position.entry_stage >= 1:
+                logger.info("[매수 제외] {} 이미 보유 중".format(code))
+                return True
+            if position.is_pending():
+                logger.info("[매수 제외] {} 미체결 주문 존재".format(code))
+                return True
+            if position.bought_today:
+                logger.info("[매수 제외] {} 오늘 이미 매수 주문 처리".format(code))
+                return True
+        position_count = len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
+        if position_count >= MAX_CONCURRENT_POSITIONS:
             logger.info("[매수 제외] 최대 보유/주문 종목 수 도달: {}".format(MAX_CONCURRENT_POSITIONS))
             return True
-        if len(self.bought_codes) >= MAX_DAILY_BUY_COUNT:
+        if len(self.portfolio.bought_today_codes()) >= MAX_DAILY_BUY_COUNT:
             logger.info("[매수 제외] 일일 매수 횟수 한도 도달: {}".format(MAX_DAILY_BUY_COUNT))
             return True
         return False
@@ -1231,11 +1564,102 @@ class Kiwoom(QAxWidget):
     def clamp(self, value, low=0.0, high=1.0):
         return max(low, min(high, value))
 
+    def load_entry_calibration(self, path=TRAINING_ENTRY_CSV, bins=10, min_per_bin=5, min_total=80):
+        """학습 데이터에서 score→평균 return_10m 매핑(보정 테이블)을 만든다.
+
+        - score를 bins개 구간으로 나눠 각 구간 평균 return_10m 을 계산한다.
+        - 각 구간에 표본이 min_per_bin개 미만이거나 전체가 min_total 미만이면 None 반환.
+        - return은 scoring.calibrated_return_from_score 가 사용하는 형식의 list of dict.
+        """
+        try:
+            if not os.path.exists(path):
+                return None
+            df = pd.read_csv(path, encoding="utf-8-sig")
+            if "score" not in df.columns or "return_10m" not in df.columns:
+                return None
+            df = df[["score", "return_10m"]].copy()
+            df["score"] = pd.to_numeric(df["score"], errors="coerce")
+            df["return_10m"] = pd.to_numeric(df["return_10m"], errors="coerce")
+            df = df.dropna()
+            if len(df) < min_total:
+                logger.info("[entry calibration] 표본 부족(%d < %d) → fallback 사용", len(df), min_total)
+                return None
+            edges = [i / bins for i in range(bins + 1)]
+            df["bin"] = pd.cut(df["score"], bins=edges, include_lowest=True, labels=False)
+            grouped = df.groupby("bin")
+            table = []
+            for bin_idx, group in grouped:
+                if len(group) < min_per_bin:
+                    continue
+                table.append({
+                    "score": float((edges[int(bin_idx)] + edges[int(bin_idx) + 1]) / 2),
+                    "return": float(group["return_10m"].mean()),
+                    "count": int(len(group)),
+                })
+            if len(table) < 3:
+                logger.info("[entry calibration] 유효 구간 부족(%d) → fallback 사용", len(table))
+                return None
+            table.sort(key=lambda row: row["score"])
+            logger.info("[entry calibration] %d개 구간 로드: %s", len(table),
+                        ["{:.2f}->{:+.2%}({})".format(r["score"], r["return"], r["count"]) for r in table])
+            self.dynamic_min_net_return = self._compute_dynamic_min_net_return(df["return_10m"])
+            return table
+        except Exception as exc:
+            logger.warning("[entry calibration] 로드 실패: %s", exc)
+            return None
+
+    def _compute_dynamic_min_net_return(self, returns):
+        """학습 데이터의 return_10m 분포에서 P50 기반의 자동 임계값을 계산한다.
+
+        - 표본이 너무 적으면 None 반환 → 정적 MIN_NET_EXPECTED_RETURN 사용.
+        - gross P50 에서 왕복비용을 차감한 net 값을 [floor, ceiling] 범위로 클램프한다.
+        """
+        try:
+            series = returns.dropna() if hasattr(returns, "dropna") else returns
+            if len(series) < 80:
+                return None
+            gross_p = float(series.quantile(DYNAMIC_MIN_NET_RETURN_PERCENTILE))
+            net = gross_p - ESTIMATED_ROUND_TRIP_COST_RATE
+            tuned = max(MIN_NET_EXPECTED_RETURN, min(net, DYNAMIC_MIN_NET_RETURN_CEILING))
+            logger.info(
+                "[entry calibration] 동적 매수 임계값 적용: P%.0f gross=%+.2%%, 비용=%.2%%, net=%+.2%% → 임계 %.2%%",
+                DYNAMIC_MIN_NET_RETURN_PERCENTILE * 100,
+                gross_p,
+                ESTIMATED_ROUND_TRIP_COST_RATE,
+                net,
+                tuned,
+            )
+            return tuned
+        except Exception as exc:
+            logger.warning("[entry calibration] 동적 임계값 계산 실패: %s", exc)
+            return None
+
+    def gross_to_net_return(self, gross_return):
+        gross_return = self.parse_float(gross_return, 0.0)
+        return gross_return - ESTIMATED_ROUND_TRIP_COST_RATE
+
+    def net_to_gross_return(self, net_return):
+        net_return = self.parse_float(net_return, 0.0)
+        return net_return + ESTIMATED_ROUND_TRIP_COST_RATE
+
+    def compute_target_price_for_net_return(self, entry_price, net_target_return):
+        gross_target_return = self.net_to_gross_return(net_target_return)
+        return self.compute_target_price(entry_price, gross_target_return)
+
+    def estimate_net_target_return(self, entry_price, target_price):
+        gross_target_return = self.estimate_target_return(entry_price, target_price)
+        return self.gross_to_net_return(gross_target_return)
+
     def compute_target_price(self, entry_price, target_return):
         entry_price = self.parse_int(entry_price)
         if entry_price <= 0:
             return 0
-        return round(int(entry_price * (1 + target_return)), -1)
+        raw = entry_price * (1 + target_return)
+        rounded = scoring.round_up_to_tick(raw)
+        # 진입가와 같거나 더 낮아지는 경우(매우 작은/음수 target_return)는 최소 1틱 위로 올린다.
+        if rounded <= entry_price:
+            rounded = entry_price + scoring.tick_size(entry_price)
+        return rounded
 
     def estimate_target_return(self, entry_price, target_price):
         entry_price = self.parse_int(entry_price)
@@ -1244,7 +1668,7 @@ class Kiwoom(QAxWidget):
             return 0.0
         return target_price / entry_price - 1
 
-    def has_consecutive_down_ticks(self, code, required_count=OPENING_STOP_LOSS_CONFIRM_TICKS):
+    def has_consecutive_down_ticks(self, code, required_count=3):
         code = self.normalize_code(code)
         ticks = self.realtime_ticks.get(code, [])
         if len(ticks) < required_count + 1:
@@ -1337,6 +1761,166 @@ class Kiwoom(QAxWidget):
         with open(TRAINING_ENTRY_CSV, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
             writer.writerow(row)
+
+    # ---------------------------------------------------------------
+    # 단테 학습 트랙(Phase A) — 데이터 수집 전용. Phase B 모델 학습은 별도 스크립트.
+    # ---------------------------------------------------------------
+
+    def ensure_dante_training_data_file(self):
+        if not DANTE_TRAINING_DATA_ENABLED:
+            return
+        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+        if os.path.exists(DANTE_TRAINING_CSV):
+            return
+        with open(DANTE_TRAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=DANTE_TRAINING_FIELDS)
+            writer.writeheader()
+
+    def append_dante_training_row(self, row):
+        if not DANTE_TRAINING_DATA_ENABLED:
+            return
+        self.ensure_dante_training_data_file()
+        with open(DANTE_TRAINING_CSV, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=DANTE_TRAINING_FIELDS)
+            writer.writerow(row)
+
+    def register_dante_training_sample(self, *, code, name, ctx, decision, current_price):
+        """1차/2차 매수 'ready' 결정 직후 호출. 진입 피처를 캡처하고 사후 라벨링 큐에 등록한다.
+
+        실제 매수 발주(send_order) 와 무관하게 호출된다.
+        매수 차단/실패가 일어나도 단테 게이트가 'ready' 라고 판단했으면 가설 표본으로 누적한다.
+        같은 종목에서 1분 안에 두 번 ready 가 떨어져도 한 번만 기록한다.
+        """
+        if not DANTE_TRAINING_DATA_ENABLED:
+            return
+        if decision is None or getattr(decision, "status", "") != "ready":
+            return
+        if current_price <= 0:
+            return
+
+        now = time.time()
+        last_at = self.last_dante_sample_at.get(code, 0)
+        if now - last_at < DANTE_TRAINING_SAMPLE_COOLDOWN_SECONDS:
+            return
+
+        five_min = ctx.five_min_ind
+        env_upper = five_min.env_upper_13_25 if five_min is not None else None
+        bb_upper = five_min.bb_upper_55_2 if five_min is not None else None
+        closes_count = five_min.closes_count if five_min is not None else 0
+        breakout_high = ctx.position.breakout_high if ctx.position is not None else 0
+        obs_elapsed = now - (ctx.condition_registered_at or now)
+
+        features = scoring.build_dante_entry_features(
+            current_price=current_price,
+            chejan_strength=ctx.chejan_strength,
+            volume_speed=ctx.volume_speed,
+            spread_rate=ctx.spread_rate,
+            obs_elapsed_sec=obs_elapsed,
+            env_upper_13=env_upper,
+            bb_upper_55=bb_upper,
+            five_min_closes_count=closes_count,
+            breakout_high=breakout_high,
+            minute_bars=ctx.minute_bars,
+            chejan_strength_history=ctx.chejan_strength_history,
+            is_breakout_zero_bar=ctx.is_breakout_zero_bar,
+            is_breakout_prev_bar=ctx.is_breakout_prev_bar,
+            upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
+            open_return=ctx.open_return,
+        )
+
+        sample_id = uuid.uuid4().hex
+        row = {
+            "sample_id": sample_id,
+            "captured_at": now,
+            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "name": name,
+            "entry_stage": int(getattr(decision, "stage", 1)),
+            "entry_price": int(current_price),
+            "ratio": float(getattr(decision, "ratio", 0.0)),
+            "reason": getattr(decision, "reason", ""),
+        }
+        row.update(features)
+        for horizon in DANTE_TRAINING_LABEL_HORIZONS:
+            row["return_{}m".format(horizon // 60)] = ""
+        row["max_return_25m"] = ""
+        row["min_return_25m"] = ""
+        row["reached_1r"] = ""
+        row["reached_2r"] = ""
+        row["hit_stop"] = ""
+        row["time_exit"] = ""
+        row["labeled_at"] = ""
+
+        self.pending_dante_samples[sample_id] = {
+            "code": code,
+            "captured_at": now,
+            "entry_price": int(current_price),
+            "row": row,
+            "labeled_horizons": set(),
+            "max_price": int(current_price),
+            "min_price": int(current_price),
+            "finalized": False,
+        }
+        self.last_dante_sample_at[code] = now
+        logger.info(
+            "[단테 학습데이터] 후보 등록 {} {} stage={} ratio={:.2f} sample {}".format(
+                name, code, row["entry_stage"], row["ratio"], sample_id[:8]
+            )
+        )
+
+    def update_dante_training_labels(self, code, current_price, received_at):
+        """매 틱 수신 시 호출. 진행 중인 단테 샘플에 max/min/horizon 라벨을 갱신한다.
+
+        25분 경과한 샘플은 reached_1r/reached_2r/hit_stop/time_exit 를 확정하고 CSV 에 flush.
+        """
+        if not DANTE_TRAINING_DATA_ENABLED:
+            return
+        if not self.pending_dante_samples:
+            return
+        if current_price is None or current_price <= 0:
+            return
+        completed = []
+        for sample_id, sample in list(self.pending_dante_samples.items()):
+            if sample.get("finalized"):
+                continue
+            if sample.get("code") != code:
+                continue
+            entry_price = sample.get("entry_price", 0)
+            if entry_price <= 0:
+                continue
+            elapsed = received_at - sample.get("captured_at", received_at)
+            if current_price > sample.get("max_price", current_price):
+                sample["max_price"] = current_price
+            if current_price < sample.get("min_price", current_price):
+                sample["min_price"] = current_price
+            for horizon in DANTE_TRAINING_LABEL_HORIZONS:
+                if horizon in sample["labeled_horizons"] or elapsed < horizon:
+                    continue
+                sample["row"]["return_{}m".format(horizon // 60)] = current_price / entry_price - 1
+                sample["labeled_horizons"].add(horizon)
+            if elapsed >= DANTE_TRAINING_FINAL_HORIZON_SECONDS:
+                row = sample["row"]
+                max_ret = sample["max_price"] / entry_price - 1
+                min_ret = sample["min_price"] / entry_price - 1
+                r_unit = exit_strategy.R_UNIT_PCT
+                row["max_return_25m"] = max_ret
+                row["min_return_25m"] = min_ret
+                row["reached_1r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_BE_R else 0
+                row["reached_2r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_PARTIAL_R else 0
+                row["hit_stop"] = 1 if min_ret <= -r_unit else 0
+                row["time_exit"] = 1 if max_ret < r_unit * exit_strategy.EXIT_BE_R else 0
+                row["labeled_at"] = received_at
+                self.append_dante_training_row(row)
+                sample["finalized"] = True
+                completed.append(sample_id)
+                logger.info(
+                    "[단테 학습데이터] 라벨 완료 {} sample {} max {:.2%} min {:.2%} 1R={} 2R={} stop={}".format(
+                        code, sample_id[:8], max_ret, min_ret,
+                        row["reached_1r"], row["reached_2r"], row["hit_stop"],
+                    )
+                )
+        for sample_id in completed:
+            self.pending_dante_samples.pop(sample_id, None)
 
     def ensure_trade_log_file(self):
         os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
@@ -1474,131 +2058,128 @@ class Kiwoom(QAxWidget):
         ]
 
     def score_opening_trade(self, code):
+        """단테조건식 편입 종목에 대해 1차(추격) 또는 2차(눌림 본진입) 매수 가능 여부 평가."""
         code = self.normalize_code(code)
         now = self.current_hhmmss()
         if now < OPENING_BUY_START:
-            return {
-                "status": "wait",
-                "reason": "장초반 매수 시작 전",
-            }
+            return {"status": "wait", "reason": "매수 시작 전"}
         if now > OPENING_BUY_END:
-            return {
-                "status": "blocked",
-                "reason": "장초반 매수 시간 아님",
-            }
+            return {"status": "blocked", "reason": "매수 시간 종료"}
 
         ticks = self.realtime_ticks.get(code, [])
-        if len(ticks) < OPENING_MIN_TICKS:
-            return {
-                "status": "wait",
-                "reason": "실시간 틱 부족 {}/{}".format(len(ticks), OPENING_MIN_TICKS),
-            }
+        if not ticks:
+            return {"status": "wait", "reason": "실시간 틱 미수신"}
 
         first = ticks[0]
         last = ticks[-1]
         current_price = last["close"]
         open_price = last["open"]
-        highs = [tick["high"] for tick in ticks if tick["high"] > 0]
-        lows = [tick["low"] for tick in ticks if tick["low"] > 0]
-        if not highs or not lows:
-            return {
-                "status": "wait",
-                "reason": "고가/저가 데이터 부족",
-            }
-        high = max(highs)
-        low = min(lows)
         ask = last["ask"]
         bid = last["bid"]
-        if current_price <= 0 or open_price <= 0 or high <= low or ask <= 0 or bid <= 0:
-            return {
-                "status": "wait",
-                "reason": "실시간 가격 데이터 부족",
-            }
+        chejan_strength = float(last.get("chejan_strength", 0.0))
 
-        features = scoring.build_entry_features(
-            ticks=ticks,
+        if current_price <= 0 or ask <= 0 or bid <= 0:
+            return {"status": "wait", "reason": "실시간 가격 데이터 부족"}
+
+        spread_rate = (ask - bid) / current_price if current_price > 0 else 0.0
+        elapsed_secs = max(last["received_at"] - first["received_at"], 1.0)
+        volume_delta = max(last["accum_volume"] - first["accum_volume"], 0)
+        volume_speed = volume_delta / elapsed_secs
+
+        highs = [tick["high"] for tick in ticks if tick["high"] > 0]
+        lows = [tick["low"] for tick in ticks if tick["low"] > 0]
+        high = max(highs) if highs else current_price
+        low = min(lows) if lows else current_price
+
+        # 5분봉 추세 필터(필요 시) 갱신. TR 분주 시 자동으로 다음 사이클로 미뤄진다.
+        self.refresh_five_min_indicators(code)
+
+        position = self.portfolio.get(code)
+        name = self.get_code_name(code)
+        five_min_ind = self.five_min_cache.get(code)
+
+        # 새 게이트 입력값 추출 (체결강도 추세/돌파 등급/윗꼬리/과열).
+        chejan_history = [
+            float(t.get("chejan_strength", 0.0))
+            for t in ticks[-entry_strategy.CHEJAN_STRENGTH_TREND_LOOKBACK:]
+        ]
+        is_breakout_zero = bool(five_min_ind.is_breakout_zero_bar()) if five_min_ind else False
+        is_breakout_prev = bool(five_min_ind.is_breakout_prev_bar()) if five_min_ind else False
+        upper_wick = float(five_min_ind.upper_wick_ratio_zero_bar()) if five_min_ind else 0.0
+        if five_min_ind and five_min_ind.bb_upper_55_2 and five_min_ind.bb_upper_55_2 > 0:
+            px_over_bb55 = current_price / five_min_ind.bb_upper_55_2 - 1
+        else:
+            px_over_bb55 = 0.0
+        open_return = (current_price / open_price - 1) if open_price > 0 else 0.0
+
+        ctx = entry_strategy.EntryContext(
+            code=code,
+            name=name,
             current_price=current_price,
             open_price=open_price,
             high=high,
             low=low,
             ask=ask,
             bid=bid,
+            chejan_strength=chejan_strength,
+            volume_speed=volume_speed,
+            spread_rate=spread_rate,
+            minute_bars=self.minute_aggregator.all_bars(code),
+            five_min_ind=five_min_ind,
+            condition_registered_at=self.condition_registered_at.get(code, time.time()),
+            now_ts=time.time(),
+            tick_count=len(ticks),
+            position=position,
+            chejan_strength_history=chejan_history,
+            is_breakout_zero_bar=is_breakout_zero,
+            is_breakout_prev_bar=is_breakout_prev,
+            upper_wick_ratio_zero_bar=upper_wick,
+            px_over_bb55_pct=px_over_bb55,
+            open_return=open_return,
         )
-        if features is None:
-            return {
-                "status": "wait",
-                "reason": "실시간 가격 데이터 부족",
-            }
-        spread_rate = features["spread_rate"]
-        price_momentum = features["price_momentum"]
-        open_return = features["open_return"]
-        box_position = features["box_position"]
-        direction_score = features["direction_score"]
-        if box_position >= ENTRY_OVERHEAT_BOX_POSITION and direction_score <= ENTRY_OVERHEAT_DIRECTION_MAX:
-            return {
-                "status": "wait",
-                "reason": "상단 과열 구간 추격 진입 대기(box {:.2f}, direction {:.2f})".format(
-                    box_position, direction_score
-                ),
-            }
 
-        server_prediction = self.call_ai_server("/predict-entry", {
-            "code": code,
-            "name": self.get_code_name(code),
-            "current_price": current_price,
-            "open_price": open_price,
-            "high": high,
-            "low": low,
-            "ask": ask,
-            "bid": bid,
-            "ticks": self.serialize_ticks(ticks),
-        })
-        if server_prediction is not None:
-            server_prediction["code"] = code
-            server_prediction["name"] = self.get_code_name(code)
-            server_prediction["current_price"] = current_price
-            logger.info("[AI서버 매수판단] {} 현재가 {} 점수 {:.2f} 기대수익률 {:.2%} 모델 {} 사유 {}".format(
-                server_prediction["name"],
-                current_price,
-                server_prediction.get("score", 0),
-                server_prediction.get("expected_return", 0),
-                server_prediction.get("model_name", "unknown"),
-                server_prediction.get("reason", ""),
-            ))
-            self.register_training_sample(code, server_prediction["name"], current_price, features, server_prediction)
-            return server_prediction
+        if position is not None and position.entry_stage == 1:
+            decision = entry_strategy.evaluate_second_entry(ctx)
+            stage = 2
+        else:
+            decision = entry_strategy.evaluate_first_entry(ctx)
+            stage = decision.stage if decision.stage in (1, 2) else 1
 
-        if spread_rate < 0 or spread_rate > OPENING_MAX_SPREAD_RATE:
-            return {
-                "status": "blocked",
-                "reason": "호가 스프레드 과다 {:.2%}".format(spread_rate),
-            }
+        # Phase A 학습 트랙 — ready 시점의 모든 입력을 즉시 캡처해 사후 라벨링 큐에 등록한다.
+        # 매수 발주/체결 결과와 무관하게 게이트가 'ready' 라고 판단한 표본을 모두 누적한다.
+        if decision.status == "ready":
+            try:
+                self.register_dante_training_sample(
+                    code=code,
+                    name=name,
+                    ctx=ctx,
+                    decision=decision,
+                    current_price=current_price,
+                )
+            except Exception as exc:
+                logger.warning("[단테 학습데이터] sample 등록 실패 {} {}".format(code, exc))
 
-        score = scoring.compute_entry_score(features, OPENING_MAX_SPREAD_RATE)
-        expected_return = scoring.expected_return_from_score(score)
-        target_price = scoring.compute_target_price(current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
-        name = self.get_code_name(code)
-        logger.info("[장초반점수] {} 현재가 {} 점수 {:.2f} 기대수익률 {:.2%} 모멘텀 {:.2%} 시가대비 {:.2%} 스프레드 {:.2%}".format(
-            name,
-            current_price,
-            score,
-            expected_return,
-            price_momentum,
-            open_return,
-            spread_rate,
-        ))
-        prediction = {
-            "status": "ready",
+        return {
+            "status": decision.status,
             "code": code,
             "name": name,
             "current_price": current_price,
-            "target_price": target_price,
-            "expected_return": expected_return,
-            "score": score,
-            "model_name": "OpeningRealtimeScore",
+            "ratio": decision.ratio,
+            "stage": stage,
+            "score": decision.ratio,
+            "spread_rate": spread_rate,
+            "chejan_strength": chejan_strength,
+            "volume_speed": volume_speed,
+            "reason": decision.reason,
+            "grade": getattr(decision, "grade", "") or "",
+            "is_breakout_zero_bar": is_breakout_zero,
+            "is_breakout_prev_bar": is_breakout_prev,
+            "upper_wick_ratio": upper_wick,
+            "px_over_bb55_pct": px_over_bb55,
+            "open_return": open_return,
+            "chejan_strength_history": chejan_history,
+            "model_name": "DanteRule",
         }
-        self.register_training_sample(code, name, current_price, features, prediction)
-        return prediction
 
     def handle_condition_stock(self, code):
         code = self.normalize_code(code)
@@ -1608,14 +2189,17 @@ class Kiwoom(QAxWidget):
             self.register_realtime_stock(code)
             self.condition_registered_at[code] = time.time()
             self.requeue_condition_stock(code)
-            logger.info("[조건검색 관찰] {} 실시간 등록 후 장초반 점수 대기".format(code))
+            logger.info("[조건편입 관찰] {} 실시간 등록 - 단테 1차 게이트 대기".format(code))
             return
 
         prediction = self.predict_stock(code)
         if prediction is None:
             return
 
-        if prediction.get("status") == "wait":
+        status = prediction.get("status")
+        stage = int(prediction.get("stage", 1) or 1)
+
+        if status == "wait":
             ticks = self.realtime_ticks.get(code, [])
             registered_at = self.condition_registered_at.get(code, time.time())
             if len(ticks) == 0 and time.time() - registered_at >= REALTIME_TICK_WAIT_TIMEOUT_SECONDS:
@@ -1624,69 +2208,144 @@ class Kiwoom(QAxWidget):
                 return
             self.requeue_condition_stock(code)
             if self.should_print_wait_log(code):
-                logger.info("[매수 대기] {} {}".format(code, prediction["reason"]))
+                logger.info("[{}차 매수 대기] {} {}".format(stage, code, prediction.get("reason", "")))
             return
-        if prediction.get("status") == "blocked":
-            logger.info("[매수 제외] {} {}".format(code, prediction["reason"]))
+        if status == "blocked":
+            logger.info("[{}차 매수 제외] {} {}".format(stage, code, prediction.get("reason", "")))
             return
 
         self.update_account_status()
-        if self.should_skip_buy(code):
+        grade = str(prediction.get("grade", "") or "")
+        if self.should_skip_buy(code, stage=stage, grade=grade):
             return
 
-        expected_return = prediction["expected_return"]
-        if expected_return < MIN_EXPECTED_RETURN:
-            logger.info("[매수 보류] {} 기대수익률 {:.2%} < 기준 {:.2%}".format(code, expected_return, MIN_EXPECTED_RETURN))
-            return
-        if prediction["score"] < OPENING_MIN_SCORE:
-            logger.info("[매수 보류] {} 장초반점수 {:.2f} < 기준 {:.2f}".format(code, prediction["score"], OPENING_MIN_SCORE))
+        ratio = float(prediction.get("ratio", 0.0))
+        if ratio <= 0:
             return
 
-        self.place_buy_order(code, prediction)
+        self.place_buy_order(code, prediction, ratio=ratio, stage=stage)
 
-    def place_buy_order(self, code, prediction):
-        current_price = prediction["current_price"]
+    def place_buy_order(self, code, prediction, *, ratio, stage):
+        """단테 분할매수 발주.
+
+        stage == 1 (1차 추격):
+          - 종목당 총 예산을 기반으로 planned_quantity 산정.
+          - order_quantity = planned_quantity * ratio (1차 비율) → 시장가 주문.
+        stage == 2 (본진입):
+          - position.planned_quantity 에서 이미 체결된 1차 수량을 뺀 잔여를 시장가 주문.
+        """
+        code = self.normalize_code(code)
+        current_price = self.parse_int(prediction.get("current_price", 0))
+        if current_price <= 0:
+            logger.info("[매수 보류] {} 현재가 0".format(code))
+            return
+
         deposit = self.get_deposit(force=True)
-        position_count = len(self.holding_codes) + len(self.pending_order_codes)
-        remaining_slots = max(MAX_CONCURRENT_POSITIONS - position_count, 1)
-        order_budget = int(deposit * BUY_CASH_BUFFER_RATE / remaining_slots)
+        position = self.portfolio.get(code)
 
         ticks = self.realtime_ticks.get(code, [])
         last_ask = ticks[-1].get("ask", 0) if ticks else 0
         reference_price = max(current_price, last_ask) if last_ask > 0 else current_price
         unit_cost = max(int(reference_price * BUY_PRICE_MARGIN_RATE), 1)
-        order_quantity = order_budget // unit_cost if unit_cost > 0 else 0
-        needed_cash = current_price * order_quantity
-        if order_quantity <= 0:
-            logger.info("[매수 보류] {} 예수금 부족: 종목당 예산 {}, 단가 {}, 가능 예수금 {}".format(code, order_budget, unit_cost, deposit))
-            self.append_trade_log(
-                "buy_skip",
-                code=code,
-                name=prediction.get("name", ""),
-                side="buy",
-                quantity=0,
-                current_price=current_price,
-                target_price=prediction.get("target_price", ""),
-                score=prediction.get("score", ""),
-                expected_return=prediction.get("expected_return", ""),
-                model_name=prediction.get("model_name", ""),
-                reason="예수금 부족",
-                message="종목당 예산 {}, 단가 {}, 가능 {}".format(order_budget, unit_cost, deposit),
-            )
-            return
+
+        grade = str(prediction.get("grade", "") or "")
+        b_grade_lump_sum = (
+            stage == 2
+            and (position is None or position.entry_stage == 0)
+            and grade == "B"
+        )
+
+        if stage == 1:
+            position_count = len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
+            remaining_slots = max(MAX_CONCURRENT_POSITIONS - position_count, 1)
+            full_budget = int(deposit * BUY_CASH_BUFFER_RATE / remaining_slots)
+            planned_quantity = full_budget // unit_cost if unit_cost > 0 else 0
+            if planned_quantity <= 0:
+                logger.info(
+                    "[매수 보류] {} 예수금 부족: 종목당 예산 {}, 단가 {}, 가능 예수금 {}".format(
+                        code, full_budget, unit_cost, deposit
+                    )
+                )
+                self.append_trade_log(
+                    "buy_skip",
+                    code=code,
+                    name=prediction.get("name", ""),
+                    side="buy",
+                    quantity=0,
+                    current_price=current_price,
+                    score=prediction.get("score", ""),
+                    model_name=prediction.get("model_name", ""),
+                    reason="예수금 부족",
+                    message="단테 1차 stage 보류, 종목당 예산 {}, 단가 {}, 가능 {}".format(
+                        full_budget, unit_cost, deposit
+                    ),
+                )
+                return
+            order_quantity = max(int(planned_quantity * ratio), 1)
+            # 잔여 분(2차분)이 1주 이상 남도록 캡 — 1차에서 전량 다 사버리면 본진입이 무의미.
+            order_quantity = min(order_quantity, max(planned_quantity - 1, 1))
+        elif b_grade_lump_sum:
+            # B급(1봉전 돌파만) — 1차/2차 분리 없이 첫 눌림에서 한 번에 본진입(ratio=1.0).
+            position_count = len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
+            remaining_slots = max(MAX_CONCURRENT_POSITIONS - position_count, 1)
+            full_budget = int(deposit * BUY_CASH_BUFFER_RATE / remaining_slots)
+            planned_quantity = full_budget // unit_cost if unit_cost > 0 else 0
+            if planned_quantity <= 0:
+                logger.info(
+                    "[B급 매수 보류] {} 예수금 부족: 종목당 예산 {}, 단가 {}, 가능 {}".format(
+                        code, full_budget, unit_cost, deposit
+                    )
+                )
+                return
+            order_quantity = planned_quantity  # ratio==1.0 이므로 전량
+        else:
+            if position is None:
+                logger.info("[2차 매수 보류] {} Position 없음".format(code))
+                return
+            already_filled = position.quantity
+            remaining = max(position.planned_quantity - already_filled, 0)
+            if remaining <= 0:
+                logger.info(
+                    "[2차 매수 보류] {} 잔여 수량 없음 (planned {}, 보유 {})".format(
+                        code, position.planned_quantity, already_filled
+                    )
+                )
+                return
+            # 본진입 잔여 수량 그대로 매수
+            order_quantity = remaining
+            planned_quantity = position.planned_quantity
+
+        # 예수금 한 번 더 안전 체크(시장가 슬리피지 대비).
+        needed_cash = unit_cost * order_quantity
+        if needed_cash > deposit:
+            adjusted = deposit // unit_cost if unit_cost > 0 else 0
+            if adjusted <= 0:
+                logger.info(
+                    "[{}차 매수 보류] {} 예수금 부족(needed {}, deposit {})".format(
+                        stage, code, needed_cash, deposit
+                    )
+                )
+                return
+            order_quantity = adjusted
 
         result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, 0, "03")
-        target_price = self.parse_int(prediction.get("target_price", 0))
-        target_return = self.estimate_target_return(current_price, target_price)
+        if grade == "B":
+            reason_label = "단테 B급 일괄 매수"
+        else:
+            reason_label = "단테 {}차 매수 (A급)".format(stage)
         self.order_context[code] = {
             "side": "buy",
             "name": prediction.get("name", ""),
-            "score": prediction.get("score", ""),
-            "expected_return": prediction.get("expected_return", ""),
-            "model_name": prediction.get("model_name", ""),
-            "target_price": prediction.get("target_price", ""),
-            "target_return": target_return,
-            "reason": "매수 조건 통과",
+            "stage": stage,
+            "ratio": ratio,
+            "grade": grade,
+            "planned_quantity": planned_quantity,
+            "score": prediction.get("score", 0.0),
+            "spread_rate": prediction.get("spread_rate", 0.0),
+            "chejan_strength": prediction.get("chejan_strength", 0.0),
+            "volume_speed": prediction.get("volume_speed", 0.0),
+            "model_name": prediction.get("model_name", "DanteRule"),
+            "reason": "{} ({})".format(reason_label, prediction.get("reason", "")),
         }
         self.append_trade_log(
             "buy_order",
@@ -1699,35 +2358,67 @@ class Kiwoom(QAxWidget):
             order_price=0,
             current_price=current_price,
             entry_price=current_price,
-            target_price=prediction.get("target_price", ""),
-            score=prediction.get("score", ""),
-            expected_return=prediction.get("expected_return", ""),
-            model_name=prediction.get("model_name", ""),
-            reason="매수 조건 통과",
+            score=prediction.get("score", 0.0),
+            model_name=prediction.get("model_name", "DanteRule"),
+            reason=reason_label,
+            message="{}, planned {}, ratio {:.2f}, 단가 {}, 사유 {}".format(
+                reason_label, planned_quantity, ratio, unit_cost, prediction.get("reason", "")
+            ),
         )
         if result == 0:
-            self.best[code] = prediction["target_price"]
-            if target_return > 0:
-                self.target_returns[code] = target_return
             self.order_prices[code] = current_price
             self.entry_times[code] = time.time()
             self.highest_prices[code] = current_price
             self.pending_order_codes.add(code)
             self.bought_codes.add(code)
-            self.save_best()
+
+            # Position 채움. 1차 발주 시점에 planned_quantity / pullback_window_deadline 셋업.
+            position = self.portfolio.get_or_create(code, name=prediction.get("name", ""))
+            position.entry_price = current_price
+            position.entry_time = position.entry_time or time.time()
+            position.update_highest(current_price)
+            position.pending_buy = True
+            position.bought_today = True
+            position.order_context = dict(self.order_context.get(code, {}))
+            if grade and not position.breakout_grade:
+                position.breakout_grade = grade
+            if stage == 1:
+                position.planned_quantity = planned_quantity
+                position.r_unit_pct = exit_strategy.R_UNIT_PCT
+                # 윈도우는 1차 체결 시 정확히 잡지만, 발주 시점에도 미리 한 번 세팅.
+                position.pullback_window_deadline = time.time() + entry_strategy.PULLBACK_WINDOW_MAX_SECONDS
+                position.entry1_time = position.entry1_time or time.time()
+            elif b_grade_lump_sum:
+                # B급은 1차+2차를 한 번에 매수했으므로 분할 윈도우 없음, planned == 전량.
+                position.planned_quantity = planned_quantity
+                position.r_unit_pct = exit_strategy.R_UNIT_PCT
+                position.entry1_time = position.entry1_time or time.time()
+                position.entry2_time = position.entry2_time or time.time()
+                position.pullback_window_deadline = 0.0
+            else:
+                position.entry2_time = position.entry2_time or time.time()
+
             self.register_realtime_stock(code)
-            logger.info("[매수 주문] {} 수량 {} 현재가 {} 주문예산 {} 목표가 {} 기대수익률 {:.2%} 장초반점수 {:.2f} 모델 {}".format(
-                prediction["name"],
-                order_quantity,
-                current_price,
-                needed_cash,
-                prediction["target_price"],
-                prediction["expected_return"],
-                prediction["score"],
-                prediction["model_name"],
-            ))
+            logger.info(
+                "[{} 매수 주문] {} 수량 {}/{} 현재가 {} 단가 {} 등급={} 사유 {}".format(
+                    "B급 일괄" if b_grade_lump_sum else "{}차".format(stage),
+                    prediction.get("name", ""),
+                    order_quantity,
+                    planned_quantity,
+                    current_price,
+                    unit_cost,
+                    grade or "?",
+                    prediction.get("reason", ""),
+                )
+            )
         else:
-            logger.error("[매수 실패] {} SendOrder 결과 {}".format(code, result))
+            logger.error(
+                "[{} 매수 실패] {} SendOrder 결과 {}".format(
+                    "B급 일괄" if b_grade_lump_sum else "{}차".format(stage),
+                    code,
+                    result,
+                )
+            )
 
     def register_realtime_stock(self, code):
         code = self.normalize_code(code)
@@ -1744,6 +2435,7 @@ class Kiwoom(QAxWidget):
             get_fid("(최우선)매도호가"),
             get_fid("(최우선)매수호가"),
             get_fid("누적거래량"),
+            get_fid("체결강도"),  # 단테 1차/2차 게이트와 청산 약화 판정에 사용
         ])
         opt_type = "0" if screen_no not in self.realtime_code_screens.values() else "1"
         self.set_real_reg(screen_no, code, fids, opt_type)
@@ -1755,14 +2447,12 @@ class Kiwoom(QAxWidget):
         return str(int(REALTIME_SCREEN_NO) + screen_offset).zfill(4)
 
     def score_exit_timing(self, code, current_price):
+        """단테 R-multiple 하이브리드 청산 평가."""
         code = self.normalize_code(code)
-        entry_price = self.order_prices.get(code)
-        if not isinstance(entry_price, (int, float)):
-            entry_price = self.parse_int(entry_price)
-            if entry_price > 0:
-                self.order_prices[code] = entry_price
-            else:
-                entry_price = None
+        position = self.portfolio.get(code)
+        entry_price = position.entry_price if position is not None and position.entry_price > 0 else 0
+        if not entry_price:
+            entry_price = self.parse_int(self.order_prices.get(code, 0))
         if not entry_price:
             for balance in self.cached_balance:
                 if self.normalize_code(balance[0]) == code:
@@ -1771,127 +2461,103 @@ class Kiwoom(QAxWidget):
                         entry_price = fallback
                         self.order_prices[code] = fallback
                     break
-        entry_time = self.entry_times.get(code)
+        if entry_price and (position is None or position.entry_price != entry_price):
+            if position is None:
+                position = self.portfolio.get_or_create(code)
+            position.entry_price = entry_price
 
         if self.current_hhmmss() >= OPENING_FORCE_EXIT:
             return {
                 "action": "sell",
-                "score": 0.0,
-                "reason": "장초반 전략 종료 시간 도달",
+                "qty_ratio": 1.0,
+                "reason": "장 마감 직전 강제 청산({})".format(OPENING_FORCE_EXIT),
             }
-        if not entry_price:
-            return {
-                "action": "hold",
-                "score": 0.0,
-                "reason": "진입가 정보 부족",
-            }
+        if not entry_price or position is None:
+            return {"action": "hold", "qty_ratio": 0.0, "reason": "진입가/Position 정보 부족"}
 
-        now = time.time()
-        if not entry_time:
-            self.entry_times[code] = now
-            entry_time = now
-        hold_seconds = now - entry_time
-        profit_rate = current_price / entry_price - 1
-        highest_price = max(self.highest_prices.get(code, current_price), current_price)
-        self.highest_prices[code] = highest_price
-        trailing_drop = current_price / highest_price - 1 if highest_price > 0 else 0
+        # Position 누락 필드 보정.
+        now_ts = time.time()
+        if not position.entry_time:
+            position.entry_time = now_ts
+        if not position.entry1_time:
+            position.entry1_time = position.entry_time
+        if position.r_unit_pct <= 0:
+            position.r_unit_pct = exit_strategy.R_UNIT_PCT
+        if position.stop_price <= 0 and position.entry_price > 0:
+            position.stop_price = int(position.entry_price * (1 - position.r_unit_pct))
+        if position.breakout_high <= 0:
+            position.breakout_high = position.entry_price
+        if current_price > 0:
+            position.update_highest(current_price)
+            position.update_breakout_high(current_price)
+            self.highest_prices[code] = position.highest_price
 
-        if profit_rate <= OPENING_STOP_LOSS_RATE:
-            in_grace = hold_seconds < OPENING_STOP_LOSS_GRACE_SECONDS
-            hard_break = profit_rate <= OPENING_STOP_LOSS_FORCE_RATE
-            confirmed_downtrend = self.has_consecutive_down_ticks(code, OPENING_STOP_LOSS_CONFIRM_TICKS)
-            if in_grace and not hard_break and not confirmed_downtrend:
-                return {
-                    "action": "hold",
-                    "score": 0.0,
-                    "reason": "손절 유예(보유 {:.0f}초, 수익률 {:.2%})".format(hold_seconds, profit_rate),
-                }
-            return {
-                "action": "sell",
-                "score": 0.0,
-                "reason": "장초반 손절가 도달",
-            }
-        if hold_seconds >= OPENING_MAX_HOLD_SECONDS:
-            return {
-                "action": "sell",
-                "score": 0.0,
-                "reason": "장초반 최대 보유시간 도달",
-            }
-
-        server_decision = self.call_ai_server("/predict-exit", {
-            "code": code,
-            "entry_price": entry_price,
-            "current_price": current_price,
-            "highest_price": highest_price,
-            "hold_seconds": hold_seconds,
-            "ticks": self.serialize_ticks(self.realtime_ticks.get(code, [])),
-        })
-        if server_decision is not None:
-            logger.info("[AI서버 익절판단] {} action {} 점수 {:.2f} 모델 {} 사유 {}".format(
-                code,
-                server_decision.get("action", "hold"),
-                server_decision.get("score", 0),
-                server_decision.get("model_name", "unknown"),
-                server_decision.get("reason", ""),
-            ))
-            return server_decision
+        # 5분봉 캐시 갱신(보유 종목은 항상 갱신 시도).
+        self.refresh_five_min_indicators(code)
 
         ticks = self.realtime_ticks.get(code, [])
-        hold_score = scoring.compute_exit_hold_score(
-            ticks=ticks,
-            current_price=current_price,
-            profit_rate=profit_rate,
-            trailing_drop=trailing_drop,
-            hold_seconds=hold_seconds,
-            opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
-            exit_min_profit_rate=EXIT_MIN_PROFIT_RATE,
-            exit_strong_profit_rate=EXIT_STRONG_PROFIT_RATE,
-            exit_trailing_drop_rate=EXIT_TRAILING_DROP_RATE,
-            exit_stall_seconds=EXIT_STALL_SECONDS,
-            opening_max_hold_seconds=OPENING_MAX_HOLD_SECONDS,
-        )
+        chejan_strength = float(ticks[-1].get("chejan_strength", 0.0)) if ticks else 0.0
 
-        if profit_rate >= EXIT_STRONG_PROFIT_RATE:
-            return {
-                "action": "sell",
-                "score": hold_score,
-                "reason": "강한 수익 구간 도달 {:.2%}".format(profit_rate),
-            }
-        if profit_rate >= EXIT_MIN_PROFIT_RATE and trailing_drop <= -EXIT_TRAILING_DROP_RATE:
-            return {
-                "action": "sell",
-                "score": hold_score,
-                "reason": "고점 대비 밀림 {:.2%}".format(trailing_drop),
-            }
-        if profit_rate >= EXIT_MIN_PROFIT_RATE and hold_seconds >= EXIT_STALL_SECONDS and hold_score < EXIT_HOLD_SCORE_MIN:
-            return {
-                "action": "sell",
-                "score": hold_score,
-                "reason": "상승 지속 점수 약화 {:.2f}".format(hold_score),
-            }
+        ctx = exit_strategy.ExitContext(
+            position=position,
+            current_price=current_price,
+            chejan_strength=chejan_strength,
+            minute_bars=self.minute_aggregator.all_bars(code),
+            five_min_ind=self.five_min_cache.get(code),
+            now_ts=now_ts,
+        )
+        decision = exit_strategy.evaluate_exit(ctx)
+
+        # BE 스탑 이동 플래그를 즉시 반영.
+        if decision.update_stop_to_be and position.entry_price > 0:
+            new_stop = position.entry_price
+            if new_stop > position.stop_price:
+                position.stop_price = new_stop
+                logger.info(
+                    "[BE 스탑 이동] {} stop {} → {} (현재가 {})".format(
+                        code, position.stop_price, new_stop, current_price
+                    )
+                )
 
         return {
-            "action": "hold",
-            "score": hold_score,
-            "reason": "상승 지속 점수 {:.2f}".format(hold_score),
+            "action": decision.action,
+            "qty_ratio": decision.qty_ratio,
+            "reason": decision.reason,
+            "mark_partial_taken": decision.mark_partial_taken,
         }
 
     def check_sell_signal(self, code, current_price):
         code = self.normalize_code(code)
-        if code in self.pending_order_codes:
+        position = self.portfolio.get(code)
+        # 매도 미체결이 진행 중인 종목은 새 매도 판단을 보류.
+        if (position is not None and position.pending_sell) or code in self.pending_sell_order_codes:
             return
-        if code not in self.holding_codes and code not in self.best:
+        # 보유도 추적도 안 하는 종목이면 매도 신호 자체가 의미 없음
+        if (position is None or not position.is_holding()) and code not in self.holding_codes and code not in self.best:
             return
 
-        target_price = self.best.get(code)
         exit_decision = self.score_exit_timing(code, current_price)
-        if exit_decision["action"] == "sell":
-            self.place_sell_order(code, 0, "03", exit_decision["reason"])
+        action = exit_decision.get("action", "hold")
+
+        if action == "sell":
+            self.place_sell_order(code, 0, "03", exit_decision.get("reason", "매도 신호"))
             return
-        if target_price is not None and current_price >= target_price and exit_decision["score"] < 0.65:
-            self.place_sell_order(code, 0, "03", "목표가 도달 후 보유 점수 약화 {:.2f}".format(exit_decision["score"]))
-        elif target_price is not None and current_price >= target_price:
-            logger.info("[익절 보류] {} 목표가 도달, 보유 지속 점수 {:.2f}".format(code, exit_decision["score"]))
+
+        if action == "partial_sell":
+            qty_ratio = float(exit_decision.get("qty_ratio", 0.5))
+            if position is None or position.quantity <= 0:
+                return
+            partial_quantity = max(int(position.quantity * qty_ratio), 1)
+            partial_quantity = min(partial_quantity, position.quantity - 1)
+            if partial_quantity <= 0:
+                return
+            # 부분 익절 발사 직전에 partial_taken 마킹 → 동일 종목에서 partial 이 두 번 발사되지 않게.
+            if exit_decision.get("mark_partial_taken"):
+                position.partial_taken = True
+            self.place_sell_order(
+                code, 0, "03", exit_decision.get("reason", "부분 익절"),
+                desired_quantity=partial_quantity,
+            )
 
     def get_balance_current_price(self, code):
         for balance in self.cached_balance:
@@ -1916,7 +2582,7 @@ class Kiwoom(QAxWidget):
         self.update_account_status(force=True)
         self._cleanup_stale_best()
         self.process_pending_sell_intents()
-        codes_to_check = set(self.best.keys()) | set(self.holding_codes)
+        codes_to_check = self.portfolio.codes() | set(self.best.keys()) | set(self.holding_codes)
         codes_to_check = {c for c in codes_to_check if c}
         for code in codes_to_check:
             self.register_realtime_stock(code)
@@ -1924,6 +2590,93 @@ class Kiwoom(QAxWidget):
             current_price = last_tick.get("close") or self.get_balance_current_price(code)
             if current_price:
                 self.check_sell_signal(code, current_price)
+
+        # [임시] Portfolio dataclass 마이그레이션 1단계 검증.
+        # read 경로를 portfolio 기반으로 옮기기 전에 dict와 portfolio가 같은 정보를 갖는지 확인한다.
+        # 1일 운용 후 [정합성] warning이 한 건도 없으면 안전하게 다음 단계 진행 가능.
+        # read 경로 변환이 끝나면 이 호출과 _assert_portfolio_consistent 메서드를 함께 제거.
+        try:
+            self._assert_portfolio_consistent()
+        except Exception as e:
+            logger.warning("[정합성 검증 오류] %s", e)
+
+    def _assert_portfolio_consistent(self):
+        """portfolio Position과 기존 dict/set의 정보가 일치하는지 점검한다(임시).
+
+        값이 다르면 [정합성] warning을 남긴다. 운용 도중 한 건이라도 발견되면
+        write 경로 어디선가 한쪽만 갱신되고 있다는 뜻이므로 다음 단계로 넘어가면 안 된다.
+        """
+        # 1) dict 기준 종목들이 portfolio에 모두 존재하고 값이 같은지 확인
+        tracked_codes = (
+            set(self.holding_codes)
+            | set(self.pending_order_codes)
+            | set(self.best.keys())
+        )
+        for code in tracked_codes:
+            if not code:
+                continue
+            position = self.portfolio.get(code)
+            if position is None:
+                logger.warning("[정합성] %s portfolio Position 누락 (holding=%s pending=%s best=%s)",
+                               code,
+                               code in self.holding_codes,
+                               code in self.pending_order_codes,
+                               code in self.best)
+                continue
+
+            dict_quantity = self.parse_int(self.position_quantities.get(code, 0))
+            if position.quantity != dict_quantity:
+                logger.warning("[정합성] %s quantity 불일치 portfolio=%s dict=%s",
+                               code, position.quantity, dict_quantity)
+
+            dict_available = self.parse_int(self.available_quantities.get(code, 0))
+            if position.available_quantity != dict_available:
+                logger.warning("[정합성] %s available_quantity 불일치 portfolio=%s dict=%s",
+                               code, position.available_quantity, dict_available)
+
+            dict_entry = self.parse_int(self.order_prices.get(code, 0))
+            if position.entry_price != dict_entry:
+                logger.warning("[정합성] %s entry_price 불일치 portfolio=%s dict=%s",
+                               code, position.entry_price, dict_entry)
+
+            dict_target = self.parse_int(self.best.get(code, 0))
+            if position.target_price != dict_target:
+                logger.warning("[정합성] %s target_price 불일치 portfolio=%s dict=%s",
+                               code, position.target_price, dict_target)
+
+            dict_highest = self.parse_int(self.highest_prices.get(code, 0))
+            if position.highest_price != dict_highest:
+                logger.warning("[정합성] %s highest_price 불일치 portfolio=%s dict=%s",
+                               code, position.highest_price, dict_highest)
+
+            dict_target_return = self.target_returns.get(code, 0.0)
+            if isinstance(dict_target_return, (int, float)):
+                if abs(position.target_return - float(dict_target_return)) > 1e-9:
+                    logger.warning("[정합성] %s target_return 불일치 portfolio=%s dict=%s",
+                                   code, position.target_return, dict_target_return)
+
+            dict_pending_buy = code in self.pending_order_codes and code not in self.pending_sell_order_codes
+            if position.pending_buy != dict_pending_buy:
+                logger.warning("[정합성] %s pending_buy 불일치 portfolio=%s dict=%s",
+                               code, position.pending_buy, dict_pending_buy)
+
+            dict_pending_sell = code in self.pending_sell_order_codes
+            if position.pending_sell != dict_pending_sell:
+                logger.warning("[정합성] %s pending_sell 불일치 portfolio=%s dict=%s",
+                               code, position.pending_sell, dict_pending_sell)
+
+            dict_bought_today = code in self.bought_codes
+            if position.bought_today != dict_bought_today:
+                logger.warning("[정합성] %s bought_today 불일치 portfolio=%s dict=%s",
+                               code, position.bought_today, dict_bought_today)
+
+        # 2) portfolio에는 있지만 어느 dict에도 없는 유령 Position 검출
+        portfolio_only = self.portfolio.codes() - tracked_codes
+        for code in portfolio_only:
+            position = self.portfolio.get(code)
+            logger.warning("[정합성] %s portfolio 유령 (qty=%s entry=%s pending_buy=%s pending_sell=%s)",
+                           code, position.quantity, position.entry_price,
+                           position.pending_buy, position.pending_sell)
 
     def check_pending_sells(self):
         # 실시간 슬롯에서 매 틱마다 동기 HTTP를 부르지 않도록, 일정 주기로 모아서 매도 판단을 수행한다.
@@ -1933,11 +2686,13 @@ class Kiwoom(QAxWidget):
         except Exception as e:
             logger.error("[매도 의도 처리 오류] {}".format(e))
 
-        codes_to_check = set(self.best.keys()) | set(self.holding_codes)
+        # portfolio 기반 조회. 보유/추적 종목 모두 포함.
+        codes_to_check = self.portfolio.codes() | set(self.best.keys()) | set(self.holding_codes)
         for code in codes_to_check:
             if not code:
                 continue
-            if code in self.pending_order_codes:
+            position = self.portfolio.get(code)
+            if (position is not None and position.is_pending()) or code in self.pending_order_codes:
                 continue
             ticks = self.realtime_ticks.get(code, [])
             if not ticks:
@@ -1965,7 +2720,13 @@ class Kiwoom(QAxWidget):
         self.save_best()
         logger.info("[best 정리] 보유/미체결 없음 종목 제거: {}".format(stale))
 
-    def place_sell_order(self, code, order_price, order_gubun, reason):
+    def place_sell_order(self, code, order_price, order_gubun, reason, *, desired_quantity=None):
+        """매도 주문 발주.
+
+        desired_quantity:
+          - None: 전량(매매가능수량 전체) 매도
+          - int > 0: 해당 수량만 매도 (부분 익절). 가용 수량보다 크면 가용으로 캡.
+        """
         code = self.normalize_code(code)
         if code in self._selling_codes:
             logger.warning("[매도 중복 차단] {} 진행 중인 매도 있음".format(code))
@@ -1975,11 +2736,11 @@ class Kiwoom(QAxWidget):
             return
         self._selling_codes.add(code)
         try:
-            self._do_place_sell_order(code, order_price, order_gubun, reason)
+            self._do_place_sell_order(code, order_price, order_gubun, reason, desired_quantity=desired_quantity)
         finally:
             self._selling_codes.discard(code)
 
-    def _do_place_sell_order(self, code, order_price, order_gubun, reason):
+    def _do_place_sell_order(self, code, order_price, order_gubun, reason, *, desired_quantity=None):
         chejan_quantity = self.parse_int(self.position_quantities.get(code, 0))
         balance_quantity, available_quantity = self._lookup_balance_quantity(code)
         balance_quantity = self.parse_int(balance_quantity)
@@ -1993,6 +2754,8 @@ class Kiwoom(QAxWidget):
 
         held_quantity = max(chejan_quantity, balance_quantity)
         sell_quantity = available_quantity
+        if desired_quantity is not None and desired_quantity > 0:
+            sell_quantity = min(int(desired_quantity), available_quantity)
 
         # 매매가능수량이 아직 갱신되지 않은 경우, 메인 스레드를 블로킹하지 않도록 sleep 없이
         # 매도 의도만 큐에 등록하고 sell_check_timer / process_pending_sell_intents가 재시도하게 둔다.
@@ -2034,7 +2797,8 @@ class Kiwoom(QAxWidget):
         if entry_price:
             last_price = self.realtime_ticks.get(code, [{}])[-1].get("close", order_price)
             if last_price:
-                profit_rate = last_price / entry_price - 1
+                gross_profit_rate = last_price / entry_price - 1
+                profit_rate = self.gross_to_net_return(gross_profit_rate)
         result = self.send_order("sell", ORDER_SCREEN_NO, 2, code, sell_quantity, order_price, order_gubun)
         self.order_context[code] = {
             "side": "sell",
@@ -2073,9 +2837,57 @@ class Kiwoom(QAxWidget):
         return self.score_opening_trade(code)
 
 
+def _log_dante_startup_banner():
+    """단테 전략 핵심 파라미터를 시작 시 로그에 한 번 출력한다.
+
+    소프트 롤아웃 1일차에 운영자가 게이트/청산 임계값을 즉시 확인할 수 있도록 한다.
+    """
+    logger.info("=" * 78)
+    logger.info("[단테 추세전략] A급(0봉 돌파) 1차 추격(%.0f%%)→눌림 본진입(%.0f%%) | B급(1봉 돌파) 첫 눌림 일괄(%.0f%%)",
+                entry_strategy.DANTE_FIRST_ENTRY_RATIO * 100,
+                entry_strategy.DANTE_SECOND_ENTRY_RATIO * 100,
+                entry_strategy.DANTE_GRADE_B_RATIO * 100)
+    logger.info("[게이트] 체결강도 Hard≥%.0f / Soft%.0f~%.0f(추세상승필요) / 거래속도≥%.0f주초 / 스프레드≤%.2f%% / 관찰%.0f초 / 최소틱%d",
+                entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
+                entry_strategy.MIN_CHEJAN_STRENGTH_SOFT,
+                entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
+                entry_strategy.MIN_VOLUME_SPEED,
+                entry_strategy.MAX_SPREAD_RATE * 100,
+                entry_strategy.DANTE_MIN_OBSERVATION_SECONDS,
+                entry_strategy.DANTE_MIN_TICKS)
+    logger.info("[가짜돌파/과열] 5분봉 윗꼬리≤%.0f%% / 시가대비≤+%.0f%% / BB55 거리≤+%.1f%%",
+                entry_strategy.MAX_UPPER_WICK_RATIO * 100,
+                entry_strategy.OVERHEATED_OPEN_RETURN * 100,
+                entry_strategy.OVERHEATED_BB55_DISTANCE * 100)
+    logger.info("[눌림] %.2f%% ~ %.2f%% (고점대비 -%.2f%% 초과 시 차단), 음봉%d~%d 후 양봉반전, 윈도우 %d초",
+                entry_strategy.PULLBACK_MIN_PCT * 100,
+                entry_strategy.PULLBACK_MAX_PCT * 100,
+                entry_strategy.MAX_DRAWDOWN_FROM_HIGH * 100,
+                entry_strategy.PULLBACK_NEG_BARS_MIN,
+                entry_strategy.PULLBACK_NEG_BARS_MAX,
+                entry_strategy.PULLBACK_WINDOW_MAX_SECONDS)
+    logger.info("[청산] -1R(%.2f%%) 손절 → +1R BE → +2R %.0f%% 부분익절 → 잔량 추세이탈, 시간손절 %d초",
+                exit_strategy.R_UNIT_PCT * 100,
+                exit_strategy.EXIT_PARTIAL_RATIO * 100,
+                exit_strategy.EXIT_TIME_LIMIT_SECONDS)
+    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, AI서버=%s, 구학습=%s, 단테학습=%s(%s)",
+                MAX_CONCURRENT_POSITIONS,
+                MAX_DAILY_BUY_COUNT,
+                OPENING_FORCE_EXIT,
+                "ON" if AI_SERVER_ENABLED else "OFF",
+                "ON" if TRAINING_DATA_ENABLED else "OFF",
+                "ON" if DANTE_TRAINING_DATA_ENABLED else "OFF",
+                DANTE_TRAINING_CSV)
+    logger.info("[조건식] 영웅문 등록명='%s' (단테조건식.xls 의 다중 BB/Envelope 상향돌파 + 거래량 + 체결강도)",
+                CONDITION_NAME)
+    logger.info("=" * 78)
+
+
 def main():
     app = QApplication(sys.argv)
     kiwoom = Kiwoom()
+
+    _log_dante_startup_banner()
 
     my_deposit = kiwoom.get_deposit()
     logger.info("남은 예수금 : %s", my_deposit)
