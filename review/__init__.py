@@ -13,6 +13,13 @@
 from .loader import Trade, load_trades
 from .metrics import attach_metrics
 from .classifier import classify_trades
+from .market_context import (
+    MarketContext,
+    attach_market_context,
+    classify_market_strength,
+    load_market_context,
+    save_market_context,
+)
 from .rules import RuleRecommendation, recommend_rules
 from .report import write_reports
 
@@ -24,4 +31,9 @@ __all__ = [
     "RuleRecommendation",
     "recommend_rules",
     "write_reports",
+    "MarketContext",
+    "attach_market_context",
+    "classify_market_strength",
+    "load_market_context",
+    "save_market_context",
 ]

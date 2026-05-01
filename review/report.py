@@ -52,6 +52,10 @@ CSV_COLUMNS = [
     # 기본 피처
     "open_return", "upper_wick_ratio",
     "px_over_bb55_pct", "chejan_strength", "volume_speed", "spread_rate",
+    # 시장 컨텍스트 (review/market_context.py 가 attach)
+    "market_strength",
+    "market_kospi_close_return", "market_kosdaq_close_return",
+    "market_kospi_intraday_high_return", "market_kosdaq_intraday_high_return",
     "reason", "exit_reason",
 ]
 
@@ -137,6 +141,13 @@ def _trade_row(trade: Trade) -> dict:
         "chejan_strength": f.get("chejan_strength"),
         "volume_speed": f.get("volume_speed"),
         "spread_rate": f.get("spread_rate"),
+        # 시장 컨텍스트 — attach_market_context 가 trade.features 에 채움.
+        # 매크로 JSON 이 없으면 strength="unknown", 나머지는 None 으로 graceful.
+        "market_strength": f.get("market_strength", "unknown"),
+        "market_kospi_close_return": f.get("market_kospi_close_return"),
+        "market_kosdaq_close_return": f.get("market_kosdaq_close_return"),
+        "market_kospi_intraday_high_return": f.get("market_kospi_intraday_high_return"),
+        "market_kosdaq_intraday_high_return": f.get("market_kosdaq_intraday_high_return"),
         "reason": trade.reason,
         "exit_reason": trade.exit_reason,
     }

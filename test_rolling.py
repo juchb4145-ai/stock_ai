@@ -433,5 +433,141 @@ def _write_one_day(out_dir: str, date_str: str, rows: list) -> None:
             ])
 
 
+def _write_day_with_classifier(out_dir: str, date_str: str, rows: List[Dict[str, object]]) -> None:
+    """classifier_version 컬럼을 명시한 단일 날짜 trade_review CSV 작성 헬퍼."""
+    path = os.path.join(out_dir, f"trade_review_{date_str}.csv")
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "date", "code", "name", "entry_class", "exit_class", "classifier_version",
+            "grade", "entry_stage_max", "entry_avg_price", "exit_avg_price",
+            "entry_first_time", "exit_last_time", "hold_seconds",
+            "realized_return", "r_multiple",
+            "mfe", "mae", "mfe_r", "mae_r",
+            "return_5m", "return_10m", "return_20m",
+            "give_back_r", "over_run_r", "bounce_after_stop_r",
+            "be_violation", "reached_1r", "reached_2r", "hit_stop", "time_exit",
+            "open_return", "upper_wick_ratio", "px_over_bb55_pct",
+            "chejan_strength", "volume_speed", "spread_rate",
+            "reason", "exit_reason",
+        ])
+        for i, row in enumerate(rows):
+            writer.writerow([
+                date_str, f"Z{i:04d}", "synth",
+                row.get("entry_class", "breakout_chase"),
+                row.get("exit_class", "clean_exit"),
+                row.get("classifier_version", "v2"),
+                "A", 1, 10000,
+                int(10000 * (1 + (row.get("realized_return") or 0))),
+                f"{date_str} 09:00:00", f"{date_str} 09:10:00", 600,
+                row.get("realized_return", 0.0),
+                row.get("r_multiple", 0.0),
+                "", "",
+                row.get("mfe_r", 0.0), row.get("mae_r", 0.0),
+                "", "", "",
+                "", "", "",
+                row.get("be_violation", 0.0),
+                row.get("reached_1r", 0), 0, 0, 0,
+                row.get("open_return", 0.0),
+                row.get("upper_wick_ratio", 0.0),
+                row.get("px_over_bb55_pct", 0.0),
+                180.0, 1500.0, 0.0015,
+                "synthetic", "synthetic",
+            ])
+
+
+class ClassifierVersionFilteringTest(unittest.TestCase):
+    """v1 fallback 거래가 후보 평가에 영향 안 주고 by_classifier_version 통계만 갱신해야 한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rolling_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_v1_rows_excluded_from_candidates(self):
+        # v1 row 만으로 가짜돌파 30%+ 발생해도 후보가 안 떠야 한다.
+        # block_fake_breakout 트리거 임계: fake_breakout_ratio >= 0.30 + 가짜돌파 n>=2.
+        v1_rows = (
+            [{"entry_class": "fake_breakout", "exit_class": "good_stop",
+              "r_multiple": -1.0, "mfe_r": 0.2, "mae_r": -1.0,
+              "realized_return": -0.015, "classifier_version": "v1"}] * 5
+            + [{"entry_class": "breakout_chase", "exit_class": "clean_exit",
+                "r_multiple": 1.0, "mfe_r": 1.5, "mae_r": -0.2,
+                "realized_return": 0.015, "classifier_version": "v1"}] * 10
+        )
+        _write_day_with_classifier(self.tmp, "2026-04-25", v1_rows)
+        result = rolling.run_rolling(
+            as_of_date="2026-04-25",
+            windows=(5,),
+            reviews_dir=self.tmp,
+            write=False,
+        )
+        # v1 만 들어 있으므로 후보 평가 대상 = 0 → 어떤 rule_id 도 트리거 안 됨
+        self.assertEqual(len(result.candidates), 0)
+        ws = result.window_stats[0]
+        self.assertEqual(ws.n_total, 15)
+        self.assertEqual(ws.n_candidate, 0)
+        self.assertIn("v1", ws.by_classifier)
+        self.assertEqual(ws.by_classifier["v1"]["n"], 15)
+        self.assertNotIn("v2", ws.by_classifier)
+
+    def test_v2_rows_drive_candidates_v1_only_in_stats(self):
+        # 같은 날에 v2 가짜돌파 5건(트리거) + v1 정상 거래 50건(잡음).
+        # 후보는 v2 만으로 평가되어야 트리거 + confidence=low (v2 n=15 미만 보장 위해 적게).
+        v2_rows = (
+            [{"entry_class": "fake_breakout", "exit_class": "good_stop",
+              "r_multiple": -1.0, "mfe_r": 0.2, "mae_r": -1.0,
+              "realized_return": -0.015, "classifier_version": "v2"}] * 5
+            + [{"entry_class": "breakout_chase", "exit_class": "clean_exit",
+                "r_multiple": 1.0, "mfe_r": 1.2, "mae_r": -0.2,
+                "realized_return": 0.015, "classifier_version": "v2"}] * 10
+        )
+        v1_rows = (
+            [{"entry_class": "breakout_chase", "exit_class": "clean_exit",
+              "r_multiple": 1.0, "mfe_r": 1.5, "mae_r": -0.2,
+              "realized_return": 0.015, "classifier_version": "v1"}] * 50
+        )
+        _write_day_with_classifier(self.tmp, "2026-04-25", v2_rows + v1_rows)
+        result = rolling.run_rolling(
+            as_of_date="2026-04-25",
+            windows=(5,),
+            reviews_dir=self.tmp,
+            write=False,
+        )
+        ws = result.window_stats[0]
+        self.assertEqual(ws.n_total, 65)
+        self.assertEqual(ws.n_candidate, 15)
+        self.assertEqual(ws.confidence, "low")  # v2 n=15 < 20
+        # by_classifier_version 통계에는 v1/v2 양쪽 노출
+        self.assertEqual(ws.by_classifier["v2"]["n"], 15)
+        self.assertEqual(ws.by_classifier["v1"]["n"], 50)
+        # 후보는 v2 표본만으로 트리거 — block_fake_breakout 가 잡혀야 함
+        rule_ids = {c.rule_id for c in result.candidates}
+        self.assertIn("block_fake_breakout", rule_ids)
+
+    def test_blank_classifier_version_treated_as_v2(self):
+        # 빈 문자열은 default v2 로 취급되어 후보 평가에 들어간다(legacy fixture 호환).
+        rows = [
+            {"entry_class": "fake_breakout", "exit_class": "good_stop",
+             "r_multiple": -1.0, "mfe_r": 0.2, "mae_r": -1.0,
+             "realized_return": -0.015, "classifier_version": ""},
+        ] * 5 + [
+            {"entry_class": "breakout_chase", "exit_class": "clean_exit",
+             "r_multiple": 1.0, "mfe_r": 1.2, "mae_r": -0.2,
+             "realized_return": 0.015, "classifier_version": ""},
+        ] * 10
+        _write_day_with_classifier(self.tmp, "2026-04-25", rows)
+        result = rolling.run_rolling(
+            as_of_date="2026-04-25",
+            windows=(5,),
+            reviews_dir=self.tmp,
+            write=False,
+        )
+        ws = result.window_stats[0]
+        self.assertEqual(ws.n_candidate, 15)  # 빈 값이 v2 로 카운트
+        self.assertIn("v2", ws.by_classifier)
+
+
 if __name__ == "__main__":
     unittest.main()

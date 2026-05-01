@@ -57,11 +57,12 @@ class Trade:
     reached_2r: Optional[int] = None
     hit_stop: Optional[int] = None
     time_exit: Optional[int] = None
-    # 진입 피처 dict (chejan_strength, volume_speed, spread_rate,
-    # upper_wick_ratio, open_return, ...)
-    features: Dict[str, float] = field(default_factory=dict)
+    # 진입 피처 dict (chejan_strength, volume_speed, spread_rate, upper_wick_ratio,
+    # open_return, market_strength=str, ...). 값이 float 가 아닌 컬럼(market_strength
+    # 같은 라벨) 도 들어가므로 typing 은 object 로 둔다.
+    features: Dict[str, object] = field(default_factory=dict)
     # 분류/메트릭(나중에 채워짐)
-    metrics: Dict[str, float] = field(default_factory=dict)
+    metrics: Dict[str, object] = field(default_factory=dict)
     entry_class: str = ""
     exit_class: str = ""
     notes: List[str] = field(default_factory=list)

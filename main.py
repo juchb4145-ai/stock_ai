@@ -19,7 +19,7 @@ import scoring
 import entry_strategy
 import exit_strategy
 from bars import FiveMinIndicatorCache, MinuteBarAggregator
-from portfolio import Position, PortfolioState
+from portfolio import LoadedPortfolioState, Position, PortfolioState
 
 
 def _setup_logging():
@@ -102,6 +102,28 @@ DANTE_TRAINING_FIELDS = [
     "time_exit",
     "labeled_at",
 ]
+# === 단테 shadow 학습 트랙(false-negative 측정용) ===
+# 게이트가 wait/blocked 으로 거른 종목도 같은 25분 horizon 사후 라벨로 캡처한다.
+# 이걸 누적해야 "우리가 거른 종목들이 사실은 +1R 까지 잘 갔는가?" 분포를 볼 수 있다.
+# 기존 dante_entry_training.csv (=ready 만) 와 짝을 이루어 false-negative 분석에 쓰인다.
+# 분석 단계에서 두 파일을 한 번에 읽으려면 schema 가 호환되어야 하므로,
+# 헤더는 [decision_status] + DANTE_TRAINING_FIELDS 로 정의한다(앞에 한 컬럼 추가).
+DANTE_SHADOW_TRAINING_DATA_ENABLED = True
+DANTE_SHADOW_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_shadow_training.csv")
+# shadow 표본은 같은 코드에서 wait 가 반복되며 줄줄이 발생할 수 있어, ready 보다 길게 잡는다.
+DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS = 90
+DANTE_SHADOW_TRAINING_FIELDS = ["decision_status"] + DANTE_TRAINING_FIELDS
+
+# === 장중 크래시 복원용 portfolio 상태 디스크 영속화 ===
+# Position 의 전략 필드(entry_stage / planned_quantity / stop_price / partial_taken /
+# breakout_high / breakout_grade / pullback_window_deadline 등) 는 메모리에만 있다.
+# 장중에 프로세스가 죽으면 잔고 TR 응답으로 quantity/entry_price 만 회복되고 위 필드들은
+# 모두 0/false 로 초기화된다. 그러면 BE 스탑이 풀려 -1R 보호가 사라지고, 1차에 25%만
+# 사놓고 2차 본진입이 영원히 발사 안 되는 등 운영 사고가 난다.
+# 이를 막기 위해 매 chejan 이벤트, 매도 의도 큐 변경, 매도 평가 종료 시점마다 atomic
+# write 한다. 부팅 시 잔고 TR 보다 먼저 로드해 두면, _sync_position_from_dicts 가
+# 잔고 정보로 휘발성 필드만 덮어쓰고 전략 필드는 그대로 보존된다.
+PORTFOLIO_STATE_PATH = os.path.join(TRAINING_DATA_DIR, "portfolio_state.json")
 BUY_CASH_BUFFER_RATE = 0.98
 BUY_PRICE_MARGIN_RATE = 1.005
 MIN_EXPECTED_RETURN = 0.006
@@ -121,7 +143,7 @@ DYNAMIC_MIN_NET_RETURN_PERCENTILE = 0.5
 DYNAMIC_MIN_NET_RETURN_CEILING = 0.015
 # 매수 가능 시간(장 마감 직전 강제 청산 시점은 OPENING_FORCE_EXIT 동일).
 OPENING_BUY_START = 90500
-OPENING_BUY_END = 101000
+OPENING_BUY_END = 143000
 OPENING_FORCE_EXIT = 151500
 # 실시간 틱 버퍼 크기 / 최소 틱 수 (단테 1차 게이트가 사용)
 OPENING_MIN_TICKS = entry_strategy.DANTE_MIN_TICKS
@@ -130,7 +152,7 @@ OPENING_TICK_LIMIT = 40
 OPENING_MAX_SPREAD_RATE = entry_strategy.MAX_SPREAD_RATE
 # 손절/시간 손절 등은 exit_strategy 모듈로 이전했다. 호환을 위해 alias 만 남긴다.
 OPENING_STOP_LOSS_RATE = -exit_strategy.R_UNIT_PCT  # -1R
-OPENING_MAX_HOLD_SECONDS = exit_strategy.EXIT_TIME_LIMIT_SECONDS
+OPENING_MAX_HOLD_SECONDS = exit_strategy.EXIT_TIME_LIMIT_SECONDS                         
 # 단테 전략은 1차 추격(소량) + 2차 본진입(본물량) 분할매수 방식이라 동시 보유 종목을
 # 보수적으로 1개로 시작한다. 검증 후 점진적으로 늘린다.
 MAX_CONCURRENT_POSITIONS = 1
@@ -528,6 +550,10 @@ class Kiwoom(QAxWidget):
         # 단테 학습 트랙(Phase A) 의 sample_id → 진행 정보. 5/10/20분 horizon 라벨링 후 CSV flush.
         self.pending_dante_samples = {}
         self.last_dante_sample_at = {}
+        # shadow 학습 트랙: 게이트가 거른(wait/blocked) 표본을 같은 25분 horizon 으로 사후 라벨링.
+        # ready 표본과 같은 풀에 들어가지 않도록 별도 dict + 별도 CSV 로 분리.
+        self.pending_dante_shadow_samples = {}
+        self.last_dante_shadow_sample_at = {}
         self.order_context = {}
         self.last_tr_request_at = 0
         self.last_order_request_at = 0
@@ -802,6 +828,10 @@ class Kiwoom(QAxWidget):
             position = self.portfolio.get(code)
             if position is not None:
                 position.order_context = {}
+
+        # chejan 은 모든 매수/매도 체결의 진입점이라, 여기서 한 번만 disk 동기화하면
+        # entry_stage/planned_quantity/stop_price 변경이 빠짐없이 반영된다.
+        self.save_portfolio_state()
 
     def _on_receive_condition_ver(self, ret, msg):
         logger.info("조건식 로드 결과: ret=%s msg=%s", ret, msg)
@@ -1292,6 +1322,7 @@ class Kiwoom(QAxWidget):
 
         self.update_training_labels(code, close, received_at)
         self.update_dante_training_labels(code, close, received_at)
+        self.update_dante_shadow_training_labels(code, close, received_at)
 
     def _on_receive_real_data(self, s_code, real_type, real_data):
         if real_type == "장시작시간":
@@ -1351,6 +1382,8 @@ class Kiwoom(QAxWidget):
         self.last_dante_sample_at.clear()
         # 전날 미라벨링된 단테 샘플은 표본 신뢰도가 낮으므로 폐기한다.
         self.pending_dante_samples.clear()
+        self.last_dante_shadow_sample_at.clear()
+        self.pending_dante_shadow_samples.clear()
         logger.info("[일일초기화] {} 매수 후보/대기 상태 초기화".format(today))
 
     def normalize_code(self, code):
@@ -1385,7 +1418,7 @@ class Kiwoom(QAxWidget):
         position.order_context = order_context if isinstance(order_context, dict) else {}
         return position
 
-    def _discard_position(self, code, *, save=True, drop_pending_sell=True):
+    def _discard_position(self, code, *, save=True, drop_pending_sell=True, persist=True):
         # 종목 청산 시 흩어진 상태 dict/set을 한 번에 정리한다. 한 군데라도 빠지면 정합성이 깨지므로 항상 이 헬퍼를 사용한다.
         code = self.normalize_code(code)
         if not code:
@@ -1409,6 +1442,11 @@ class Kiwoom(QAxWidget):
         self.five_min_cache.discard(code)
         if save:
             self.save_best()
+        # 청산이 일어난 시점은 portfolio_state.json 도 동기화. 안 하면 다음 부팅 시
+        # 이미 청산된 종목이 살아있는 것처럼 복원된다(잔고 TR 로 결국 정정되긴 하나 한 사이클
+        # 동안 잘못된 should_skip_buy 결과가 나올 수 있음).
+        if persist:
+            self.save_portfolio_state()
 
     def save_best(self):
         # 쓰기 도중 종료되어도 best.dat이 깨지지 않도록 임시 파일 → rename 으로 교체
@@ -1436,6 +1474,84 @@ class Kiwoom(QAxWidget):
         except Exception as e:
             logger.error("best.dat 로드 실패: %s", e)
             self.best = {}
+
+    def save_portfolio_state(self):
+        """장중 크래시 복원용 portfolio JSON 영속화. atomic write 로 부분 쓰기를 방어.
+
+        매 체결/매도 큐 변경/매도 평가 종료 시점마다 호출된다. IO 실패는 main 루프를
+        멈추지 않고 로그만 남긴다(거래 자체가 막혀선 안 되므로 best-effort).
+
+        보유/주문 종목이 0 일 때는 디스크 IO 를 스킵한다 -- check_open_positions 의
+        1.5초 주기에서 의미 없는 fsync 가 누적되는 것을 방지한다. 잔존 portfolio_state.json
+        파일은 그대로 남되, 다음 부팅 시 trading_day 비교로 어차피 폐기되므로 안전.
+        """
+        if len(self.portfolio) == 0:
+            return
+        try:
+            self.portfolio.save(
+                PORTFOLIO_STATE_PATH,
+                metadata={
+                    "trading_day": self.trading_day,
+                    "saved_at": time.time(),
+                    "saved_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
+        except Exception as exc:
+            logger.warning("portfolio_state 저장 실패: %s", exc)
+
+    def load_portfolio_state(self):
+        """부팅 시 portfolio JSON 복원. 잔고 TR 호출 전에 실행해야 한다.
+
+        디스크에 저장된 trading_day 가 오늘과 같으면 self.trading_day 도 미리 복원해
+        뒤이은 ``reset_daily_state`` 가 cleanup 으로 동작하지 않도록 한다(같은 거래일
+        내 재시작 → 어제 매도 의도/매수 한도 카운터 보존). 다른 날이면 metadata 만 읽고
+        position 자체는 잔고 TR 로 다시 검증된다.
+        """
+        loaded: LoadedPortfolioState = PortfolioState.load(PORTFOLIO_STATE_PATH)
+        saved_trading_day = str(loaded.metadata.get("trading_day") or "")
+        today = time.strftime("%Y-%m-%d")
+        # 같은 거래일 내 재시작이 아니면 strategy 상태도 미신뢰 — 잔고 TR 만으로 다시 시작.
+        if saved_trading_day and saved_trading_day != today:
+            logger.info(
+                "[portfolio_state] saved_trading_day=%s != today=%s -- 어제 상태 폐기, "
+                "잔고 TR 로 재구성합니다.",
+                saved_trading_day, today,
+            )
+            return
+
+        if len(loaded.state) == 0:
+            return
+
+        self.portfolio = loaded.state
+        if saved_trading_day:
+            self.trading_day = saved_trading_day
+
+        # 흩어진 dict 들도 portfolio 의 최근 값과 일치하도록 채워넣는다.
+        # (update_account_status 가 잔고 TR 응답으로 다시 갱신하지만, 그 사이의 매도 의도/
+        # 매수 한도 카운터 같은 휘발성이 아닌 메타는 _sync_position_from_dicts 가
+        # 의존하기 때문에 미리 dict 에 깔아두어야 잔고 TR 동기화 후에도 보존된다.)
+        for code, position in self.portfolio.items():
+            if position.bought_today:
+                self.bought_codes.add(code)
+            if position.entry_time:
+                self.entry_times[code] = position.entry_time
+            if position.highest_price:
+                self.highest_prices[code] = position.highest_price
+            if position.target_price:
+                self.best.setdefault(code, position.target_price)
+            if position.target_return:
+                self.target_returns[code] = position.target_return
+            if position.pending_sell_intent:
+                self.pending_sell_intents[code] = dict(position.pending_sell_intent)
+            if position.order_context:
+                self.order_context[code] = dict(position.order_context)
+
+        logger.info(
+            "[portfolio_state] %d 종목 복원 (saved=%s) -- entry_stage/stop_price/"
+            "planned_quantity 등 전략 상태 보존",
+            len(self.portfolio),
+            loaded.metadata.get("saved_time", "?"),
+        )
 
     def update_account_status(self, force=False):
         now = time.time()
@@ -1693,13 +1809,20 @@ class Kiwoom(QAxWidget):
         if not code:
             return
         existing = self.pending_sell_intents.get(code, {})
-        self.pending_sell_intents[code] = {
+        intent = {
             "reason": reason,
             "order_price": order_price,
             "order_gubun": order_gubun,
             "queued_at": existing.get("queued_at", time.time()),
             "last_try_at": existing.get("last_try_at", 0),
         }
+        self.pending_sell_intents[code] = intent
+        # Position 의 pending_sell_intent 도 같이 갱신해 portfolio_state.json 에 보존되게 한다.
+        # 크래시 후 재시작해도 큐가 사라지지 않아 매도 재시도가 자동으로 재개된다.
+        position = self.portfolio.get(code)
+        if position is not None:
+            position.pending_sell_intent = dict(intent)
+            self.save_portfolio_state()
 
     def process_pending_sell_intents(self, target_codes=None):
         if target_codes is None:
@@ -1867,6 +1990,191 @@ class Kiwoom(QAxWidget):
                 name, code, row["entry_stage"], row["ratio"], sample_id[:8]
             )
         )
+
+    def ensure_dante_shadow_training_data_file(self):
+        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
+            return
+        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+        if os.path.exists(DANTE_SHADOW_TRAINING_CSV):
+            return
+        with open(DANTE_SHADOW_TRAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=DANTE_SHADOW_TRAINING_FIELDS)
+            writer.writeheader()
+
+    def append_dante_shadow_training_row(self, row):
+        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
+            return
+        self.ensure_dante_shadow_training_data_file()
+        with open(DANTE_SHADOW_TRAINING_CSV, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=DANTE_SHADOW_TRAINING_FIELDS)
+            writer.writerow(row)
+
+    def _is_dante_shadow_data_ready(self, ctx):
+        """shadow 표본을 등록할지 판단하는 데이터 사전조건 게이트.
+
+        의미 있는 false-negative 측정을 하려면, 게이트가 거절한 이유가 "데이터 부족"이
+        아니라 "전략 임계 미달" 이어야 한다. 그렇지 않은 표본(틱 부족/관찰시간 부족/
+        5분봉 캐시 미준비) 은 분석 가치가 없으므로 여기서 모두 걸러낸다.
+        이미 본진입까지 끝난 종목(entry_stage>=2) 도 매수 여지가 없으므로 제외한다.
+        """
+        if ctx.position is not None and ctx.position.entry_stage >= 2:
+            return False
+        if ctx.current_price <= 0 or ctx.ask <= 0 or ctx.bid <= 0:
+            return False
+        if ctx.tick_count < entry_strategy.DANTE_MIN_TICKS:
+            return False
+        elapsed = ctx.now_ts - (ctx.condition_registered_at or ctx.now_ts)
+        if elapsed < entry_strategy.DANTE_MIN_OBSERVATION_SECONDS:
+            return False
+        if ctx.five_min_ind is None or ctx.five_min_ind.closes_count < 13:
+            return False
+        return True
+
+    def register_dante_shadow_sample(self, *, code, name, ctx, decision, current_price):
+        """게이트가 wait/blocked 으로 거른 1차/2차 평가 결과를 사후 라벨링용으로 캡처한다.
+
+        ready 표본(dante_entry_training.csv) 과 짝을 이루어 false-negative 측정에 쓰인다.
+        진입 피처 계산은 ready 경로(register_dante_training_sample) 와 동일하게 수행하며,
+        구분을 위해 row 첫 컬럼에 decision_status("wait"|"blocked") 를 추가한다.
+        같은 종목의 wait 가 줄줄이 발생해도 cooldown 으로 한 번만 기록한다.
+        """
+        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
+            return
+        if decision is None:
+            return
+        status = getattr(decision, "status", "")
+        if status not in ("wait", "blocked"):
+            return
+        if current_price <= 0:
+            return
+        if not self._is_dante_shadow_data_ready(ctx):
+            return
+
+        now = time.time()
+        last_at = self.last_dante_shadow_sample_at.get(code, 0)
+        if now - last_at < DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS:
+            return
+
+        five_min = ctx.five_min_ind
+        env_upper = five_min.env_upper_13_25 if five_min is not None else None
+        bb_upper = five_min.bb_upper_55_2 if five_min is not None else None
+        closes_count = five_min.closes_count if five_min is not None else 0
+        breakout_high = ctx.position.breakout_high if ctx.position is not None else 0
+        obs_elapsed = now - (ctx.condition_registered_at or now)
+
+        features = scoring.build_dante_entry_features(
+            current_price=current_price,
+            chejan_strength=ctx.chejan_strength,
+            volume_speed=ctx.volume_speed,
+            spread_rate=ctx.spread_rate,
+            obs_elapsed_sec=obs_elapsed,
+            env_upper_13=env_upper,
+            bb_upper_55=bb_upper,
+            five_min_closes_count=closes_count,
+            breakout_high=breakout_high,
+            minute_bars=ctx.minute_bars,
+            chejan_strength_history=ctx.chejan_strength_history,
+            is_breakout_zero_bar=ctx.is_breakout_zero_bar,
+            is_breakout_prev_bar=ctx.is_breakout_prev_bar,
+            upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
+            open_return=ctx.open_return,
+        )
+
+        sample_id = uuid.uuid4().hex
+        row = {
+            "decision_status": status,
+            "sample_id": sample_id,
+            "captured_at": now,
+            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "code": code,
+            "name": name,
+            "entry_stage": int(getattr(decision, "stage", 1)),
+            "entry_price": int(current_price),
+            "ratio": 0.0,
+            "reason": getattr(decision, "reason", ""),
+        }
+        row.update(features)
+        for horizon in DANTE_TRAINING_LABEL_HORIZONS:
+            row["return_{}m".format(horizon // 60)] = ""
+        row["max_return_25m"] = ""
+        row["min_return_25m"] = ""
+        row["reached_1r"] = ""
+        row["reached_2r"] = ""
+        row["hit_stop"] = ""
+        row["time_exit"] = ""
+        row["labeled_at"] = ""
+
+        self.pending_dante_shadow_samples[sample_id] = {
+            "code": code,
+            "captured_at": now,
+            "entry_price": int(current_price),
+            "row": row,
+            "labeled_horizons": set(),
+            "max_price": int(current_price),
+            "min_price": int(current_price),
+            "finalized": False,
+        }
+        self.last_dante_shadow_sample_at[code] = now
+        logger.info(
+            "[단테 shadow] 후보 등록 {} {} status={} stage={} sample {}".format(
+                name, code, status, row["entry_stage"], sample_id[:8]
+            )
+        )
+
+    def update_dante_shadow_training_labels(self, code, current_price, received_at):
+        """매 틱 수신 시 호출. 진행 중인 shadow 샘플에 max/min/horizon 라벨을 갱신한다.
+
+        구조는 update_dante_training_labels 와 동일하지만 별도 dict/CSV 에 쓴다.
+        25분 경과 시 reached_1r/reached_2r/hit_stop/time_exit 를 확정하고 shadow CSV 에 flush.
+        """
+        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
+            return
+        if not self.pending_dante_shadow_samples:
+            return
+        if current_price is None or current_price <= 0:
+            return
+        completed = []
+        for sample_id, sample in list(self.pending_dante_shadow_samples.items()):
+            if sample.get("finalized"):
+                continue
+            if sample.get("code") != code:
+                continue
+            entry_price = sample.get("entry_price", 0)
+            if entry_price <= 0:
+                continue
+            elapsed = received_at - sample.get("captured_at", received_at)
+            if current_price > sample.get("max_price", current_price):
+                sample["max_price"] = current_price
+            if current_price < sample.get("min_price", current_price):
+                sample["min_price"] = current_price
+            for horizon in DANTE_TRAINING_LABEL_HORIZONS:
+                if horizon in sample["labeled_horizons"] or elapsed < horizon:
+                    continue
+                sample["row"]["return_{}m".format(horizon // 60)] = current_price / entry_price - 1
+                sample["labeled_horizons"].add(horizon)
+            if elapsed >= DANTE_TRAINING_FINAL_HORIZON_SECONDS:
+                row = sample["row"]
+                max_ret = sample["max_price"] / entry_price - 1
+                min_ret = sample["min_price"] / entry_price - 1
+                r_unit = exit_strategy.R_UNIT_PCT
+                row["max_return_25m"] = max_ret
+                row["min_return_25m"] = min_ret
+                row["reached_1r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_BE_R else 0
+                row["reached_2r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_PARTIAL_R else 0
+                row["hit_stop"] = 1 if min_ret <= -r_unit else 0
+                row["time_exit"] = 1 if max_ret < r_unit * exit_strategy.EXIT_BE_R else 0
+                row["labeled_at"] = received_at
+                self.append_dante_shadow_training_row(row)
+                sample["finalized"] = True
+                completed.append(sample_id)
+                logger.info(
+                    "[단테 shadow] 라벨 완료 {} sample {} status={} max {:.2%} min {:.2%} 1R={} stop={}".format(
+                        code, sample_id[:8], row["decision_status"], max_ret, min_ret,
+                        row["reached_1r"], row["hit_stop"],
+                    )
+                )
+        for sample_id in completed:
+            self.pending_dante_shadow_samples.pop(sample_id, None)
 
     def update_dante_training_labels(self, code, current_price, received_at):
         """매 틱 수신 시 호출. 진행 중인 단테 샘플에 max/min/horizon 라벨을 갱신한다.
@@ -2158,6 +2466,19 @@ class Kiwoom(QAxWidget):
                 )
             except Exception as exc:
                 logger.warning("[단테 학습데이터] sample 등록 실패 {} {}".format(code, exc))
+        else:
+            # Shadow 트랙 — 게이트가 wait/blocked 으로 거른 표본도 false-negative 측정용으로
+            # 캡처. 의미 있는 데이터(틱/관찰시간/캐시 충분) 기준은 register 내부에서 다시 검사.
+            try:
+                self.register_dante_shadow_sample(
+                    code=code,
+                    name=name,
+                    ctx=ctx,
+                    decision=decision,
+                    current_price=current_price,
+                )
+            except Exception as exc:
+                logger.warning("[단테 shadow] sample 등록 실패 {} {}".format(code, exc))
 
         return {
             "status": decision.status,
@@ -2399,6 +2720,9 @@ class Kiwoom(QAxWidget):
                 position.entry2_time = position.entry2_time or time.time()
 
             self.register_realtime_stock(code)
+            # 발주 직후 portfolio_state 디스크 동기화 — planned_quantity / pullback 윈도우 등
+            # 1차 발주 단계에서만 세팅되는 필드들을 보존해야 다음 부팅 시 2차 본진입 평가가 가능.
+            self.save_portfolio_state()
             logger.info(
                 "[{} 매수 주문] {} 수량 {}/{} 현재가 {} 단가 {} 등급={} 사유 {}".format(
                     "B급 일괄" if b_grade_lump_sum else "{}차".format(stage),
@@ -2590,6 +2914,9 @@ class Kiwoom(QAxWidget):
             current_price = last_tick.get("close") or self.get_balance_current_price(code)
             if current_price:
                 self.check_sell_signal(code, current_price)
+        # 매도 평가에서 BE 스탑 이동/partial_taken/breakout_high 갱신이 일어나므로,
+        # 한 사이클이 끝나면 portfolio_state 를 디스크에 동기화한다.
+        self.save_portfolio_state()
 
         # [임시] Portfolio dataclass 마이그레이션 1단계 검증.
         # read 경로를 portfolio 기반으로 옮기기 전에 dict와 portfolio가 같은 정보를 갖는지 확인한다.
@@ -2870,14 +3197,16 @@ def _log_dante_startup_banner():
                 exit_strategy.R_UNIT_PCT * 100,
                 exit_strategy.EXIT_PARTIAL_RATIO * 100,
                 exit_strategy.EXIT_TIME_LIMIT_SECONDS)
-    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, AI서버=%s, 구학습=%s, 단테학습=%s(%s)",
+    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, AI서버=%s, 구학습=%s, 단테학습=%s(%s), shadow=%s(%s)",
                 MAX_CONCURRENT_POSITIONS,
                 MAX_DAILY_BUY_COUNT,
                 OPENING_FORCE_EXIT,
                 "ON" if AI_SERVER_ENABLED else "OFF",
                 "ON" if TRAINING_DATA_ENABLED else "OFF",
                 "ON" if DANTE_TRAINING_DATA_ENABLED else "OFF",
-                DANTE_TRAINING_CSV)
+                DANTE_TRAINING_CSV,
+                "ON" if DANTE_SHADOW_TRAINING_DATA_ENABLED else "OFF",
+                DANTE_SHADOW_TRAINING_CSV)
     logger.info("[조건식] 영웅문 등록명='%s' (단테조건식.xls 의 다중 BB/Envelope 상향돌파 + 거래량 + 체결강도)",
                 CONDITION_NAME)
     logger.info("=" * 78)
@@ -2893,6 +3222,10 @@ def main():
     logger.info("남은 예수금 : %s", my_deposit)
 
     kiwoom.load_best()
+    # portfolio_state 는 잔고 TR 호출 전에 미리 로드. 같은 거래일 내 재시작이면
+    # entry_stage / planned_quantity / stop_price 등 전략 필드를 보존하고, 잔고 TR 응답이
+    # quantity / entry_price 등 휘발성 필드만 덮어쓰게 한다.
+    kiwoom.load_portfolio_state()
     kiwoom.reset_daily_state()
     kiwoom.update_account_status()
     logger.info("현재가지고 있는 종목: {}".format(kiwoom.get_balance()))

@@ -411,6 +411,42 @@ _apply_overnight_rules()
 **(B)** 코드에서 기본값을 직접 변경. 가장 확실하지만 git diff 가 늘어남.
 중요한 변경(예: hard cap 자체 조정) 일 때만 권장.
 
+### 9.7 portfolio_state.json 이 손상되었습니다
+
+**증상**: main.py 부팅 시 `data/main.log` 에 다음 로그.
+
+```
+[ERROR] portfolio_state 손상 -- data/portfolio_state.json.corrupt 로 보존 후 빈 상태 시작: ...
+```
+
+**원인**: 디스크 가득참 / 비정상 종료 시 atomic write 가 깨진 경우 / 손으로 편집했다가 JSON 형식이 어긋난 경우.
+
+**대응 자동 동작**:
+
+1. 손상된 파일은 `data/portfolio_state.json.corrupt` 로 자동 보존됨 (분석용)
+2. 빈 상태로 부팅 진행 — 거래 자체는 막히지 않음
+3. 잔고 TR 응답으로 휘발성 필드(`quantity` / `entry_price`) 만 다시 채워짐
+
+**사람이 해야 할 일**:
+
+1. `data/portfolio_state.json.corrupt` 가 있다면 이전 거래일 데이터인지 확인
+2. 같은 거래일이라면 — 보유 종목의 `entry_stage` / `stop_price` / `partial_taken` / `breakout_grade` 가 default 로 리셋되었음을 인지하고, 필요하면 다음 절차로 수동 복원
+3. 다른 거래일이라면 — 그냥 백업 폴더로 옮기고 무시
+
+**수동 복원 (같은 거래일에 의미 있음)**:
+
+`.corrupt` 파일에서 보유 중인 종목 entry 만 골라 새 `portfolio_state.json` 으로 작성. 형식은 [review_system_overview.md](review_system_overview.md) §5.0.3 참조. 또는 main.py 를 종료 → 키움 영웅문에서 **수동 매도 후 다시 시작** 이 가장 안전.
+
+> **주의** — 손상된 portfolio_state 와 *전략 사이드의 정합성 깨짐* 을 그대로 두면, BE 스탑이 풀려 -1R 보호가 사라지거나 1차에 25% 만 산 상태로 멈출 수 있습니다. 의심스러우면 즉시 자동매매를 중단하고 영웅문에서 수동으로 종목 정리 후 재시작 권장.
+
+### 9.8 trading_day 가 어제로 남아 있습니다
+
+**증상**: main.py 가 자정 이후에도 종료되지 않고 새 거래일에 처음 매수 시점에서 어제 매수 카운터가 남아 있음.
+
+**원인**: `reset_daily_state` 가 trading_day 비교로만 일별 초기화를 트리거하는데, 자정을 넘긴 *프로세스 자체* 의 trading_day 갱신이 condition 큐 처리 후에야 일어남. 정상 동작이지만 첫 거래 직전 1~2초 race window 가 있을 수 있음.
+
+**대응**: 자정~장 시작 (09:05) 사이에 main.py 를 한 번 재시작하는 것이 가장 깔끔. 그러면 부팅 시점에 `load_portfolio_state` 가 어제 trading_day 를 보고 자동으로 어제 portfolio 를 폐기 → 클린 상태로 새 거래일 시작.
+
 ---
 
 ## 10. 안전성 점검 체크리스트
@@ -429,6 +465,8 @@ _apply_overnight_rules()
 - `python -m unittest test_overrides` 18건 통과
 - `python -m unittest test_classifier` 18건 통과
 - `python -m unittest test_intraday test_rolling` 모두 통과
+- `python -m unittest test_portfolio_persistence test_save_portfolio_skip` (장중 크래시 복원) 통과
+- `python -m unittest test_shadow_training test_market_context test_fetch_market_context` (표본 수집 인프라) 통과
 
 **audit 누적**
 
@@ -440,6 +478,85 @@ _apply_overnight_rules()
 - main.py 부팅 시 자동 commit 코드가 *의도된 형태*로 들어가 있는지
 - fixture_hook 가 `test_classifier` 를 1초 안에 돌리는 형태인지
 - `allow_auto_apply` 를 *기본 false* 로 두는 정책이 깨지지 않았는지
+- `data/portfolio_state.json` 가 매일 새 trading_day 로 갱신되는지 (오래된 trading_day 가 며칠째 같으면 main.py 가 자정 이후 한 번도 재시작되지 않음을 의미)
 
 이 체크리스트 모든 항목을 통과한다면 시스템이 안전 상태에 있습니다. 한 항목이라도 의심되면 [review_user_guide.md](review_user_guide.md) §8 의
 "commit 하면 안 되는 상황" 도 같이 점검하세요.
+
+---
+
+## 11. 장중 크래시 복원 (portfolio_state.json)
+
+main.py 가 장중에 죽고 재시작되어도 전략 상태가 보존되도록, 매 체결/매도 큐 변경/매도 평가 사이클마다 `data/portfolio_state.json` 에 atomic write 합니다.
+
+### 11.1 보호되는 필드
+
+잔고 TR 응답으로 회복 *불가능* 한 8개 전략 필드:
+
+
+| 필드 | 잃으면 일어나는 일 |
+| --- | -------------- |
+| `entry_stage` | 1차에 25%만 사놓고 2차 본진입이 영원히 발사 안 됨 |
+| `planned_quantity` | 2차 매수 수량 계산이 깨짐 |
+| `stop_price` | BE 스탑이 풀려 -1R 보호가 사라짐 (가장 위험) |
+| `partial_taken` | +2R 도달 시 또 부분익절 시도 (이중 체결) |
+| `breakout_high` | 추적 고점이 0부터 다시 → 눌림 판정 오작동 |
+| `breakout_grade` | A/B 등급 식별자 손실 → 분할매수 분기 오작동 |
+| `pullback_window_deadline` | 2차 본진입 윈도우 영원히 만료 안 됨 → 1주 락 |
+| `pending_sell_intent` | 큐에 있던 매도 의도 사라짐 → 매도 재시도 중단 |
+
+
+### 11.2 부팅 시 복원 동작
+
+```
+1. load_best()                # best.dat (target_price 등)
+2. load_portfolio_state()     # data/portfolio_state.json 읽어서 self.portfolio 복원
+   ├─ saved_trading_day == today → portfolio + sell intent + bought_today 카운터 복원
+   └─ saved_trading_day != today → 어제 상태 폐기, 잔고 TR 만으로 다시 시작
+3. reset_daily_state()        # trading_day 일치 시 no-op (위에서 미리 세팅)
+4. update_account_status()    # 잔고/미체결 TR 호출 → quantity / pending_buy/sell 만 덮어씀
+                              #   _sync_position_from_dicts 가 휘발성 필드만 갱신
+                              #   전략 필드(entry_stage 등) 는 디스크 본 그대로 보존
+```
+
+**핵심 — 잔고 TR 호출이 *나중* 에 일어나서 휘발성 필드만 덮어쓰고, 디스크 본의 전략 필드는 그대로 살아남습니다.**
+
+### 11.3 저장 트리거
+
+- `_on_receive_chejan` 끝 — 모든 매수/매도 체결 결과 동기화
+- `place_buy_order` 발주 직후 — `planned_quantity` / `pullback_window_deadline` 보존
+- `queue_sell_intent` — 큐에 들어갈 때마다
+- `check_open_positions` 끝 — BE 스탑 이동 / partial_taken / breakout_high 갱신 동기화 (1.5초 주기)
+- `_discard_position` — 청산 직후 stale 상태 제거
+
+보유 0 상태에서는 1.5초 주기 호출에서도 IO 를 스킵해 무의미한 fsync 누적을 방지합니다.
+
+### 11.4 손상된 JSON 동작
+
+`json.JSONDecodeError` / `OSError` 발생 시:
+
+1. 원본을 `data/portfolio_state.json.corrupt` 로 보존 (분석용)
+2. main.log 에 ERROR 한 줄 — `portfolio_state 손상 -- ... 빈 상태 시작`
+3. 빈 PortfolioState 로 부팅 진행 — *부팅 자체는 차단되지 않음*
+4. 잔고 TR 응답이 휘발성 필드를 채움 → 보유 종목은 수량/평단까지 복원
+5. **전략 필드(`entry_stage` 등) 는 default 로 리셋** — 운영자가 인지하고 필요 시 매도 후 재시작
+
+손으로 편집하다 망가뜨려도 자동 거래는 멈추지 않지만, 그 시점부터 전략 보호가 약해진다는 점을 인지하세요.
+
+### 11.5 type-cast 강건성
+
+JSON 의 잘못된 타입(예: `"entry_stage": "two"`) 도 `from_persisted_dict` 가 캐스트 실패 시 *해당 필드만* default 로 두고 진행합니다. 다른 필드 복원은 영향받지 않습니다 — 손상 한 곳이 전체 복원을 막지 않게.
+
+```python
+# 캐스트 카테고리 (portfolio.py 상단)
+_PERSISTED_INT_FIELDS   = {"target_price", "highest_price",
+                           "entry_stage", "planned_quantity",
+                           "stop_price", "breakout_high"}
+_PERSISTED_FLOAT_FIELDS = {"target_return", "entry_time",
+                           "entry1_time", "entry2_time",
+                           "r_unit_pct", "pullback_window_deadline"}
+_PERSISTED_BOOL_FIELDS  = {"bought_today", "partial_taken"}
+_PERSISTED_STR_FIELDS   = {"name", "breakout_grade"}
+```
+
+캐스트 실패 시 `data/main.log` 에 `WARNING from_persisted_dict: <code>.<field> 값 무시(...)` 한 줄이 남습니다. 이 경고가 매일 보이면 어디선가 잘못된 타입을 디스크에 쓰고 있다는 신호 — 즉시 코드 점검.

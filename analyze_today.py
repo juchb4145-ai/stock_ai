@@ -32,6 +32,11 @@ from review import (
 )
 from review.intraday import INTRADAY_DIR_DEFAULT, attach_intraday_metrics
 from review.loader import latest_trade_date
+from review.market_context import (
+    REVIEWS_DIR_DEFAULT as MARKET_CONTEXT_DIR_DEFAULT,
+    attach_market_context,
+    classify_market_strength,
+)
 
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:
@@ -42,6 +47,8 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
                         help=f"1분봉 캐시 디렉토리 (기본 {INTRADAY_DIR_DEFAULT}).")
     parser.add_argument("--no-intraday", action="store_true",
                         help="1분봉 정밀 메트릭 단계를 건너뛴다(테스트/디버그용).")
+    parser.add_argument("--reviews-dir", default=MARKET_CONTEXT_DIR_DEFAULT,
+                        help=f"매크로/리뷰 산출 디렉토리 (기본 {MARKET_CONTEXT_DIR_DEFAULT}).")
     return parser.parse_args(argv)
 
 
@@ -78,6 +85,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "missing": [t.code for t in trades],
             }
 
+    # 시장 컨텍스트(KOSPI/KOSDAQ 등락률 + 강세/약세 레이블) 를 trade.features 에 join.
+    # 파일이 없으면 모든 매크로 컬럼은 None / market_strength="unknown" 으로 fallback.
+    market_ctx = attach_market_context(trades, target_date, reviews_dir=args.reviews_dir)
+    market_strength = classify_market_strength(market_ctx)
+
     classify_trades(trades)
     recs = recommend_rules(trades)
     paths = write_reports(trades, recs, target_date,
@@ -91,6 +103,21 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"missing: {len(intraday_summary['missing'])}건")
     if intraday_summary["missing"]:
         print(f"      missing codes: {','.join(intraday_summary['missing'])}")
+    if market_ctx is None:
+        print("  - 시장 컨텍스트: 데이터 없음 (market_context_*.json 미작성). "
+              "fetch_market_context.py 또는 수동 작성 권장.")
+    else:
+        kospi_str = (
+            f"{market_ctx.kospi_close_return:+.2%}"
+            if market_ctx.kospi_close_return is not None else "n/a"
+        )
+        kosdaq_str = (
+            f"{market_ctx.kosdaq_close_return:+.2%}"
+            if market_ctx.kosdaq_close_return is not None else "n/a"
+        )
+        print(f"  - 시장 컨텍스트: {market_strength} "
+              f"(KOSPI {kospi_str} / KOSDAQ {kosdaq_str}, "
+              f"source={market_ctx.source or 'unknown'})")
     print(f"  - 추천 룰 {len(recs)}건")
     for path_kind, path in paths.items():
         print(f"  - {path_kind}: {path}")

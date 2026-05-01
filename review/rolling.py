@@ -45,6 +45,16 @@ CONFIDENCE_LOW_MAX = 20      # n < 20 → low
 CONFIDENCE_MEDIUM_MAX = 40   # 20 ≤ n < 40 → medium
 # n ≥ 40 + 동일 손실 패턴 반복(=윈도우 일관성) → high
 
+# === 분류기 버전 정책 ===
+# trade_review_*.csv 의 classifier_version 컬럼 기준.
+# - "v2"     : 현재 분류기(권장). 룰 후보 평가의 신호원.
+# - "v1"     : 1분봉 D 피처 부재로 fallback 된 거래. 분류 임계가 다르므로 후보 평가에서
+#              제외하고 audit 가독성을 위해 by_classifier_version 통계로만 노출.
+# - 빈 값/기타: 과거 fixture 호환을 위해 "v2" default 로 취급(현재 운영 trade_review 는
+#              항상 v2 를 적는다 — review.classifier 의 _classify_entry 가 강제).
+DEFAULT_CLASSIFIER_VERSION = "v2"
+CANDIDATE_CLASSIFIER_VERSIONS = ("v2",)
+
 # === rule candidate 트리거 임계 (review/rules.py 와 동일하게 유지) ===
 FAKE_BREAKOUT_RATIO_BLOCK = 0.30
 A_VS_B_DIFF_R = 0.5
@@ -269,16 +279,38 @@ def _confidence_for_n(n: int) -> str:
     return "high"
 
 
+def _row_classifier_version(row: Dict[str, object]) -> str:
+    """row 의 분류기 버전을 추출. 빈 값은 최신(v2) default."""
+    cv = str(row.get("classifier_version") or "").strip()
+    return cv if cv else DEFAULT_CLASSIFIER_VERSION
+
+
+def _filter_candidate_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """룰 후보 평가에 들어갈 row 만 골라낸다.
+
+    현재 정책: ``CANDIDATE_CLASSIFIER_VERSIONS = ("v2",)`` 만 통과. v1 fallback /
+    빈 값(legacy) / 기타 분류기는 제외해 후보 평가가 v2 표본으로만 결정되게 한다.
+    by_classifier_version 통계는 별도로 v1 도 노출(audit 가독성).
+    """
+    return [r for r in rows if _row_classifier_version(r) in CANDIDATE_CLASSIFIER_VERSIONS]
+
+
 @dataclass
 class WindowStats:
-    """단일 윈도우(예: 10영업일)의 누적 통계."""
+    """단일 윈도우(예: 10영업일)의 누적 통계.
+
+    confidence 는 *후보 평가에 실제로 쓰이는 표본 수* 기준이라 v2 only count 를 본다.
+    n_total 은 전체 row 수(분류기 버전 무관) 라 v1/v2 비율 모니터링용으로 따로 둔다.
+    """
     window: int
     dates: List[str]
     n_total: int
+    n_candidate: int                       # v2(=후보 평가 대상) row 수
     overall: Dict[str, object]
     by_entry: Dict[str, Dict[str, object]] = field(default_factory=dict)
     by_exit: Dict[str, Dict[str, object]] = field(default_factory=dict)
     by_combo: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    by_classifier: Dict[str, Dict[str, object]] = field(default_factory=dict)
     confidence: str = "low"
 
     def to_dict(self) -> dict:
@@ -286,11 +318,13 @@ class WindowStats:
             "window": self.window,
             "dates": self.dates,
             "n_total": self.n_total,
+            "n_candidate": self.n_candidate,
             "confidence": self.confidence,
             "overall": self.overall,
             "by_entry_class": self.by_entry,
             "by_exit_class": self.by_exit,
             "by_entry_exit": self.by_combo,
+            "by_classifier_version": self.by_classifier,
         }
 
 
@@ -303,32 +337,42 @@ def aggregate_window(
     by_entry: Dict[str, Dict[str, object]] = {}
     by_exit: Dict[str, Dict[str, object]] = {}
     by_combo: Dict[str, Dict[str, object]] = {}
+    by_classifier: Dict[str, Dict[str, object]] = {}
 
     grouped_e: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     grouped_x: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     grouped_c: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    grouped_v: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     for row in rows:
         ec = (row.get("entry_class") or "unclassified") or "unclassified"
         xc = (row.get("exit_class") or "unclassified") or "unclassified"
         grouped_e[str(ec)].append(row)
         grouped_x[str(xc)].append(row)
         grouped_c[f"{ec}|{xc}"].append(row)
+        grouped_v[_row_classifier_version(row)].append(row)
     for k, v in grouped_e.items():
         by_entry[k] = _aggregate_group(v)
     for k, v in grouped_x.items():
         by_exit[k] = _aggregate_group(v)
     for k, v in grouped_c.items():
         by_combo[k] = _aggregate_group(v)
+    for k, v in grouped_v.items():
+        by_classifier[k] = _aggregate_group(v)
 
+    n_candidate = sum(
+        1 for row in rows if _row_classifier_version(row) in CANDIDATE_CLASSIFIER_VERSIONS
+    )
     return WindowStats(
         window=window,
         dates=dates,
         n_total=len(rows),
+        n_candidate=n_candidate,
         overall=overall,
         by_entry=by_entry,
         by_exit=by_exit,
         by_combo=by_combo,
-        confidence=_confidence_for_n(len(rows)),
+        by_classifier=by_classifier,
+        confidence=_confidence_for_n(n_candidate),
     )
 
 
@@ -597,8 +641,13 @@ def run_rolling(
         overrides_evidence_by_window[w] = evidence
         window_stats.append(aggregate_window(w, dates, rows))
 
-    window_total_by_window = {w: len(rows_by_window[w]) for w in windows}
-    candidates = evaluate_candidates(rows_by_window, window_total_by_window)
+    # 룰 후보 평가는 v2 분류기 표본만으로 — v1 fallback 거래는 분류 임계가 다르므로
+    # 통계가 흐려진다. 전체 rows 는 by_classifier_version 통계 노출에만 쓰인다.
+    candidate_rows_by_window = {
+        w: _filter_candidate_rows(rows_by_window[w]) for w in windows
+    }
+    window_total_by_window = {w: len(candidate_rows_by_window[w]) for w in windows}
+    candidates = evaluate_candidates(candidate_rows_by_window, window_total_by_window)
 
     paths: Dict[str, str] = {}
     if write:
