@@ -13,6 +13,7 @@ CI/64bit venv 에서도 sys.modules stub 만 채워 두면 main 모듈을 import
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import sys
 import tempfile
@@ -61,6 +62,8 @@ def _ensure_external_stubs() -> None:
 
 _ensure_external_stubs()
 import main  # noqa: E402  외부 stub 후에 import
+import training_recorder  # noqa: E402  shadow CSV 경로 patch 대상
+import market_state as ms  # noqa: E402  market dry-run 메타 테스트용
 
 
 class _StubFiveMinInd:
@@ -86,6 +89,8 @@ class _StubCtx:
         elapsed_sec: float = 60.0,
         five_min_closes_count: int = 60,
         position=None,
+        market_state=None,
+        now_ts: float | None = None,
     ) -> None:
         self.current_price = current_price
         self.ask = ask
@@ -94,7 +99,7 @@ class _StubCtx:
         self.volume_speed = volume_speed
         self.spread_rate = spread_rate
         self.tick_count = tick_count
-        now = time.time()
+        now = now_ts if now_ts is not None else datetime(2026, 4, 30, 10, 0, 0).timestamp()
         self.now_ts = now
         self.condition_registered_at = now - elapsed_sec
         if five_min_closes_count > 0:
@@ -108,6 +113,7 @@ class _StubCtx:
         self.is_breakout_prev_bar = False
         self.upper_wick_ratio_zero_bar = 0.2
         self.open_return = 0.05
+        self.market_state = market_state
 
 
 class _StubDecision:
@@ -117,11 +123,19 @@ class _StubDecision:
         stage: int = 1,
         ratio: float = 0.0,
         reason: str = "",
+        reason_code: str = "",
+        market_regime: str = "",
+        market_gate_action: str = "",
+        market_gate_reason: str = "",
     ) -> None:
         self.status = status
         self.stage = stage
         self.ratio = ratio
         self.reason = reason
+        self.reason_code = reason_code
+        self.market_regime = market_regime
+        self.market_gate_action = market_gate_action
+        self.market_gate_reason = market_gate_reason
 
 
 class _StubPosition:
@@ -148,15 +162,27 @@ class _StubKiwoom:
 
 
 class ShadowTrainingFieldsTests(unittest.TestCase):
-    def test_fields_compose_dante_plus_status(self):
+    def test_fields_compose_status_code_then_dante(self):
+        # decision_status + reason_code 가 분류축으로 앞에 박혀 있어야
+        # 분석 시 두 축으로 group by 가 자연스럽다.
         self.assertEqual(
             main.DANTE_SHADOW_TRAINING_FIELDS,
-            ["decision_status"] + main.DANTE_TRAINING_FIELDS,
+            ["decision_status", "reason_code"] + main.DANTE_TRAINING_FIELDS,
         )
 
     def test_separate_csv_path(self):
         self.assertNotEqual(main.DANTE_SHADOW_TRAINING_CSV, main.DANTE_TRAINING_CSV)
         self.assertTrue(main.DANTE_SHADOW_TRAINING_CSV.endswith(".csv"))
+
+    def test_dante_training_fields_end_with_market_columns(self):
+        # 라벨링 컬럼들 뒤에 MARKET_FIELDS + MARKET_GATE_FIELDS 가 끝에 박혀 있어야 한다
+        # (rolling/분석 측에서 ``df.columns[-7:]`` 같은 위치 추출이 가능하도록).
+        tail = (
+            list(training_recorder.MARKET_FIELDS)
+            + list(training_recorder.MARKET_GATE_FIELDS)
+        )
+        self.assertEqual(main.DANTE_TRAINING_FIELDS[-len(tail):], tail)
+        self.assertEqual(main.DANTE_SHADOW_TRAINING_FIELDS[-len(tail):], tail)
 
 
 class ShadowTrainingRegistrationTests(unittest.TestCase):
@@ -191,6 +217,26 @@ class ShadowTrainingRegistrationTests(unittest.TestCase):
         kw.register_dante_shadow_sample(
             code="000001", name="A", ctx=_StubCtx(five_min_closes_count=0),
             decision=_StubDecision(status="wait", reason="5분봉 캐시 미준비"),
+            current_price=10_000,
+        )
+        self.assertEqual(kw.pending_dante_shadow_samples, {})
+
+    def test_skip_when_outside_regular_capture_session(self):
+        kw = _StubKiwoom()
+        night_ts = datetime(2026, 4, 30, 21, 27, 24).timestamp()
+        kw.register_dante_shadow_sample(
+            code="000001", name="A", ctx=_StubCtx(now_ts=night_ts),
+            decision=_StubDecision(status="wait", reason="X"),
+            current_price=10_000,
+        )
+        self.assertEqual(kw.pending_dante_shadow_samples, {})
+
+    def test_skip_on_weekend_even_during_capture_hours(self):
+        kw = _StubKiwoom()
+        weekend_ts = datetime(2026, 5, 3, 10, 0, 0).timestamp()
+        kw.register_dante_shadow_sample(
+            code="000001", name="A", ctx=_StubCtx(now_ts=weekend_ts),
+            decision=_StubDecision(status="wait", reason="X"),
             current_price=10_000,
         )
         self.assertEqual(kw.pending_dante_shadow_samples, {})
@@ -232,6 +278,82 @@ class ShadowTrainingRegistrationTests(unittest.TestCase):
         sample = next(iter(kw.pending_dante_shadow_samples.values()))
         self.assertEqual(sample["row"]["decision_status"], "blocked")
 
+    def test_register_persists_reason_code(self):
+        # decision.reason_code 가 row 에 그대로 보존돼야 분석측에서 안정 group by 가 가능.
+        kw = _StubKiwoom()
+        kw.register_dante_shadow_sample(
+            code="000003", name="C", ctx=_StubCtx(),
+            decision=_StubDecision(
+                status="blocked",
+                reason="시가 대비 과열 12.0% > 10.0%",
+                reason_code="GATE_OVERHEAT_OPEN",
+            ),
+            current_price=11_000,
+        )
+        sample = next(iter(kw.pending_dante_shadow_samples.values()))
+        self.assertEqual(sample["row"]["reason_code"], "GATE_OVERHEAT_OPEN")
+        self.assertEqual(sample["row"]["decision_status"], "blocked")
+
+    def test_register_reason_code_defaults_to_empty(self):
+        # reason_code 가 비어 있는 결정도 안전하게 빈 문자열로 들어가야 한다.
+        kw = _StubKiwoom()
+        kw.register_dante_shadow_sample(
+            code="000004", name="D", ctx=_StubCtx(),
+            decision=_StubDecision(status="wait", reason="X"),
+            current_price=10_000,
+        )
+        sample = next(iter(kw.pending_dante_shadow_samples.values()))
+        self.assertEqual(sample["row"]["reason_code"], "")
+
+    def test_shadow_row_persists_market_meta_when_present(self):
+        # MarketSnapshot + decision 의 dry-run 메타가 row 에 그대로 박혀야 분석에서 join 가능.
+        kw = _StubKiwoom()
+        snap = ms.MarketSnapshot(
+            market_pct=-0.012,
+            market_slope_1m=-0.001,
+            market_slope_3m=-0.006,
+            market_drawdown_from_high=-0.018,
+            market_regime=ms.REGIME_WEAK,
+        )
+        kw.register_dante_shadow_sample(
+            code="000005", name="E",
+            ctx=_StubCtx(market_state=snap),
+            decision=_StubDecision(
+                status="wait", reason="0봉/1봉 동시 돌파 미확인",
+                reason_code="GATE_NO_BREAKOUT",
+                market_regime=ms.REGIME_WEAK,
+                market_gate_action="dry_run_allow",
+                market_gate_reason="",
+            ),
+            current_price=10_000,
+        )
+        row = next(iter(kw.pending_dante_shadow_samples.values()))["row"]
+        self.assertEqual(row["market_regime"], ms.REGIME_WEAK)
+        self.assertAlmostEqual(row["market_pct"], -0.012)
+        self.assertAlmostEqual(row["market_drawdown_from_high"], -0.018)
+        self.assertEqual(row["market_gate_action"], "dry_run_allow")
+        self.assertEqual(row["market_gate_reason"], "")
+
+    def test_shadow_row_market_meta_blank_when_snapshot_missing(self):
+        # ctx.market_state=None → MARKET_FIELDS 5개 모두 빈 문자열, gate 메타 2개는
+        # decision 에 박혀 있는 값을 그대로 유지(entry_strategy 가 항상 채워주므로).
+        kw = _StubKiwoom()
+        kw.register_dante_shadow_sample(
+            code="000006", name="F",
+            ctx=_StubCtx(market_state=None),
+            decision=_StubDecision(
+                status="wait", reason="X", reason_code="GATE_NO_BREAKOUT",
+                market_regime=ms.REGIME_NEUTRAL,
+                market_gate_action="dry_run_allow",
+            ),
+            current_price=10_000,
+        )
+        row = next(iter(kw.pending_dante_shadow_samples.values()))["row"]
+        for k in training_recorder.MARKET_FIELDS:
+            self.assertEqual(row[k], "")
+        self.assertEqual(row["market_gate_action"], "dry_run_allow")
+        self.assertEqual(row["market_gate_reason"], "")
+
     def test_cooldown_blocks_repeat_registration(self):
         kw = _StubKiwoom()
         decision = _StubDecision(status="wait", reason="X")
@@ -251,11 +373,15 @@ class ShadowTrainingLabelingTests(unittest.TestCase):
         kw = _StubKiwoom()
         with tempfile.TemporaryDirectory() as tmp:
             shadow_path = os.path.join(tmp, "shadow.csv")
-            with mock.patch.object(main, "DANTE_SHADOW_TRAINING_CSV", shadow_path), \
-                 mock.patch.object(main, "TRAINING_DATA_DIR", tmp):
+            with mock.patch.object(training_recorder, "DANTE_SHADOW_TRAINING_CSV", shadow_path), \
+                 mock.patch.object(training_recorder, "TRAINING_DATA_DIR", tmp):
                 kw.register_dante_shadow_sample(
                     code="000001", name="A", ctx=_StubCtx(),
-                    decision=_StubDecision(status="blocked", reason="과열"),
+                    decision=_StubDecision(
+                        status="blocked",
+                        reason="과열",
+                        reason_code="GATE_OVERHEAT_OPEN",
+                    ),
                     current_price=10_000,
                 )
                 self.assertEqual(len(kw.pending_dante_shadow_samples), 1)
@@ -272,15 +398,18 @@ class ShadowTrainingLabelingTests(unittest.TestCase):
                 self.assertEqual(len(lines), 2)
                 header = lines[0].strip().split(",")
                 self.assertEqual(header[0], "decision_status")
-                # 첫 데이터 행이 blocked 로 시작
-                self.assertTrue(lines[1].startswith("blocked,"))
+                self.assertEqual(header[1], "reason_code")
+                # 첫 데이터 행: blocked,GATE_OVERHEAT_OPEN,...
+                cells = lines[1].rstrip("\r\n").split(",")
+                self.assertEqual(cells[0], "blocked")
+                self.assertEqual(cells[1], "GATE_OVERHEAT_OPEN")
 
     def test_max_min_returns_tracked_during_horizon(self):
         kw = _StubKiwoom()
         with tempfile.TemporaryDirectory() as tmp:
             shadow_path = os.path.join(tmp, "shadow.csv")
-            with mock.patch.object(main, "DANTE_SHADOW_TRAINING_CSV", shadow_path), \
-                 mock.patch.object(main, "TRAINING_DATA_DIR", tmp):
+            with mock.patch.object(training_recorder, "DANTE_SHADOW_TRAINING_CSV", shadow_path), \
+                 mock.patch.object(training_recorder, "TRAINING_DATA_DIR", tmp):
                 kw.register_dante_shadow_sample(
                     code="000001", name="A", ctx=_StubCtx(),
                     decision=_StubDecision(status="wait", reason="X"),
@@ -305,8 +434,8 @@ class ShadowTrainingLabelingTests(unittest.TestCase):
         kw = _StubKiwoom()
         with tempfile.TemporaryDirectory() as tmp:
             shadow_path = os.path.join(tmp, "shadow.csv")
-            with mock.patch.object(main, "DANTE_SHADOW_TRAINING_CSV", shadow_path), \
-                 mock.patch.object(main, "TRAINING_DATA_DIR", tmp):
+            with mock.patch.object(training_recorder, "DANTE_SHADOW_TRAINING_CSV", shadow_path), \
+                 mock.patch.object(training_recorder, "TRAINING_DATA_DIR", tmp):
                 kw.register_dante_shadow_sample(
                     code="000001", name="A", ctx=_StubCtx(),
                     decision=_StubDecision(status="wait", reason="X"),

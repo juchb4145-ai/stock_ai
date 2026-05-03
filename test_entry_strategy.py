@@ -16,6 +16,7 @@ from typing import List
 from bars import FiveMinIndicators, MinuteBar
 from portfolio import Position
 import entry_strategy as es
+import market_state as ms
 
 
 def make_bar(*, ts: float, open_: int, high: int, low: int, close: int, volume: int = 100) -> MinuteBar:
@@ -80,6 +81,7 @@ def build_ctx(
     upper_wick_ratio_zero_bar: float = 0.1,
     px_over_bb55_pct: float | None = None,
     open_return: float | None = None,
+    market_state: ms.MarketSnapshot | None = None,
 ) -> es.EntryContext:
     now = now_ts or time.time()
     if five_min_ind == "default":
@@ -117,6 +119,18 @@ def build_ctx(
         upper_wick_ratio_zero_bar=upper_wick_ratio_zero_bar,
         px_over_bb55_pct=px_over_bb55_pct,
         open_return=open_return,
+        market_state=market_state,
+    )
+
+
+def make_market_snap(*, regime: str, pct: float = 0.0) -> ms.MarketSnapshot:
+    """테스트용 MarketSnapshot. classify_regime 임계와 어긋나도 regime 을 강제 부여한다."""
+    return ms.MarketSnapshot(
+        market_pct=pct,
+        market_slope_1m=None,
+        market_slope_3m=None,
+        market_drawdown_from_high=None,
+        market_regime=regime,
     )
 
 
@@ -132,6 +146,7 @@ class FirstEntryTests(unittest.TestCase):
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "blocked")
         self.assertIn("스프레드", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_SPREAD)
 
     def test_waits_when_observation_short(self):
         now = time.time()
@@ -139,18 +154,21 @@ class FirstEntryTests(unittest.TestCase):
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("관찰", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_OBSERVATION_SHORT)
 
     def test_waits_on_low_chejan_strength(self):
         ctx = build_ctx(chejan_strength=50.0)
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("체결강도", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_CHEJAN_SOFT)
 
     def test_waits_on_low_volume_speed(self):
         ctx = build_ctx(volume_speed=10.0)
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("거래속도", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_VOLUME_SPEED)
 
     def test_waits_when_below_5min_envelope(self):
         ind = FiveMinIndicators(
@@ -203,6 +221,7 @@ class FirstEntryTests(unittest.TestCase):
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("0봉/1봉", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_NO_BREAKOUT)
 
     def test_a_grade_ready_with_grade_field(self):
         ctx = build_ctx(is_breakout_zero_bar=True, is_breakout_prev_bar=False)
@@ -211,6 +230,7 @@ class FirstEntryTests(unittest.TestCase):
         self.assertEqual(d.grade, "A")
         self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
         self.assertEqual(d.stage, 1)
+        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
 
     def test_blocks_on_fake_breakout_upper_wick(self):
         ctx = build_ctx(upper_wick_ratio_zero_bar=0.55)  # > MAX_UPPER_WICK_RATIO
@@ -223,12 +243,14 @@ class FirstEntryTests(unittest.TestCase):
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "blocked")
         self.assertIn("시가", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_OVERHEAT_OPEN)
 
     def test_blocks_on_overheated_bb55_distance(self):
         ctx = build_ctx(px_over_bb55_pct=0.06)  # BB55 +6%
         d = es.evaluate_first_entry(ctx)
         self.assertEqual(d.status, "blocked")
         self.assertIn("BB55", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_OVERHEAT_BB55)
 
     def test_chejan_strength_120_passes_without_history(self):
         # 120 이상이면 추세 미상이어도 통과
@@ -283,6 +305,7 @@ class GradeBPullbackTests(unittest.TestCase):
         self.assertEqual(d.grade, "B")
         self.assertAlmostEqual(d.ratio, es.DANTE_GRADE_B_RATIO)
         self.assertEqual(d.stage, 2)
+        self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
 
     def test_b_grade_waits_when_no_pullback(self):
         ts = time.time() - 60 * 3
@@ -339,6 +362,7 @@ class SecondEntryTests(unittest.TestCase):
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "ready")
         self.assertAlmostEqual(d.ratio, es.DANTE_SECOND_ENTRY_RATIO)
+        self.assertEqual(d.reason_code, es.READY_AGRADE_SECOND)
 
     def test_waits_when_pullback_too_shallow(self):
         pos = self._position_after_stage1(breakout_high=10_300)
@@ -348,6 +372,7 @@ class SecondEntryTests(unittest.TestCase):
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("눌림 부족", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_STAGE2_PULLBACK_SHALLOW)
 
     def test_blocks_when_drawdown_exceeds_max(self):
         pos = self._position_after_stage1(breakout_high=10_500)
@@ -356,6 +381,7 @@ class SecondEntryTests(unittest.TestCase):
         ctx = build_ctx(position=pos, current_price=10_180, minute_bars=bars)
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "blocked")
+        self.assertEqual(d.reason_code, es.GATE_STAGE2_DRAWDOWN)
 
     def test_waits_when_no_negative_then_positive_pattern(self):
         pos = self._position_after_stage1(breakout_high=10_300)
@@ -378,6 +404,7 @@ class SecondEntryTests(unittest.TestCase):
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "blocked")
         self.assertIn("윈도우", d.reason)
+        self.assertEqual(d.reason_code, es.GATE_STAGE2_WINDOW_EXPIRED)
 
     def test_should_lock_single_position_after_window(self):
         pos = self._position_after_stage1(breakout_high=10_300)
@@ -389,6 +416,130 @@ class SecondEntryTests(unittest.TestCase):
         pos = self._position_after_stage1(breakout_high=10_300)
         ctx = build_ctx(position=pos)
         self.assertFalse(es.should_lock_single_position(ctx))
+
+
+class MarketDryRunGateTests(unittest.TestCase):
+    """1차 PR: market regime 은 status/ratio 변경 없이 메타만 부착한다.
+
+    테스트는 (1) 실제 진입 행동(status/ratio/grade/reason_code) 가 매크로에 의해
+    절대 바뀌지 않는지, (2) market_gate_action / market_gate_reason 메타가 정책대로
+    부여되는지 두 축에 집중한다.
+    """
+
+    def test_unknown_when_market_state_missing_falls_back_to_allow(self):
+        # ctx.market_state=None 시 neutral fallback → action=dry_run_allow
+        ctx = build_ctx()
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        self.assertEqual(d.market_regime, ms.REGIME_NEUTRAL)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+        self.assertEqual(d.market_gate_reason, "")
+
+    def test_unknown_regime_treated_as_neutral(self):
+        # snapshot 자체는 있으나 regime 이 unknown 이면 neutral 로 처리
+        snap = make_market_snap(regime=ms.REGIME_UNKNOWN)
+        ctx = build_ctx(market_state=snap)
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.market_regime, ms.REGIME_NEUTRAL)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+
+    def test_strong_keeps_allow_for_a_grade(self):
+        snap = make_market_snap(regime=ms.REGIME_STRONG, pct=0.01)
+        ctx = build_ctx(market_state=snap)
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.market_regime, ms.REGIME_STRONG)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+
+    def test_weak_blocks_a_grade_chase_only_but_status_unchanged(self):
+        # weak 매크로 + A급 0봉 추격 ready → action=block_chase_only, status 는 그대로 ready
+        snap = make_market_snap(regime=ms.REGIME_WEAK, pct=-0.008)
+        ctx = build_ctx(market_state=snap)
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready")
+        self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
+        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        self.assertEqual(d.market_regime, ms.REGIME_WEAK)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_CHASE_ONLY)
+        self.assertEqual(d.market_gate_reason, es.MARKET_GATE_WEAK_CHASE_BLOCK)
+
+    def test_weak_allows_b_grade_pullback(self):
+        # weak 매크로 + B급 첫 눌림 ready → action=allow (chase 가 아니므로)
+        ts = time.time() - 60 * 5
+        bars = [
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_230, close=10_240),
+            make_bar(ts=ts + 120, open_=10_240, high=10_250, low=10_200, close=10_220),
+            make_bar(ts=ts + 180, open_=10_220, high=10_260, low=10_215, close=10_240),
+        ]
+        snap = make_market_snap(regime=ms.REGIME_WEAK, pct=-0.008)
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            market_state=snap,
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
+        self.assertEqual(d.market_regime, ms.REGIME_WEAK)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+        self.assertEqual(d.market_gate_reason, "")
+
+    def test_weak_keeps_allow_for_non_ready_decisions(self):
+        # weak 매크로 + wait/blocked 결정 → 매크로는 allow (block_chase_only 는 A급 ready 한정)
+        snap = make_market_snap(regime=ms.REGIME_WEAK, pct=-0.008)
+        ctx = build_ctx(spread_rate=0.02, market_state=snap)  # 스프레드로 blocked
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "blocked")
+        self.assertEqual(d.reason_code, es.GATE_SPREAD)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+
+    def test_risk_off_marks_block_all_for_a_grade_ready(self):
+        snap = make_market_snap(regime=ms.REGIME_RISK_OFF, pct=-0.02)
+        ctx = build_ctx(market_state=snap)
+        d = es.evaluate_first_entry(ctx)
+        # status/ratio/reason_code 는 변경 없음
+        self.assertEqual(d.status, "ready")
+        self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
+        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        # 메타만 block_all
+        self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
+        self.assertEqual(d.market_gate_reason, es.MARKET_GATE_RISK_OFF)
+
+    def test_risk_off_marks_block_all_even_for_wait(self):
+        # risk_off 는 ready 가 아닌 결정에도 block_all 메타가 붙는다(분석 시 표본 분리용).
+        snap = make_market_snap(regime=ms.REGIME_RISK_OFF, pct=-0.02)
+        ctx = build_ctx(is_breakout_zero_bar=False, is_breakout_prev_bar=False, market_state=snap)
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_NO_BREAKOUT)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
+        self.assertEqual(d.market_gate_reason, es.MARKET_GATE_RISK_OFF)
+
+    def test_risk_off_marks_block_all_for_second_entry(self):
+        # evaluate_second_entry 도 동일 wrapping
+        snap = make_market_snap(regime=ms.REGIME_RISK_OFF, pct=-0.02)
+        pos = Position(
+            code="000001",
+            entry_stage=1,
+            entry_price=10_000,
+            quantity=10,
+            planned_quantity=40,
+            entry1_time=time.time() - 120,
+            pullback_window_deadline=time.time() + 600,
+            breakout_high=10_300,
+        )
+        ctx = build_ctx(position=pos, market_state=snap)
+        d = es.evaluate_second_entry(ctx)
+        # status 자체는 평가 결과 그대로(여기선 wait/blocked 어느 쪽이든)
+        self.assertIn(d.status, ("ready", "wait", "blocked"))
+        self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
+        self.assertEqual(d.market_gate_reason, es.MARKET_GATE_RISK_OFF)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 from bars import FiveMinIndicators, MinuteBar
+from market_state import (
+    MarketSnapshot,
+    REGIME_NEUTRAL,
+    REGIME_RISK_OFF,
+    REGIME_UNKNOWN,
+    REGIME_WEAK,
+)
 from portfolio import Position
 
 
@@ -64,6 +71,70 @@ PULLBACK_NEG_BARS_MAX = 2
 PULLBACK_WINDOW_MAX_SECONDS = 10 * 60
 
 
+# === reason_code enum ===
+# 자유 형식 한글 reason 과 짝을 이루는 안정 식별자. shadow 학습 트랙에서
+# false-negative 분석 시 group by 키로 쓰인다(수치가 들어간 한글 문자열은
+# 카디널리티가 폭발하므로 별도 코드 컬럼이 필요).
+#
+# 명명 규칙: GATE_* (게이트 거절) / READY_* (합격 분기). 같은 게이트가 단계별로
+# 상태가 다른 경우(stage1 spread 는 blocked, stage2 spread 는 wait) 도 게이트
+# 식별자는 동일하게 두고, 단계 구분이 필요한 항목만 STAGE2_ prefix 를 단다.
+# wait/blocked/ready 분리는 EntryDecision.status 로 직교 식별 가능.
+
+# Stage1 공통 게이트
+GATE_ALREADY_ENTERED = "GATE_ALREADY_ENTERED"
+GATE_PRICE_DATA = "GATE_PRICE_DATA"
+GATE_SPREAD = "GATE_SPREAD"
+GATE_TICKS_INSUFFICIENT = "GATE_TICKS_INSUFFICIENT"
+GATE_OBSERVATION_SHORT = "GATE_OBSERVATION_SHORT"
+GATE_VOLUME_SPEED = "GATE_VOLUME_SPEED"
+GATE_CHEJAN_SOFT = "GATE_CHEJAN_SOFT"
+GATE_CHEJAN_HARD_NO_TREND = "GATE_CHEJAN_HARD_NO_TREND"
+GATE_FIVEMIN_CACHE = "GATE_FIVEMIN_CACHE"
+GATE_TREND_FILTER = "GATE_TREND_FILTER"
+GATE_UPPER_WICK = "GATE_UPPER_WICK"
+GATE_OVERHEAT_OPEN = "GATE_OVERHEAT_OPEN"
+GATE_OVERHEAT_BB55 = "GATE_OVERHEAT_BB55"
+GATE_NO_BREAKOUT = "GATE_NO_BREAKOUT"
+
+# Stage1 B급 풀백
+GATE_BGRADE_NO_MINUTE_BARS = "GATE_BGRADE_NO_MINUTE_BARS"
+GATE_BGRADE_NO_HIGH = "GATE_BGRADE_NO_HIGH"
+GATE_BGRADE_DRAWDOWN = "GATE_BGRADE_DRAWDOWN"
+GATE_BGRADE_PULLBACK_SHALLOW = "GATE_BGRADE_PULLBACK_SHALLOW"
+GATE_BGRADE_PULLBACK_DEEP = "GATE_BGRADE_PULLBACK_DEEP"
+GATE_BGRADE_NO_REVERSAL = "GATE_BGRADE_NO_REVERSAL"
+
+# Stage2 본진입
+GATE_STAGE2_NO_FIRST = "GATE_STAGE2_NO_FIRST"
+GATE_STAGE2_WINDOW_EXPIRED = "GATE_STAGE2_WINDOW_EXPIRED"
+GATE_STAGE2_PRICE_DATA = "GATE_STAGE2_PRICE_DATA"
+GATE_STAGE2_SPREAD = "GATE_STAGE2_SPREAD"
+GATE_STAGE2_CHEJAN = "GATE_STAGE2_CHEJAN"
+GATE_STAGE2_VOLUME = "GATE_STAGE2_VOLUME"
+GATE_STAGE2_HIGH_DATA = "GATE_STAGE2_HIGH_DATA"
+GATE_STAGE2_DRAWDOWN = "GATE_STAGE2_DRAWDOWN"
+GATE_STAGE2_PULLBACK_SHALLOW = "GATE_STAGE2_PULLBACK_SHALLOW"
+GATE_STAGE2_PULLBACK_DEEP = "GATE_STAGE2_PULLBACK_DEEP"
+GATE_STAGE2_NO_REVERSAL = "GATE_STAGE2_NO_REVERSAL"
+
+# 합격 분기
+READY_AGRADE_FIRST = "READY_AGRADE_FIRST"
+READY_AGRADE_SECOND = "READY_AGRADE_SECOND"
+READY_BGRADE_PULLBACK = "READY_BGRADE_PULLBACK"
+
+
+# === Market regime dry-run gate (1차 PR: status/ratio 변경 없음, 메타만 부여) ===
+# 다음 PR 에서 표본 누적 후 일부를 실제 status="blocked" 로 승격할 때
+# reason_code 와 동일한 명명 규칙(`GATE_*`)을 그대로 쓸 수 있도록 정의해 둔다.
+MARKET_GATE_WEAK_CHASE_BLOCK = "GATE_MARKET_WEAK_CHASE_BLOCK"
+MARKET_GATE_RISK_OFF = "GATE_MARKET_RISK_OFF"
+
+MARKET_ACTION_ALLOW = "dry_run_allow"
+MARKET_ACTION_BLOCK_CHASE_ONLY = "dry_run_block_chase_only"
+MARKET_ACTION_BLOCK_ALL = "dry_run_block_all"
+
+
 @dataclass
 class EntryDecision:
     """1차/2차 진입 평가 결과."""
@@ -73,6 +144,13 @@ class EntryDecision:
     stage: int = 0  # 1 또는 2 (어느 단계인지 호출측이 식별하기 위함)
     reason: str = ""
     grade: str = ""  # "A"(0봉 돌파 분할) / "B"(1봉 돌파 일괄) / "" (해당 없음)
+    reason_code: str = ""  # GATE_*/READY_* enum. shadow 분석 시 안정 group by 키.
+    # === Market regime dry-run 메타 (status/ratio 에는 영향 없음) ===
+    # 1차 PR 에서는 학습/거래 로그에 기록만 하고 실제 매수 행동은 변경하지 않는다.
+    # 다음 PR 에서 표본 분포를 본 뒤 일부 케이스를 실제 status="blocked" 로 승격 예정.
+    market_regime: str = ""           # "strong"|"neutral"|"weak"|"risk_off"|"unknown"
+    market_gate_action: str = ""      # MARKET_ACTION_*
+    market_gate_reason: str = ""      # ""|MARKET_GATE_WEAK_CHASE_BLOCK|MARKET_GATE_RISK_OFF
 
 
 @dataclass
@@ -103,9 +181,55 @@ class EntryContext:
     upper_wick_ratio_zero_bar: float = 0.0
     px_over_bb55_pct: float = 0.0  # (현재가 / BB(55,2) 상단) - 1
     open_return: float = 0.0       # (현재가 / 시가) - 1
+    # === Market regime snapshot (None 가능 — 미수신 시 _apply_market_gate 가 neutral fallback) ===
+    market_state: Optional[MarketSnapshot] = None
+
+
+def _apply_market_gate(decision: EntryDecision, ctx: EntryContext) -> EntryDecision:
+    """매크로 regime 에 따라 decision 의 dry-run 메타 3개만 채워 반환.
+
+    1차 PR 에서는 status/ratio/grade/reason_code 를 절대 건드리지 않는다.
+    실제 매수 행동은 변경되지 않으며, ready/shadow/trade_log CSV 에 메타가 기록되어
+    표본 누적 후 다음 PR 에서 정책 승격 여부를 결정한다.
+
+    정책:
+        - strong/neutral: action=dry_run_allow, reason=""
+        - weak: A급 0봉 추격(READY_AGRADE_FIRST) 만 dry_run_block_chase_only,
+                그 외(B급 풀백/Stage2 본진입/wait/blocked) 는 dry_run_allow
+        - risk_off: 모든 분기에서 dry_run_block_all
+        - unknown 또는 ctx.market_state 미수신: neutral 로 fallback → dry_run_allow
+    """
+    snap = ctx.market_state
+    if snap is None:
+        regime = REGIME_NEUTRAL
+    else:
+        regime = snap.market_regime or REGIME_UNKNOWN
+        if regime == REGIME_UNKNOWN:
+            regime = REGIME_NEUTRAL
+
+    decision.market_regime = regime
+
+    if regime == REGIME_RISK_OFF:
+        decision.market_gate_action = MARKET_ACTION_BLOCK_ALL
+        decision.market_gate_reason = MARKET_GATE_RISK_OFF
+        return decision
+
+    if regime == REGIME_WEAK and decision.reason_code == READY_AGRADE_FIRST:
+        decision.market_gate_action = MARKET_ACTION_BLOCK_CHASE_ONLY
+        decision.market_gate_reason = MARKET_GATE_WEAK_CHASE_BLOCK
+        return decision
+
+    decision.market_gate_action = MARKET_ACTION_ALLOW
+    decision.market_gate_reason = ""
+    return decision
 
 
 def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
+    """공개 API 래퍼. 내부 평가 후 매크로 dry-run 메타를 부여해 반환."""
+    return _apply_market_gate(_evaluate_first_entry_inner(ctx), ctx)
+
+
+def _evaluate_first_entry_inner(ctx: EntryContext) -> EntryDecision:
     """신규 종목(entry_stage==0) 평가. A급(0봉 돌파)/B급(1봉 돌파만) 으로 분기.
 
     - A급: 0봉전 4개 상한선 동시 돌파 + 모든 게이트 통과 → 1차 추격 25%(stage=1)
@@ -117,14 +241,24 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
       5분봉 캐시 충분/추세 필터/가짜돌파(윗꼬리)/과열(시가대비, BB55 거리)
     """
     if ctx.position is not None and ctx.position.entry_stage > 0:
-        return EntryDecision("blocked", 0.0, 1, "이미 진입 완료")
+        return EntryDecision(
+            "blocked", 0.0, 1, "이미 진입 완료",
+            reason_code=GATE_ALREADY_ENTERED,
+        )
     if ctx.current_price <= 0 or ctx.ask <= 0 or ctx.bid <= 0:
-        return EntryDecision("wait", 0.0, 1, "가격/호가 데이터 부족")
+        return EntryDecision(
+            "wait", 0.0, 1, "가격/호가 데이터 부족",
+            reason_code=GATE_PRICE_DATA,
+        )
     if ctx.spread_rate < 0 or ctx.spread_rate > MAX_SPREAD_RATE:
-        return EntryDecision("blocked", 0.0, 1, "스프레드 과다 {:.2%}".format(ctx.spread_rate))
+        return EntryDecision(
+            "blocked", 0.0, 1, "스프레드 과다 {:.2%}".format(ctx.spread_rate),
+            reason_code=GATE_SPREAD,
+        )
     if ctx.tick_count < DANTE_MIN_TICKS:
         return EntryDecision(
-            "wait", 0.0, 1, "실시간 틱 부족 {}/{}".format(ctx.tick_count, DANTE_MIN_TICKS)
+            "wait", 0.0, 1, "실시간 틱 부족 {}/{}".format(ctx.tick_count, DANTE_MIN_TICKS),
+            reason_code=GATE_TICKS_INSUFFICIENT,
         )
 
     elapsed = ctx.now_ts - (ctx.condition_registered_at or ctx.now_ts)
@@ -132,12 +266,14 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
         return EntryDecision(
             "wait", 0.0, 1,
             "조건편입 관찰 {:.0f}/{}초".format(elapsed, DANTE_MIN_OBSERVATION_SECONDS),
+            reason_code=GATE_OBSERVATION_SHORT,
         )
 
     if ctx.volume_speed < MIN_VOLUME_SPEED:
         return EntryDecision(
             "wait", 0.0, 1,
             "거래속도 부족 {:.0f} < {}주/초".format(ctx.volume_speed, MIN_VOLUME_SPEED),
+            reason_code=GATE_VOLUME_SPEED,
         )
 
     # === 체결강도 강화 게이트 ===
@@ -148,6 +284,7 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
             return EntryDecision(
                 "wait", 0.0, 1,
                 "체결강도 부족 {:.1f} < {}".format(ctx.chejan_strength, MIN_CHEJAN_STRENGTH_SOFT),
+                reason_code=GATE_CHEJAN_SOFT,
             )
         if ctx.chejan_strength < MIN_CHEJAN_STRENGTH_HARD:
             if not _chejan_strength_rising(ctx.chejan_strength_history, MIN_CHEJAN_STRENGTH_SOFT):
@@ -156,11 +293,15 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
                     "체결강도 약함 {:.1f} (상승 미확인, Hard {} 미만)".format(
                         ctx.chejan_strength, MIN_CHEJAN_STRENGTH_HARD
                     ),
+                    reason_code=GATE_CHEJAN_HARD_NO_TREND,
                 )
 
     # === 5분봉 추세 필터 / 돌파 등급 판정에 캐시 필수 ===
     if ctx.five_min_ind is None or ctx.five_min_ind.closes_count < 13:
-        return EntryDecision("wait", 0.0, 1, "5분봉 캐시 미준비")
+        return EntryDecision(
+            "wait", 0.0, 1, "5분봉 캐시 미준비",
+            reason_code=GATE_FIVEMIN_CACHE,
+        )
     if not ctx.five_min_ind.trend_up(ctx.current_price):
         return EntryDecision(
             "wait", 0.0, 1,
@@ -169,6 +310,7 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
                 int(ctx.five_min_ind.env_upper_13_25 or 0),
                 int(ctx.five_min_ind.bb_upper_55_2 or 0),
             ),
+            reason_code=GATE_TREND_FILTER,
         )
 
     # === 가짜 돌파 게이트 (5분봉 진행봉 윗꼬리) ===
@@ -178,6 +320,7 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
             "5분봉 윗꼬리 과다 {:.0%} > {:.0%}".format(
                 ctx.upper_wick_ratio_zero_bar, MAX_UPPER_WICK_RATIO
             ),
+            reason_code=GATE_UPPER_WICK,
         )
 
     # === 과열 게이트 ===
@@ -185,6 +328,7 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
         return EntryDecision(
             "blocked", 0.0, 1,
             "시가 대비 과열 {:.1%} > {:.1%}".format(ctx.open_return, OVERHEATED_OPEN_RETURN),
+            reason_code=GATE_OVERHEAT_OPEN,
         )
     if ctx.px_over_bb55_pct > OVERHEATED_BB55_DISTANCE:
         return EntryDecision(
@@ -192,6 +336,7 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
             "BB55 대비 과열 +{:.1%} > {:.1%}".format(
                 ctx.px_over_bb55_pct, OVERHEATED_BB55_DISTANCE
             ),
+            reason_code=GATE_OVERHEAT_BB55,
         )
 
     # === A급 / B급 분기 ===
@@ -200,13 +345,17 @@ def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
             "ready", DANTE_FIRST_ENTRY_RATIO, 1,
             "A급 0봉 돌파 1차 추격 ({:.0%})".format(DANTE_FIRST_ENTRY_RATIO),
             grade="A",
+            reason_code=READY_AGRADE_FIRST,
         )
 
     if ctx.is_breakout_prev_bar:
         # B급: 추격 안 하고 1분봉 첫 눌림 + 양봉 반전 시 한 번에 본진입(100%)
         return _evaluate_b_grade_pullback(ctx)
 
-    return EntryDecision("wait", 0.0, 1, "0봉/1봉 동시 돌파 미확인")
+    return EntryDecision(
+        "wait", 0.0, 1, "0봉/1봉 동시 돌파 미확인",
+        reason_code=GATE_NO_BREAKOUT,
+    )
 
 
 def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
@@ -218,27 +367,36 @@ def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
     """
     bars = ctx.minute_bars
     if not bars:
-        return EntryDecision("wait", 0.0, 1, "B급: 1분봉 미수신")
+        return EntryDecision(
+            "wait", 0.0, 1, "B급: 1분봉 미수신",
+            reason_code=GATE_BGRADE_NO_MINUTE_BARS,
+        )
 
     recent = bars[-min(len(bars), 10):]
     high_since = max((b.high for b in recent if b.high > 0), default=0)
     if high_since <= 0:
-        return EntryDecision("wait", 0.0, 1, "B급: 1분봉 고점 데이터 없음")
+        return EntryDecision(
+            "wait", 0.0, 1, "B급: 1분봉 고점 데이터 없음",
+            reason_code=GATE_BGRADE_NO_HIGH,
+        )
 
     pullback_pct = (high_since - ctx.current_price) / high_since
     if pullback_pct > MAX_DRAWDOWN_FROM_HIGH:
         return EntryDecision(
-            "blocked", 0.0, 1, "B급: 고점 대비 -{:.2%} 초과".format(pullback_pct)
+            "blocked", 0.0, 1, "B급: 고점 대비 -{:.2%} 초과".format(pullback_pct),
+            reason_code=GATE_BGRADE_DRAWDOWN,
         )
     if pullback_pct < PULLBACK_MIN_PCT:
         return EntryDecision(
             "wait", 0.0, 1,
             "B급: 눌림 부족 ({:.2%} < {:.2%})".format(pullback_pct, PULLBACK_MIN_PCT),
+            reason_code=GATE_BGRADE_PULLBACK_SHALLOW,
         )
     if pullback_pct > PULLBACK_MAX_PCT:
         return EntryDecision(
             "wait", 0.0, 1,
             "B급: 눌림 깊음 ({:.2%} > {:.2%})".format(pullback_pct, PULLBACK_MAX_PCT),
+            reason_code=GATE_BGRADE_PULLBACK_DEEP,
         )
 
     if not _has_neg_then_positive_pattern(
@@ -246,7 +404,10 @@ def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
     ):
-        return EntryDecision("wait", 0.0, 1, "B급: 음봉→양봉 반전 미확인")
+        return EntryDecision(
+            "wait", 0.0, 1, "B급: 음봉→양봉 반전 미확인",
+            reason_code=GATE_BGRADE_NO_REVERSAL,
+        )
 
     return EntryDecision(
         "ready", DANTE_GRADE_B_RATIO, 2,
@@ -254,6 +415,7 @@ def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
             pullback_pct, DANTE_GRADE_B_RATIO
         ),
         grade="B",
+        reason_code=READY_BGRADE_PULLBACK,
     )
 
 
@@ -277,10 +439,18 @@ def _chejan_strength_rising(history: Sequence[float], min_recent_avg: float) -> 
 
 
 def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
+    """공개 API 래퍼. 내부 평가 후 매크로 dry-run 메타를 부여해 반환."""
+    return _apply_market_gate(_evaluate_second_entry_inner(ctx), ctx)
+
+
+def _evaluate_second_entry_inner(ctx: EntryContext) -> EntryDecision:
     """2차(본진입) 가능 여부 평가. position.entry_stage == 1 인 종목에만 적용."""
     pos = ctx.position
     if pos is None or pos.entry_stage != 1:
-        return EntryDecision("blocked", 0.0, 2, "1차 미체결 또는 본진입 완료")
+        return EntryDecision(
+            "blocked", 0.0, 2, "1차 미체결 또는 본진입 완료",
+            reason_code=GATE_STAGE2_NO_FIRST,
+        )
 
     deadline = pos.pullback_window_deadline
     if deadline > 0 and ctx.now_ts > deadline:
@@ -291,12 +461,19 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
             "본진입 윈도우 만료(1차 후 {:.0f}초)".format(
                 ctx.now_ts - (pos.entry1_time or ctx.now_ts)
             ),
+            reason_code=GATE_STAGE2_WINDOW_EXPIRED,
         )
 
     if ctx.current_price <= 0 or ctx.ask <= 0 or ctx.bid <= 0:
-        return EntryDecision("wait", 0.0, 2, "가격/호가 데이터 부족")
+        return EntryDecision(
+            "wait", 0.0, 2, "가격/호가 데이터 부족",
+            reason_code=GATE_STAGE2_PRICE_DATA,
+        )
     if ctx.spread_rate < 0 or ctx.spread_rate > MAX_SPREAD_RATE:
-        return EntryDecision("wait", 0.0, 2, "스프레드 과다 {:.2%}".format(ctx.spread_rate))
+        return EntryDecision(
+            "wait", 0.0, 2, "스프레드 과다 {:.2%}".format(ctx.spread_rate),
+            reason_code=GATE_STAGE2_SPREAD,
+        )
 
     if ctx.chejan_strength > 0 and ctx.chejan_strength < MIN_CHEJAN_STRENGTH:
         return EntryDecision(
@@ -304,6 +481,7 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
             0.0,
             2,
             "체결강도 약화 {:.1f} < {}".format(ctx.chejan_strength, MIN_CHEJAN_STRENGTH),
+            reason_code=GATE_STAGE2_CHEJAN,
         )
 
     if ctx.volume_speed < MIN_VOLUME_SPEED * 0.5:
@@ -312,11 +490,15 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
             0.0,
             2,
             "거래속도 약화 {:.0f}".format(ctx.volume_speed),
+            reason_code=GATE_STAGE2_VOLUME,
         )
 
     breakout_high = pos.breakout_high or pos.entry_price
     if breakout_high <= 0:
-        return EntryDecision("wait", 0.0, 2, "고점 추적 데이터 부족")
+        return EntryDecision(
+            "wait", 0.0, 2, "고점 추적 데이터 부족",
+            reason_code=GATE_STAGE2_HIGH_DATA,
+        )
     pullback_pct = (breakout_high - ctx.current_price) / breakout_high
 
     if pullback_pct > MAX_DRAWDOWN_FROM_HIGH:
@@ -325,6 +507,7 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
             0.0,
             2,
             "고점 대비 -{:.2%} 초과(차단)".format(pullback_pct),
+            reason_code=GATE_STAGE2_DRAWDOWN,
         )
     if pullback_pct < PULLBACK_MIN_PCT:
         return EntryDecision(
@@ -332,6 +515,7 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
             0.0,
             2,
             "눌림 부족 ({:.2%} < {:.2%})".format(pullback_pct, PULLBACK_MIN_PCT),
+            reason_code=GATE_STAGE2_PULLBACK_SHALLOW,
         )
     if pullback_pct > PULLBACK_MAX_PCT:
         return EntryDecision(
@@ -339,6 +523,7 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
             0.0,
             2,
             "눌림 깊음 ({:.2%} > {:.2%})".format(pullback_pct, PULLBACK_MAX_PCT),
+            reason_code=GATE_STAGE2_PULLBACK_DEEP,
         )
 
     if not _has_neg_then_positive_pattern(
@@ -346,7 +531,10 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
     ):
-        return EntryDecision("wait", 0.0, 2, "음봉→양봉 반전 미확인")
+        return EntryDecision(
+            "wait", 0.0, 2, "음봉→양봉 반전 미확인",
+            reason_code=GATE_STAGE2_NO_REVERSAL,
+        )
 
     return EntryDecision(
         "ready",
@@ -354,6 +542,7 @@ def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
         2,
         "A급 본진입 (눌림 {:.2%}, {:.0%})".format(pullback_pct, DANTE_SECOND_ENTRY_RATIO),
         grade="A",
+        reason_code=READY_AGRADE_SECOND,
     )
 
 

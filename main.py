@@ -1,16 +1,12 @@
 from PyQt5.QAxContainer import *
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
-import csv
 import json
-import logging
-import logging.handlers
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
-import uuid
 
 import pandas as pd
 import pickle
@@ -19,38 +15,36 @@ import scoring
 import entry_strategy
 import exit_strategy
 from bars import FiveMinIndicatorCache, MinuteBarAggregator
+from market_state import KOSDAQ_CODE, KOSPI_CODE, MarketStateCache
 from portfolio import LoadedPortfolioState, Position, PortfolioState
+from logging_setup import setup_logging
+from fid_codes import FID_CODES, FID_NAME_TO_CODE, get_fid
+from training_recorder import (
+    TrainingRecorderMixin,
+    # 모듈 상수 re-export — 외부 테스트가 main.X 로 직접 접근하므로 호환 유지
+    TRAINING_DATA_ENABLED,
+    TRAINING_DATA_DIR,
+    TRAINING_ENTRY_CSV,
+    TRADE_LOG_CSV,
+    TRAINING_SAMPLE_COOLDOWN_SECONDS,
+    TRAINING_LABEL_HORIZONS,
+    DANTE_TRAINING_DATA_ENABLED,
+    DANTE_TRAINING_CSV,
+    DANTE_TRAINING_LABEL_HORIZONS,
+    DANTE_TRAINING_FINAL_HORIZON_SECONDS,
+    DANTE_TRAINING_SAMPLE_COOLDOWN_SECONDS,
+    DANTE_TRAINING_FIELDS,
+    DANTE_SHADOW_TRAINING_DATA_ENABLED,
+    DANTE_SHADOW_TRAINING_CSV,
+    DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS,
+    DANTE_SHADOW_TRAINING_FIELDS,
+    ENTRY_FEATURE_NAMES,
+    TRAINING_ENTRY_FIELDS,
+    TRADE_LOG_FIELDS,
+)
 
 
-def _setup_logging():
-    # 환경변수 KIWOOM_LOG_LEVEL=DEBUG 등으로 임시 디버그 가능. 기본은 INFO.
-    log_dir = "data"
-    os.makedirs(log_dir, exist_ok=True)
-    root = logging.getLogger()
-    if root.handlers:
-        return logging.getLogger("kiwoom")
-    level_name = os.environ.get("KIWOOM_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    root.setLevel(level)
-    fmt = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(fmt)
-    root.addHandler(stream_handler)
-    file_handler = logging.handlers.RotatingFileHandler(
-        os.path.join(log_dir, "main.log"),
-        maxBytes=5_000_000,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
-    root.addHandler(file_handler)
-    return logging.getLogger("kiwoom")
-
-
-logger = _setup_logging()
+logger = setup_logging()
 
 # ===== 단테조건식 추세전략 =====
 # 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 단테조건식.xls 의 본 조건은
@@ -60,59 +54,17 @@ logger = _setup_logging()
 CONDITION_NAME = "단테떡상이"
 CONDITION_SCREEN_NO = "0150"
 REALTIME_SCREEN_NO = "0160"
+# KOSPI/KOSDAQ 업종지수 실시간용 별도 스크린(종목 실시간과 충돌 방지).
+INDEX_REALTIME_SCREEN_NO = "0170"
 ORDER_SCREEN_NO = "0001"
 # 단테 룰 기반 전환 직후에는 AI 서버/구식 학습 트랙(entry_training.csv) 의 의사결정을
 # 따르지 않는다. 새 전략 데이터가 충분히 쌓일 때까지 두 트랙 모두 비활성화한다.
 AI_SERVER_ENABLED = False
 AI_SERVER_URL = "http://127.0.0.1:8000"
 AI_SERVER_TIMEOUT_SECONDS = 0.35
-TRAINING_DATA_ENABLED = False
-TRAINING_DATA_DIR = "data"
-TRAINING_ENTRY_CSV = os.path.join(TRAINING_DATA_DIR, "entry_training.csv")
-TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
-TRAINING_SAMPLE_COOLDOWN_SECONDS = 30
-TRAINING_LABEL_HORIZONS = (300, 600, 1200)
-# === 단테 전용 학습 트랙(Phase A) ===
-# 룰 기반 운용을 유지한 채 1차/2차 진입 후보의 피처/사후 라벨만 별도 CSV 로 누적한다.
-# 충분한 표본이 쌓이면 train_dante_lgbm.py 가 같은 헤더를 읽어 모델을 학습한다.
-DANTE_TRAINING_DATA_ENABLED = True
-DANTE_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_entry_training.csv")
-DANTE_TRAINING_LABEL_HORIZONS = (300, 600, 1200)  # 5/10/20분 단순 수익률
-DANTE_TRAINING_FINAL_HORIZON_SECONDS = 25 * 60  # 25분 후 reached_1r/2r/hit_stop/time_exit 확정
-DANTE_TRAINING_SAMPLE_COOLDOWN_SECONDS = 60  # 같은 종목 연속 등록 방지(중복 표본 줄이기)
-DANTE_TRAINING_FIELDS = [
-    "sample_id",
-    "captured_at",
-    "captured_time",
-    "code",
-    "name",
-    "entry_stage",
-    "entry_price",
-    "ratio",
-    "reason",
-] + list(scoring.DANTE_ENTRY_FEATURE_NAMES) + [
-    "return_5m",
-    "return_10m",
-    "return_20m",
-    "max_return_25m",
-    "min_return_25m",
-    "reached_1r",
-    "reached_2r",
-    "hit_stop",
-    "time_exit",
-    "labeled_at",
-]
-# === 단테 shadow 학습 트랙(false-negative 측정용) ===
-# 게이트가 wait/blocked 으로 거른 종목도 같은 25분 horizon 사후 라벨로 캡처한다.
-# 이걸 누적해야 "우리가 거른 종목들이 사실은 +1R 까지 잘 갔는가?" 분포를 볼 수 있다.
-# 기존 dante_entry_training.csv (=ready 만) 와 짝을 이루어 false-negative 분석에 쓰인다.
-# 분석 단계에서 두 파일을 한 번에 읽으려면 schema 가 호환되어야 하므로,
-# 헤더는 [decision_status] + DANTE_TRAINING_FIELDS 로 정의한다(앞에 한 컬럼 추가).
-DANTE_SHADOW_TRAINING_DATA_ENABLED = True
-DANTE_SHADOW_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_shadow_training.csv")
-# shadow 표본은 같은 코드에서 wait 가 반복되며 줄줄이 발생할 수 있어, ready 보다 길게 잡는다.
-DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS = 90
-DANTE_SHADOW_TRAINING_FIELDS = ["decision_status"] + DANTE_TRAINING_FIELDS
+# 학습 트랙(구학습 + 단테 + shadow) 의 enable 플래그/CSV 경로/필드 정의는
+# training_recorder 모듈로 이전했다. 같은 이름의 모듈 상수를 main 에서 re-export
+# 하므로 기존 ``from main import DANTE_TRAINING_CSV`` 같은 사용처는 그대로 동작한다.
 
 # === 장중 크래시 복원용 portfolio 상태 디스크 영속화 ===
 # Position 의 전략 필드(entry_stage / planned_quantity / stop_price / partial_taken /
@@ -174,347 +126,11 @@ SELL_SKIP_LOG_COOLDOWN_SECONDS = 30
 TR_RESPONSE_TIMEOUT_MS = 5000
 AI_SERVER_FAILURE_THRESHOLD = 3
 AI_SERVER_COOLDOWN_SECONDS = 30
-ENTRY_FEATURE_NAMES = [
-    "price_momentum",
-    "open_return",
-    "box_position",
-    "direction_score",
-    "volume_speed",
-    "spread_rate",
-]
-TRAINING_ENTRY_FIELDS = [
-    "sample_id",
-    "captured_at",
-    "captured_time",
-    "code",
-    "name",
-    "entry_price",
-    "score",
-    "expected_return",
-    "target_price",
-    "model_name",
-    "status",
-    "reason",
-] + ENTRY_FEATURE_NAMES + [
-    "return_5m",
-    "return_10m",
-    "return_20m",
-    "success_10m",
-]
-TRADE_LOG_FIELDS = [
-    "logged_at",
-    "event",
-    "code",
-    "name",
-    "side",
-    "order_type",
-    "order_status",
-    "order_no",
-    "order_result",
-    "quantity",
-    "order_price",
-    "current_price",
-    "executed_price",
-    "executed_quantity",
-    "entry_price",
-    "target_price",
-    "score",
-    "expected_return",
-    "model_name",
-    "reason",
-    "hold_seconds",
-    "profit_rate",
-    "message",
-]
-
-FID_CODES = {
-    "10": "현재가",
-    "11": "전일 대비",
-    "12": "등락율",
-    "13": "누적거래량",
-    "14": "누적거래대금",
-    "15": "거래량",
-    "16": "시가",
-    "17": "고가",
-    "18": "저가",
-    "20": "체결시간",
-    "21": "호가시간",
-    "23": "예상체결가",
-    "24": "예상체결 수량",
-    "25": "전일대비기호",
-    "26": "전일거래량 대비(계약,주)",
-    "27": "(최우선)매도호가",
-    "28": "(최우선)매수호가",
-    "29": "거래대금 증감",
-    "30": "전일거래량 대비(비율)",
-    "31": "거래회전율",
-    "32": "거래비용",
-    "41": "매도호가1",
-    "42": "매도호가2",
-    "43": "매도호가3",
-    "44": "매도호가4",
-    "45": "매도호가5",
-    "46": "매도호가6",
-    "47": "매도호가7",
-    "48": "매도호가8",
-    "49": "매도호가9",
-    "50": "매도호가10",
-    "51": "매수호가1",
-    "52": "매수호가2",
-    "53": "매수호가3",
-    "54": "매수호가4",
-    "55": "매수호가5",
-    "56": "매수호가6",
-    "57": "매수호가7",
-    "58": "매수호가8",
-    "59": "매수호가9",
-    "60": "매수호가10",
-    "61": "매도호가 수량1",
-    "62": "매도호가 수량2",
-    "63": "매도호가 수량3",
-    "64": "매도호가 수량4",
-    "65": "매도호가 수량5",
-    "66": "매도호가 수량6",
-    "67": "매도호가 수량7",
-    "68": "매도호가 수량8",
-    "69": "매도호가 수량9",
-    "70": "매도호가 수량10",
-    "71": "매수호가 수량1",
-    "72": "매수호가 수량2",
-    "73": "매수호가 수량3",
-    "74": "매수호가 수량4",
-    "75": "매수호가 수량5",
-    "76": "매수호가 수량6",
-    "77": "매수호가 수량7",
-    "78": "매수호가 수량8",
-    "79": "매수호가 수량9",
-    "80": "매수호가 수량10",
-    "81": "매도호가 직전대비1",
-    "82": "매도호가 직전대비2",
-    "83": "매도호가 직전대비3",
-    "84": "매도호가 직전대비4",
-    "85": "매도호가 직전대비5",
-    "86": "매도호가 직전대비6",
-    "87": "매도호가 직전대비7",
-    "88": "매도호가 직전대비8",
-    "89": "매도호가 직전대비9",
-    "90": "매도호가 직전대비10",
-    "91": "매수호가 직전대비1",
-    "92": "매수호가 직전대비2",
-    "93": "매수호가 직전대비3",
-    "94": "매수호가 직전대비4",
-    "95": "매수호가 직전대비5",
-    "96": "매수호가 직전대비6",
-    "97": "매수호가 직전대비7",
-    "98": "매수호가 직전대비8",
-    "99": "매수호가 직전대비9",
-    "100": "매수호가 직전대비10",
-    "101": "매도호가 건수1",
-    "102": "매도호가 건수2",
-    "103": "매도호가 건수3",
-    "104": "매도호가 건수4",
-    "105": "매도호가 건수5",
-    "111": "매수호가 건수1",
-    "112": "매수호가 건수2",
-    "113": "매수호가 건수3",
-    "114": "매수호가 건수4",
-    "115": "매수호가 건수5",
-    "121": "매도호가 총잔량",
-    "122": "매도호가 총잔량 직전대비",
-    "123": "매도호가 총 건수",
-    "125": "매수호가 총잔량",
-    "126": "매수호가 총잔량 직전대비",
-    "127": "매수호가 총 건수",
-    "128": "순매수잔량(총매수잔량-총매도잔량)",
-    "129": "매수비율",
-    "131": "시간외 매도호가 총잔량",
-    "132": "시간외 매도호가 총잔량 직전대비",
-    "135": "시간외 매수호가 총잔량",
-    "136": "시간외 매수호가 총잔량 직전대비",
-    "137": "호가 순잔량",
-    "138": "순매도잔량(총매도잔량-총매수잔량)",
-    "139": "매도비율",
-    "141": "매도 거래원1",
-    "142": "매도 거래원2",
-    "143": "매도 거래원3",
-    "144": "매도 거래원4",
-    "145": "매도 거래원5",
-    "146": "매도 거래원 코드1",
-    "147": "매도 거래원 코드2",
-    "148": "매도 거래원 코드3",
-    "149": "매도 거래원 코드4",
-    "150": "매도 거래원 코드5",
-    "151": "매수 거래원1",
-    "152": "매수 거래원2",
-    "153": "매수 거래원3",
-    "154": "매수 거래원4",
-    "155": "매수 거래원5",
-    "156": "매수 거래원 코드1",
-    "157": "매수 거래원 코드2",
-    "158": "매수 거래원 코드3",
-    "159": "매수 거래원 코드4",
-    "160": "매수 거래원 코드5",
-    "161": "매도 거래원 수량1",
-    "162": "매도 거래원 수량2",
-    "163": "매도 거래원 수량3",
-    "164": "매도 거래원 수량4",
-    "165": "매도 거래원 수량5",
-    "166": "매도 거래원별 증감1",
-    "167": "매도 거래원별 증감2",
-    "168": "매도 거래원별 증감3",
-    "169": "매도 거래원별 증감4",
-    "170": "매도 거래원별 증감5",
-    "171": "매수 거래원 수량1",
-    "172": "매수 거래원 수량2",
-    "173": "매수 거래원 수량3",
-    "174": "매수 거래원 수량4",
-    "175": "매수 거래원 수량5",
-    "176": "매수 거래원별 증감1",
-    "177": "매수 거래원별 증감2",
-    "178": "매수 거래원별 증감3",
-    "179": "매수 거래원별 증감4",
-    "180": "매수 거래원별 증감5",
-    "181": "미결제 약정 전일대비",
-    "182": "이론가",
-    "183": "시장베이시스",
-    "184": "이론베이시스",
-    "185": "괴리도",
-    "186": "괴리율",
-    "187": "내재가치",
-    "188": "시간가치",
-    "189": "내재변동성(I.V.)",
-    "190": "델타",
-    "191": "감마",
-    "192": "베가",
-    "193": "세타",
-    "194": "로",
-    "195": "미결제약정",
-    "196": "미결제 증감",
-    "197": "KOSPI200",
-    "200": "예상체결가 전일종가 대비",
-    "201": "예상체결가 전일종가 대비 등락율",
-    "214": "장시작 예상잔여시간",
-    "215": "장운영구분",  # (0:장시작전, 2:장종료전, 3:장시작, 4,8:장종료, 9:장마감)
-    "216": "투자자별 ticker",
-    "219": "선물 최근 월물지수",
-    "228": "체결강도",
-    "238": "예상체결가 전일종가 대비기호",
-    "246": "시초 미결제 약정수량",
-    "247": "최고 미결제 약정수량",
-    "248": "최저 미결제 약정수량",
-    "251": "상한종목수",
-    "252": "상승종목수",
-    "253": "보합종목수",
-    "254": "하한종목수",
-    "255": "하락종목수",
-    "256": "거래형성 종목수",
-    "257": "거래형성 비율",
-    "261": "외국계 매도추정합",
-    "262": "외국계 매도추정합 변동",
-    "263": "외국계 매수추정합",
-    "264": "외국계 매수추정합 변동",
-    "267": "외국계 순매수추정합",
-    "268": "외국계 순매수 변동",
-    "271": "매도 거래원 색깔1",
-    "272": "매도 거래원 색깔2",
-    "273": "매도 거래원 색깔3",
-    "274": "매도 거래원 색깔4",
-    "275": "매도 거래원 색깔5",
-    "281": "매수 거래원 색깔1",
-    "282": "매수 거래원 색깔2",
-    "283": "매수 거래원 색깔3",
-    "284": "매수 거래원 색깔4",
-    "285": "매수 거래원 색깔5",
-    "290": "장구분",
-    "291": "예상체결가",
-    "292": "예상체결량",
-    "293": "예상체결가 전일대비기호",
-    "294": "예상체결가 전일대비",
-    "295": "예상체결가 전일대비등락율",
-    "299": "전일거래량대비예상체결률",
-    "302": "종목명",
-    "307": "기준가",
-    "311": "시가총액(억)",
-    "337": "거래소구분 (1, KOSPI, 2:KOSDAQ, 3:OTCCBB, 4:KOSPI200선물, 5:KOSPI200옵션, 6:개별주식옵션, 7:채권)",
-    "391": "기준가대비 시고등락율",
-    "392": "기준가대비 고가등락율",
-    "393": "기준가대비 저가등락율",
-    "397": "주식옵션거래단위",
-    "621": "LP매도호가 수량1",
-    "622": "LP매도호가 수량2",
-    "623": "LP매도호가 수량3",
-    "624": "LP매도호가 수량4",
-    "625": "LP매도호가 수량5",
-    "626": "LP매도호가 수량6",
-    "627": "LP매도호가 수량7",
-    "628": "LP매도호가 수량8",
-    "629": "LP매도호가 수량9",
-    "630": "LP매도호가 수량10",
-    "631": "LP매수호가 수량1",
-    "632": "LP매수호가 수량2",
-    "633": "LP매수호가 수량3",
-    "634": "LP매수호가 수량4",
-    "635": "LP매수호가 수량5",
-    "636": "LP매수호가 수량6",
-    "637": "LP매수호가 수량7",
-    "638": "LP매수호가 수량8",
-    "639": "LP매수호가 수량9",
-    "640": "LP매수호가 수량10",
-    "691": "K,O 접근도 (ELW조기종료발생 기준가격, 지수)",
-    "900": "주문수량",
-    "901": "주문가격",
-    "902": "미체결수량",
-    "903": "체결누계금액",
-    "904": "원주문번호",
-    "905": "주문구분",
-    "906": "매매구분",
-    "907": "매도수구분",
-    "908": "주문시간",
-    "909": "체결번호",
-    "910": "체결가",
-    "911": "체결량",
-    "912": "주문업무분류",  # (JJ:주식주문, FJ:선물옵션, JG:주식잔고, FG:선물옵션잔고)
-    "913": "주문상태",  # (10:원주문, 11:정정주문, 12:취소주문, 20:주문확인, 21:정정확인, 22:취소확인, 90-92:주문거부)
-    "914": "단위체결가",
-    "915": "단위체결량",
-    "916": "대출일",
-    "917": "신용구분",
-    "918": "만기일",
-    "930": "보유수량",
-    "931": "매입단가",
-    "932": "총매입가",
-    "933": "주문가능수량",
-    "938": "당일매매 수수료",
-    "939": "당일매매세금",
-    "945": "당일순매수량",
-    "946": "매도/매수구분",
-    "950": "당일 총 매도 손익",
-    "951": "예수금",
-    "957": "신용금액",
-    "958": "신용이자",
-    "959": "담보대출수량",
-    "990": "당일실현손익(유가)",
-    "991": "당일실현손익률(유가)",
-    "992": "당일실현손익(신용)",
-    "993": "당일실현손익률(신용)",
-    "8019": "손익율",
-    "9001": "종목코드",
-    "9201": "계좌번호",
-    "9203": "주문번호",
-    "9205": "관리자사번"
-}
-
-FID_NAME_TO_CODE = {value: key for key, value in FID_CODES.items()}
+# 학습/거래 로그 필드 정의(ENTRY_FEATURE_NAMES, TRAINING_ENTRY_FIELDS, TRADE_LOG_FIELDS)
+# 는 training_recorder.py 로 이전. 본 파일 상단 import 에서 re-export 한다.
 
 
-def get_fid(fid_name):
-    try:
-        return FID_NAME_TO_CODE[fid_name]
-    except KeyError:
-        raise KeyError("알 수 없는 FID 이름: {}".format(fid_name))
-
-
-class Kiwoom(QAxWidget):
+class Kiwoom(TrainingRecorderMixin, QAxWidget):
     def __init__(self):
         super().__init__()
         self._make_kiwoom_instance()
@@ -575,6 +191,10 @@ class Kiwoom(QAxWidget):
         # 1분봉은 실시간 틱(append_realtime_tick) 에서, 5분봉은 opt10080 TR 응답에서 push 된다.
         self.minute_aggregator = MinuteBarAggregator(max_bars=60)
         self.five_min_cache = FiveMinIndicatorCache()
+        # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 캐시.
+        # 미수신 시 entry_strategy 가 neutral fallback 으로 안전 처리한다.
+        self.market_state = MarketStateCache()
+        self.index_realtime_registered = False
         # 학습 데이터(entry_training.csv) 기반 보정값.
         # 단테 룰 전환 직후에는 사용하지 않으므로 None 상태로 둔다.
         self.dynamic_min_net_return = None
@@ -1327,6 +947,12 @@ class Kiwoom(QAxWidget):
     def _on_receive_real_data(self, s_code, real_type, real_data):
         if real_type == "장시작시간":
             pass
+        elif real_type == "업종지수":
+            # KOSPI(001)/KOSDAQ(101) 실시간 지수 — market_state.MarketStateCache 갱신.
+            # 등록 안 된 업종 코드는 cache 가 자동으로 무시한다.
+            price = self.get_real_int(s_code, "현재가")
+            if price > 0:
+                self.market_state.update(str(s_code), float(price), time.time())
         elif real_type == "주식체결":
             signed_at = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("체결시간"))
             close = self.get_real_int(s_code, "현재가")
@@ -1867,453 +1493,6 @@ class Kiwoom(QAxWidget):
         self.last_wait_log_at[code] = now
         return True
 
-    def ensure_training_data_file(self):
-        if not TRAINING_DATA_ENABLED:
-            return
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(TRAINING_ENTRY_CSV):
-            return
-        with open(TRAINING_ENTRY_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
-            writer.writeheader()
-
-    def append_training_row(self, row):
-        if not TRAINING_DATA_ENABLED:
-            return
-        self.ensure_training_data_file()
-        with open(TRAINING_ENTRY_CSV, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
-            writer.writerow(row)
-
-    # ---------------------------------------------------------------
-    # 단테 학습 트랙(Phase A) — 데이터 수집 전용. Phase B 모델 학습은 별도 스크립트.
-    # ---------------------------------------------------------------
-
-    def ensure_dante_training_data_file(self):
-        if not DANTE_TRAINING_DATA_ENABLED:
-            return
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(DANTE_TRAINING_CSV):
-            return
-        with open(DANTE_TRAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=DANTE_TRAINING_FIELDS)
-            writer.writeheader()
-
-    def append_dante_training_row(self, row):
-        if not DANTE_TRAINING_DATA_ENABLED:
-            return
-        self.ensure_dante_training_data_file()
-        with open(DANTE_TRAINING_CSV, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=DANTE_TRAINING_FIELDS)
-            writer.writerow(row)
-
-    def register_dante_training_sample(self, *, code, name, ctx, decision, current_price):
-        """1차/2차 매수 'ready' 결정 직후 호출. 진입 피처를 캡처하고 사후 라벨링 큐에 등록한다.
-
-        실제 매수 발주(send_order) 와 무관하게 호출된다.
-        매수 차단/실패가 일어나도 단테 게이트가 'ready' 라고 판단했으면 가설 표본으로 누적한다.
-        같은 종목에서 1분 안에 두 번 ready 가 떨어져도 한 번만 기록한다.
-        """
-        if not DANTE_TRAINING_DATA_ENABLED:
-            return
-        if decision is None or getattr(decision, "status", "") != "ready":
-            return
-        if current_price <= 0:
-            return
-
-        now = time.time()
-        last_at = self.last_dante_sample_at.get(code, 0)
-        if now - last_at < DANTE_TRAINING_SAMPLE_COOLDOWN_SECONDS:
-            return
-
-        five_min = ctx.five_min_ind
-        env_upper = five_min.env_upper_13_25 if five_min is not None else None
-        bb_upper = five_min.bb_upper_55_2 if five_min is not None else None
-        closes_count = five_min.closes_count if five_min is not None else 0
-        breakout_high = ctx.position.breakout_high if ctx.position is not None else 0
-        obs_elapsed = now - (ctx.condition_registered_at or now)
-
-        features = scoring.build_dante_entry_features(
-            current_price=current_price,
-            chejan_strength=ctx.chejan_strength,
-            volume_speed=ctx.volume_speed,
-            spread_rate=ctx.spread_rate,
-            obs_elapsed_sec=obs_elapsed,
-            env_upper_13=env_upper,
-            bb_upper_55=bb_upper,
-            five_min_closes_count=closes_count,
-            breakout_high=breakout_high,
-            minute_bars=ctx.minute_bars,
-            chejan_strength_history=ctx.chejan_strength_history,
-            is_breakout_zero_bar=ctx.is_breakout_zero_bar,
-            is_breakout_prev_bar=ctx.is_breakout_prev_bar,
-            upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
-            open_return=ctx.open_return,
-        )
-
-        sample_id = uuid.uuid4().hex
-        row = {
-            "sample_id": sample_id,
-            "captured_at": now,
-            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "code": code,
-            "name": name,
-            "entry_stage": int(getattr(decision, "stage", 1)),
-            "entry_price": int(current_price),
-            "ratio": float(getattr(decision, "ratio", 0.0)),
-            "reason": getattr(decision, "reason", ""),
-        }
-        row.update(features)
-        for horizon in DANTE_TRAINING_LABEL_HORIZONS:
-            row["return_{}m".format(horizon // 60)] = ""
-        row["max_return_25m"] = ""
-        row["min_return_25m"] = ""
-        row["reached_1r"] = ""
-        row["reached_2r"] = ""
-        row["hit_stop"] = ""
-        row["time_exit"] = ""
-        row["labeled_at"] = ""
-
-        self.pending_dante_samples[sample_id] = {
-            "code": code,
-            "captured_at": now,
-            "entry_price": int(current_price),
-            "row": row,
-            "labeled_horizons": set(),
-            "max_price": int(current_price),
-            "min_price": int(current_price),
-            "finalized": False,
-        }
-        self.last_dante_sample_at[code] = now
-        logger.info(
-            "[단테 학습데이터] 후보 등록 {} {} stage={} ratio={:.2f} sample {}".format(
-                name, code, row["entry_stage"], row["ratio"], sample_id[:8]
-            )
-        )
-
-    def ensure_dante_shadow_training_data_file(self):
-        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
-            return
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(DANTE_SHADOW_TRAINING_CSV):
-            return
-        with open(DANTE_SHADOW_TRAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=DANTE_SHADOW_TRAINING_FIELDS)
-            writer.writeheader()
-
-    def append_dante_shadow_training_row(self, row):
-        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
-            return
-        self.ensure_dante_shadow_training_data_file()
-        with open(DANTE_SHADOW_TRAINING_CSV, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=DANTE_SHADOW_TRAINING_FIELDS)
-            writer.writerow(row)
-
-    def _is_dante_shadow_data_ready(self, ctx):
-        """shadow 표본을 등록할지 판단하는 데이터 사전조건 게이트.
-
-        의미 있는 false-negative 측정을 하려면, 게이트가 거절한 이유가 "데이터 부족"이
-        아니라 "전략 임계 미달" 이어야 한다. 그렇지 않은 표본(틱 부족/관찰시간 부족/
-        5분봉 캐시 미준비) 은 분석 가치가 없으므로 여기서 모두 걸러낸다.
-        이미 본진입까지 끝난 종목(entry_stage>=2) 도 매수 여지가 없으므로 제외한다.
-        """
-        if ctx.position is not None and ctx.position.entry_stage >= 2:
-            return False
-        if ctx.current_price <= 0 or ctx.ask <= 0 or ctx.bid <= 0:
-            return False
-        if ctx.tick_count < entry_strategy.DANTE_MIN_TICKS:
-            return False
-        elapsed = ctx.now_ts - (ctx.condition_registered_at or ctx.now_ts)
-        if elapsed < entry_strategy.DANTE_MIN_OBSERVATION_SECONDS:
-            return False
-        if ctx.five_min_ind is None or ctx.five_min_ind.closes_count < 13:
-            return False
-        return True
-
-    def register_dante_shadow_sample(self, *, code, name, ctx, decision, current_price):
-        """게이트가 wait/blocked 으로 거른 1차/2차 평가 결과를 사후 라벨링용으로 캡처한다.
-
-        ready 표본(dante_entry_training.csv) 과 짝을 이루어 false-negative 측정에 쓰인다.
-        진입 피처 계산은 ready 경로(register_dante_training_sample) 와 동일하게 수행하며,
-        구분을 위해 row 첫 컬럼에 decision_status("wait"|"blocked") 를 추가한다.
-        같은 종목의 wait 가 줄줄이 발생해도 cooldown 으로 한 번만 기록한다.
-        """
-        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
-            return
-        if decision is None:
-            return
-        status = getattr(decision, "status", "")
-        if status not in ("wait", "blocked"):
-            return
-        if current_price <= 0:
-            return
-        if not self._is_dante_shadow_data_ready(ctx):
-            return
-
-        now = time.time()
-        last_at = self.last_dante_shadow_sample_at.get(code, 0)
-        if now - last_at < DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS:
-            return
-
-        five_min = ctx.five_min_ind
-        env_upper = five_min.env_upper_13_25 if five_min is not None else None
-        bb_upper = five_min.bb_upper_55_2 if five_min is not None else None
-        closes_count = five_min.closes_count if five_min is not None else 0
-        breakout_high = ctx.position.breakout_high if ctx.position is not None else 0
-        obs_elapsed = now - (ctx.condition_registered_at or now)
-
-        features = scoring.build_dante_entry_features(
-            current_price=current_price,
-            chejan_strength=ctx.chejan_strength,
-            volume_speed=ctx.volume_speed,
-            spread_rate=ctx.spread_rate,
-            obs_elapsed_sec=obs_elapsed,
-            env_upper_13=env_upper,
-            bb_upper_55=bb_upper,
-            five_min_closes_count=closes_count,
-            breakout_high=breakout_high,
-            minute_bars=ctx.minute_bars,
-            chejan_strength_history=ctx.chejan_strength_history,
-            is_breakout_zero_bar=ctx.is_breakout_zero_bar,
-            is_breakout_prev_bar=ctx.is_breakout_prev_bar,
-            upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
-            open_return=ctx.open_return,
-        )
-
-        sample_id = uuid.uuid4().hex
-        row = {
-            "decision_status": status,
-            "sample_id": sample_id,
-            "captured_at": now,
-            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "code": code,
-            "name": name,
-            "entry_stage": int(getattr(decision, "stage", 1)),
-            "entry_price": int(current_price),
-            "ratio": 0.0,
-            "reason": getattr(decision, "reason", ""),
-        }
-        row.update(features)
-        for horizon in DANTE_TRAINING_LABEL_HORIZONS:
-            row["return_{}m".format(horizon // 60)] = ""
-        row["max_return_25m"] = ""
-        row["min_return_25m"] = ""
-        row["reached_1r"] = ""
-        row["reached_2r"] = ""
-        row["hit_stop"] = ""
-        row["time_exit"] = ""
-        row["labeled_at"] = ""
-
-        self.pending_dante_shadow_samples[sample_id] = {
-            "code": code,
-            "captured_at": now,
-            "entry_price": int(current_price),
-            "row": row,
-            "labeled_horizons": set(),
-            "max_price": int(current_price),
-            "min_price": int(current_price),
-            "finalized": False,
-        }
-        self.last_dante_shadow_sample_at[code] = now
-        logger.info(
-            "[단테 shadow] 후보 등록 {} {} status={} stage={} sample {}".format(
-                name, code, status, row["entry_stage"], sample_id[:8]
-            )
-        )
-
-    def update_dante_shadow_training_labels(self, code, current_price, received_at):
-        """매 틱 수신 시 호출. 진행 중인 shadow 샘플에 max/min/horizon 라벨을 갱신한다.
-
-        구조는 update_dante_training_labels 와 동일하지만 별도 dict/CSV 에 쓴다.
-        25분 경과 시 reached_1r/reached_2r/hit_stop/time_exit 를 확정하고 shadow CSV 에 flush.
-        """
-        if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
-            return
-        if not self.pending_dante_shadow_samples:
-            return
-        if current_price is None or current_price <= 0:
-            return
-        completed = []
-        for sample_id, sample in list(self.pending_dante_shadow_samples.items()):
-            if sample.get("finalized"):
-                continue
-            if sample.get("code") != code:
-                continue
-            entry_price = sample.get("entry_price", 0)
-            if entry_price <= 0:
-                continue
-            elapsed = received_at - sample.get("captured_at", received_at)
-            if current_price > sample.get("max_price", current_price):
-                sample["max_price"] = current_price
-            if current_price < sample.get("min_price", current_price):
-                sample["min_price"] = current_price
-            for horizon in DANTE_TRAINING_LABEL_HORIZONS:
-                if horizon in sample["labeled_horizons"] or elapsed < horizon:
-                    continue
-                sample["row"]["return_{}m".format(horizon // 60)] = current_price / entry_price - 1
-                sample["labeled_horizons"].add(horizon)
-            if elapsed >= DANTE_TRAINING_FINAL_HORIZON_SECONDS:
-                row = sample["row"]
-                max_ret = sample["max_price"] / entry_price - 1
-                min_ret = sample["min_price"] / entry_price - 1
-                r_unit = exit_strategy.R_UNIT_PCT
-                row["max_return_25m"] = max_ret
-                row["min_return_25m"] = min_ret
-                row["reached_1r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_BE_R else 0
-                row["reached_2r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_PARTIAL_R else 0
-                row["hit_stop"] = 1 if min_ret <= -r_unit else 0
-                row["time_exit"] = 1 if max_ret < r_unit * exit_strategy.EXIT_BE_R else 0
-                row["labeled_at"] = received_at
-                self.append_dante_shadow_training_row(row)
-                sample["finalized"] = True
-                completed.append(sample_id)
-                logger.info(
-                    "[단테 shadow] 라벨 완료 {} sample {} status={} max {:.2%} min {:.2%} 1R={} stop={}".format(
-                        code, sample_id[:8], row["decision_status"], max_ret, min_ret,
-                        row["reached_1r"], row["hit_stop"],
-                    )
-                )
-        for sample_id in completed:
-            self.pending_dante_shadow_samples.pop(sample_id, None)
-
-    def update_dante_training_labels(self, code, current_price, received_at):
-        """매 틱 수신 시 호출. 진행 중인 단테 샘플에 max/min/horizon 라벨을 갱신한다.
-
-        25분 경과한 샘플은 reached_1r/reached_2r/hit_stop/time_exit 를 확정하고 CSV 에 flush.
-        """
-        if not DANTE_TRAINING_DATA_ENABLED:
-            return
-        if not self.pending_dante_samples:
-            return
-        if current_price is None or current_price <= 0:
-            return
-        completed = []
-        for sample_id, sample in list(self.pending_dante_samples.items()):
-            if sample.get("finalized"):
-                continue
-            if sample.get("code") != code:
-                continue
-            entry_price = sample.get("entry_price", 0)
-            if entry_price <= 0:
-                continue
-            elapsed = received_at - sample.get("captured_at", received_at)
-            if current_price > sample.get("max_price", current_price):
-                sample["max_price"] = current_price
-            if current_price < sample.get("min_price", current_price):
-                sample["min_price"] = current_price
-            for horizon in DANTE_TRAINING_LABEL_HORIZONS:
-                if horizon in sample["labeled_horizons"] or elapsed < horizon:
-                    continue
-                sample["row"]["return_{}m".format(horizon // 60)] = current_price / entry_price - 1
-                sample["labeled_horizons"].add(horizon)
-            if elapsed >= DANTE_TRAINING_FINAL_HORIZON_SECONDS:
-                row = sample["row"]
-                max_ret = sample["max_price"] / entry_price - 1
-                min_ret = sample["min_price"] / entry_price - 1
-                r_unit = exit_strategy.R_UNIT_PCT
-                row["max_return_25m"] = max_ret
-                row["min_return_25m"] = min_ret
-                row["reached_1r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_BE_R else 0
-                row["reached_2r"] = 1 if max_ret >= r_unit * exit_strategy.EXIT_PARTIAL_R else 0
-                row["hit_stop"] = 1 if min_ret <= -r_unit else 0
-                row["time_exit"] = 1 if max_ret < r_unit * exit_strategy.EXIT_BE_R else 0
-                row["labeled_at"] = received_at
-                self.append_dante_training_row(row)
-                sample["finalized"] = True
-                completed.append(sample_id)
-                logger.info(
-                    "[단테 학습데이터] 라벨 완료 {} sample {} max {:.2%} min {:.2%} 1R={} 2R={} stop={}".format(
-                        code, sample_id[:8], max_ret, min_ret,
-                        row["reached_1r"], row["reached_2r"], row["hit_stop"],
-                    )
-                )
-        for sample_id in completed:
-            self.pending_dante_samples.pop(sample_id, None)
-
-    def ensure_trade_log_file(self):
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(TRADE_LOG_CSV):
-            return
-        with open(TRADE_LOG_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
-            writer.writeheader()
-
-    def append_trade_log(self, event, **kwargs):
-        self.ensure_trade_log_file()
-        row = {field: "" for field in TRADE_LOG_FIELDS}
-        row["logged_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        row["event"] = event
-        for key, value in kwargs.items():
-            if key in row:
-                row[key] = value
-        with open(TRADE_LOG_CSV, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
-            writer.writerow(row)
-
-    def register_training_sample(self, code, name, entry_price, features, prediction):
-        if not TRAINING_DATA_ENABLED:
-            return
-        now = time.time()
-        last_at = self.last_training_sample_at.get(code, 0)
-        if now - last_at < TRAINING_SAMPLE_COOLDOWN_SECONDS:
-            return
-
-        sample_id = uuid.uuid4().hex
-        row = {
-            "sample_id": sample_id,
-            "captured_at": now,
-            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "code": code,
-            "name": name,
-            "entry_price": entry_price,
-            "score": prediction.get("score", 0),
-            "expected_return": prediction.get("expected_return", 0),
-            "target_price": prediction.get("target_price", entry_price),
-            "model_name": prediction.get("model_name", ""),
-            "status": prediction.get("status", ""),
-            "reason": prediction.get("reason", ""),
-        }
-        for feature_name in ENTRY_FEATURE_NAMES:
-            row[feature_name] = features.get(feature_name, 0)
-        for horizon in TRAINING_LABEL_HORIZONS:
-            row["return_{}m".format(horizon // 60)] = ""
-        row["success_10m"] = ""
-
-        self.pending_training_samples[sample_id] = {
-            "code": code,
-            "captured_at": now,
-            "entry_price": entry_price,
-            "row": row,
-            "labeled_horizons": set(),
-        }
-        self.last_training_sample_at[code] = now
-        logger.info("[학습데이터 후보] {} {} 기준가 {} sample {}".format(name, code, entry_price, sample_id[:8]))
-
-    def update_training_labels(self, code, current_price, received_at):
-        if not TRAINING_DATA_ENABLED:
-            return
-        code = self.normalize_code(code)
-        completed = []
-        for sample_id, sample in list(self.pending_training_samples.items()):
-            if sample["code"] != code:
-                continue
-            elapsed = received_at - sample["captured_at"]
-            for horizon in TRAINING_LABEL_HORIZONS:
-                if horizon in sample["labeled_horizons"] or elapsed < horizon:
-                    continue
-                return_rate = current_price / sample["entry_price"] - 1
-                sample["row"]["return_{}m".format(horizon // 60)] = return_rate
-                sample["labeled_horizons"].add(horizon)
-            if len(sample["labeled_horizons"]) == len(TRAINING_LABEL_HORIZONS):
-                return_10m = sample["row"].get("return_10m", 0)
-                sample["row"]["success_10m"] = 1 if return_10m >= MIN_EXPECTED_RETURN else 0
-                self.append_training_row(sample["row"])
-                completed.append(sample_id)
-                logger.info("[학습데이터 저장] {} sample {} 10분수익률 {:.2%}".format(code, sample_id[:8], return_10m))
-
-        for sample_id in completed:
-            self.pending_training_samples.pop(sample_id, None)
-
     def call_ai_server(self, endpoint, payload):
         if not AI_SERVER_ENABLED:
             return None
@@ -2420,6 +1599,9 @@ class Kiwoom(QAxWidget):
             px_over_bb55 = 0.0
         open_return = (current_price / open_price - 1) if open_price > 0 else 0.0
 
+        # 매크로 dry-run 게이트 — 이번 PR 은 status/ratio 변경 없이 메타만 부여.
+        market_snapshot = self.market_state.snapshot()
+
         ctx = entry_strategy.EntryContext(
             code=code,
             name=name,
@@ -2444,6 +1626,7 @@ class Kiwoom(QAxWidget):
             upper_wick_ratio_zero_bar=upper_wick,
             px_over_bb55_pct=px_over_bb55,
             open_return=open_return,
+            market_state=market_snapshot,
         )
 
         if position is not None and position.entry_stage == 1:
@@ -2500,6 +1683,10 @@ class Kiwoom(QAxWidget):
             "open_return": open_return,
             "chejan_strength_history": chejan_history,
             "model_name": "DanteRule",
+            # 매크로 dry-run 메타 — place_buy_order 등 trade_log 호출처에서 그대로 사용.
+            "market_regime": getattr(decision, "market_regime", "") or "",
+            "market_gate_action": getattr(decision, "market_gate_action", "") or "",
+            "market_gate_reason": getattr(decision, "market_gate_reason", "") or "",
         }
 
     def handle_condition_stock(self, code):
@@ -2600,6 +1787,9 @@ class Kiwoom(QAxWidget):
                     message="단테 1차 stage 보류, 종목당 예산 {}, 단가 {}, 가능 {}".format(
                         full_budget, unit_cost, deposit
                     ),
+                    market_regime=prediction.get("market_regime", ""),
+                    market_gate_action=prediction.get("market_gate_action", ""),
+                    market_gate_reason=prediction.get("market_gate_reason", ""),
                 )
                 return
             order_quantity = max(int(planned_quantity * ratio), 1)
@@ -2685,6 +1875,9 @@ class Kiwoom(QAxWidget):
             message="{}, planned {}, ratio {:.2f}, 단가 {}, 사유 {}".format(
                 reason_label, planned_quantity, ratio, unit_cost, prediction.get("reason", "")
             ),
+            market_regime=prediction.get("market_regime", ""),
+            market_gate_action=prediction.get("market_gate_action", ""),
+            market_gate_reason=prediction.get("market_gate_reason", ""),
         )
         if result == 0:
             self.order_prices[code] = current_price
@@ -2765,6 +1958,30 @@ class Kiwoom(QAxWidget):
         self.set_real_reg(screen_no, code, fids, opt_type)
         self.realtime_registered_codes.add(code)
         self.realtime_code_screens[code] = screen_no
+
+    def register_realtime_indices(self):
+        """KOSPI(001)/KOSDAQ(101) 업종지수 실시간 등록 — 1회만 호출.
+
+        종목용 실시간과 다른 스크린(INDEX_REALTIME_SCREEN_NO)을 쓰고, 콜백에서는
+        ``_on_receive_real_data`` 의 ``"업종지수"`` 분기가 ``self.market_state.update()``
+        로 흘려준다. 키움 OpenAPI 의 SetRealReg 는 종목코드 자리에 업종코드(001/101)를
+        받는다. 등록 실패/지연 시 cache 가 비고 → ``regime=unknown`` → entry_strategy 가
+        neutral 로 fallback 하므로 행동 변화가 없다.
+        """
+        if self.index_realtime_registered:
+            return
+        codes = ";".join([KOSPI_CODE, KOSDAQ_CODE])
+        fids = ";".join([
+            get_fid("현재가"),
+            get_fid("시가"),
+            get_fid("고가"),
+            get_fid("저가"),
+            get_fid("체결시간"),
+        ])
+        # opt_type "0" = 새 등록(스크린이 종목과 분리되어 있으므로 안전).
+        self.set_real_reg(INDEX_REALTIME_SCREEN_NO, codes, fids, "0")
+        self.index_realtime_registered = True
+        logger.info("[매크로] KOSPI/KOSDAQ 업종지수 실시간 등록 (screen %s)", INDEX_REALTIME_SCREEN_NO)
 
     def get_realtime_screen_no(self):
         screen_offset = len(self.realtime_registered_codes) // REALTIME_CODES_PER_SCREEN
@@ -3240,6 +2457,9 @@ def main():
     kiwoom.check_open_positions()
     kiwoom.position_check_timer.start(POSITION_CHECK_INTERVAL_MS)
     kiwoom.sell_check_timer.start(SELL_CHECK_INTERVAL_MS)
+
+    # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 — 조건검색 시작 전에 1회 등록.
+    kiwoom.register_realtime_indices()
 
     if not kiwoom.start_realtime_condition(CONDITION_NAME):
         logger.error("실시간 조건검색을 시작하지 못했습니다. 조건식 설정을 확인해주세요.")
