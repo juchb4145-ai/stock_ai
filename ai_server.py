@@ -47,6 +47,8 @@ app = FastAPI(title="Kiwoom Dante LightGBM AI Server")
 model = None
 model_name = "DanteModelUnavailable"
 model_threshold = DEFAULT_DANTE_THRESHOLD
+model_ready_threshold = DEFAULT_DANTE_THRESHOLD
+model_promotion_threshold = DEFAULT_DANTE_THRESHOLD
 model_target = DEFAULT_TARGET
 model_features = list(DANTE_FEATURES)
 model_meta: Dict = {}
@@ -87,6 +89,8 @@ class DanteEntryResponse(BaseModel):
     model_name: str = "DanteModelUnavailable"
     model_target: str = DEFAULT_TARGET
     model_threshold: float = DEFAULT_DANTE_THRESHOLD
+    model_ready_threshold: float = DEFAULT_DANTE_THRESHOLD
+    model_promotion_threshold: float = DEFAULT_DANTE_THRESHOLD
     reason: str = ""
     reason_code: str = ""
     market_regime: str = ""
@@ -128,7 +132,8 @@ class ExitResponse(BaseModel):
 
 
 def _load_meta() -> None:
-    global model_threshold, model_target, model_features, model_meta
+    global model_threshold, model_ready_threshold, model_promotion_threshold
+    global model_target, model_features, model_meta
     if not os.path.exists(DANTE_MODEL_META_PATH):
         return
     try:
@@ -142,6 +147,22 @@ def _load_meta() -> None:
     threshold = model_meta.get("threshold")
     if isinstance(threshold, (int, float)) and 0 < float(threshold) < 1:
         model_threshold = float(threshold)
+
+    ready_threshold = model_meta.get("ready_threshold")
+    if isinstance(ready_threshold, (int, float)) and 0 < float(ready_threshold) < 1:
+        model_ready_threshold = float(ready_threshold)
+    else:
+        model_ready_threshold = model_threshold
+
+    promotion_threshold = model_meta.get("promotion_threshold")
+    if isinstance(promotion_threshold, (int, float)) and 0 < float(promotion_threshold) < 1:
+        model_promotion_threshold = float(promotion_threshold)
+    else:
+        model_promotion_threshold = model_threshold
+
+    # Backward-compatible field used by older callers.  Newer callers receive
+    # the active threshold per response based on ready vs shadow promotion flow.
+    model_threshold = model_promotion_threshold
 
     target = model_meta.get("target")
     if isinstance(target, str) and target:
@@ -183,6 +204,12 @@ def _predict_score(features: Dict[str, float]) -> tuple[float, List[str]]:
         prediction = model.predict(values)
         score = float(prediction[0])
     return scoring.clamp(score), missing
+
+
+def _active_entry_threshold(req: DanteEntryRequest) -> float:
+    if req.rule.status == "ready":
+        return model_ready_threshold
+    return model_promotion_threshold
 
 
 def _rule_response(req: DanteEntryRequest) -> DanteEntryResponse:
@@ -262,6 +289,8 @@ def health() -> Dict:
         "model_name": model_name,
         "target": model_target,
         "threshold": model_threshold,
+        "ready_threshold": model_ready_threshold,
+        "promotion_threshold": model_promotion_threshold,
         "features": model_features,
         "feature_count": len(model_features),
         "meta": {
@@ -287,7 +316,10 @@ def predict_dante_entry(req: DanteEntryRequest) -> DanteEntryResponse:
     response = _rule_response(req)
     response.model_name = model_name
     response.model_target = model_target
-    response.model_threshold = model_threshold
+    active_threshold = _active_entry_threshold(req)
+    response.model_threshold = active_threshold
+    response.model_ready_threshold = model_ready_threshold
+    response.model_promotion_threshold = model_promotion_threshold
 
     if model is None:
         response.model_action = MODEL_ACTION_UNAVAILABLE
@@ -305,20 +337,20 @@ def predict_dante_entry(req: DanteEntryRequest) -> DanteEntryResponse:
     response.score = model_score
     response.missing_features = missing
     response.model_action = (
-        MODEL_ACTION_ALLOW if model_score >= model_threshold else MODEL_ACTION_BLOCK
+        MODEL_ACTION_ALLOW if model_score >= active_threshold else MODEL_ACTION_BLOCK
     )
 
     if req.enforce_model and response.model_action == MODEL_ACTION_BLOCK:
         response.status = "blocked"
         response.ratio = 0.0
         response.reason = "dante model score {:.3f} < threshold {:.3f} ({})".format(
-            model_score, model_threshold, response.reason
+            model_score, active_threshold, response.reason
         )
     else:
         response.reason = "{} | dante model score {:.3f} {}".format(
             response.reason,
             model_score,
-            ">=" if model_score >= model_threshold else "<",
+            ">=" if model_score >= active_threshold else "<",
         ).strip()
     return response
 

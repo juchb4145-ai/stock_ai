@@ -46,8 +46,10 @@ MIN_CHEJAN_STRENGTH_SOFT = 100.0
 MIN_CHEJAN_STRENGTH_HARD = 120.0
 # 체결강도 추세 평가에 사용할 최근 틱 개수
 CHEJAN_STRENGTH_TREND_LOOKBACK = 6
-# 거래속도 임계 (주/초). 조건식이 일거래량 5만 이상을 이미 거르므로
-# 추가 게이트는 보수적으로 낮게 잡는다.
+# 거래대금 속도 임계 (원/분). 실시간성은 유지하고, 조건식 편입 후 받은 틱 구간을
+# 분당 거래대금으로 환산해 가격대별 왜곡(저가주는 느슨/고가주는 과도하게 엄격)을 줄인다.
+MIN_TURNOVER_SPEED_PER_MIN = 50_000_000.0
+# 기존 학습 피처/로그 호환용 주/초 기준. 신규 게이트는 거래대금 속도를 우선 사용한다.
 MIN_VOLUME_SPEED = 300.0
 # 호가 스프레드 상한
 MAX_SPREAD_RATE = 0.006
@@ -204,6 +206,13 @@ class EntryContext:
     market_state: Optional[MarketSnapshot] = None
 
 
+def turnover_speed_per_min(ctx: EntryContext) -> float:
+    """Return real-time traded value speed as KRW per minute."""
+    if ctx.current_price <= 0 or ctx.volume_speed <= 0:
+        return 0.0
+    return float(ctx.volume_speed) * float(ctx.current_price) * 60.0
+
+
 def _hhmmss_from_ts(ts: float) -> int:
     try:
         return int(time.strftime("%H%M%S", time.localtime(float(ts))))
@@ -341,10 +350,15 @@ def _evaluate_first_entry_inner(ctx: EntryContext) -> EntryDecision:
             reason_code=GATE_OBSERVATION_SHORT,
         )
 
-    if ctx.volume_speed < MIN_VOLUME_SPEED:
+    turnover_speed = turnover_speed_per_min(ctx)
+    if turnover_speed < MIN_TURNOVER_SPEED_PER_MIN:
         return EntryDecision(
             "wait", 0.0, 1,
-            "거래속도 부족 {:.0f} < {}주/초".format(ctx.volume_speed, MIN_VOLUME_SPEED),
+            "거래속도(거래대금) 부족 {:.1f}백만원/분 < {:.1f}백만원/분 ({:.0f}주/초)".format(
+                turnover_speed / 1_000_000,
+                MIN_TURNOVER_SPEED_PER_MIN / 1_000_000,
+                ctx.volume_speed,
+            ),
             reason_code=GATE_VOLUME_SPEED,
         )
 
@@ -574,9 +588,11 @@ def _evaluate_a_grade_watch_entry_inner(
             grade="A",
             reason_code=GATE_STAGE2_CHEJAN,
         )
-    if ctx.volume_speed < MIN_VOLUME_SPEED * 0.5:
+    turnover_speed = turnover_speed_per_min(ctx)
+    if turnover_speed < MIN_TURNOVER_SPEED_PER_MIN * 0.5:
         return EntryDecision(
-            "wait", 0.0, 2, "A-watch volume speed weak {:.0f}".format(ctx.volume_speed),
+            "wait", 0.0, 2,
+            "A-watch 거래속도(거래대금) 약화 {:.1f}백만원/분".format(turnover_speed / 1_000_000),
             grade="A",
             reason_code=GATE_STAGE2_VOLUME,
         )
@@ -673,12 +689,13 @@ def _evaluate_second_entry_inner(ctx: EntryContext) -> EntryDecision:
             reason_code=GATE_STAGE2_CHEJAN,
         )
 
-    if ctx.volume_speed < MIN_VOLUME_SPEED * 0.5:
+    turnover_speed = turnover_speed_per_min(ctx)
+    if turnover_speed < MIN_TURNOVER_SPEED_PER_MIN * 0.5:
         return EntryDecision(
             "wait",
             0.0,
             2,
-            "거래속도 약화 {:.0f}".format(ctx.volume_speed),
+            "거래속도(거래대금) 약화 {:.1f}백만원/분".format(turnover_speed / 1_000_000),
             reason_code=GATE_STAGE2_VOLUME,
         )
 
@@ -884,12 +901,13 @@ def evaluate_reentry_after_exit(ctx: EntryContext, watch: dict) -> EntryDecision
             reason_code=GATE_STAGE2_CHEJAN,
         )
 
-    if ctx.volume_speed < MIN_VOLUME_SPEED:
+    turnover_speed = turnover_speed_per_min(ctx)
+    if turnover_speed < MIN_TURNOVER_SPEED_PER_MIN:
         return EntryDecision(
             "wait",
             0.0,
             2,
-            "re-entry volume speed weak {:.0f}".format(ctx.volume_speed),
+            "re-entry 거래속도(거래대금) 약화 {:.1f}백만원/분".format(turnover_speed / 1_000_000),
             reason_code=GATE_VOLUME_SPEED,
         )
 

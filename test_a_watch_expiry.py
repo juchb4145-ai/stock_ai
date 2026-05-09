@@ -94,6 +94,8 @@ class _StubKiwoom:
         self.five_min_cache = {}
         self.minute_aggregator = _MinuteAggregator()
         self.market_state = _MarketState()
+        self.volume_speed_wait_counts = {}
+        self.dante_reentry_watchlist = {}
         self.dante_a_watchlist = {
             "005930": {
                 "started_at": now - entry_strategy.PULLBACK_WINDOW_MAX_SECONDS - 5,
@@ -111,6 +113,9 @@ class _StubKiwoom:
 
     def refresh_five_min_indicators(self, code):
         return None
+
+    def is_volume_speed_cooling_down(self, code):
+        return False
 
     def get_code_name(self, code):
         return "삼성전자"

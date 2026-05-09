@@ -110,6 +110,10 @@ VOLUME_SPEED_COOLDOWN_TRIGGER = 3
 VOLUME_SPEED_COOLDOWN_SECONDS = 5 * 60
 AI_CANDIDATE_PROMOTION_ENABLED = True
 AI_CANDIDATE_MIN_SCORE = 0.62
+AI_CANDIDATE_WATCH_ENABLED = True
+AI_CANDIDATE_WATCH_SECONDS = 20 * 60
+AI_CANDIDATE_WATCH_RECHECK_INTERVAL_SECONDS = 30
+AI_CANDIDATE_WATCH_MAX_CODES = 30
 RISK_TOO_WIDE_WATCH_ENABLED = True
 RISK_TOO_WIDE_WATCH_SECONDS = 20 * 60
 RISK_TOO_WIDE_RECHECK_INTERVAL_SECONDS = 30
@@ -211,6 +215,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.last_dante_shadow_sample_at = {}
         self.dante_a_watchlist = {}
         self.dante_reentry_watchlist = {}
+        self.ai_candidate_watchlist = {}
         self.risk_too_wide_watchlist = {}
         self.order_context = {}
         self.last_tr_request_at = 0
@@ -1680,7 +1685,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return False
         return True
 
-    def record_volume_speed_wait(self, code, volume_speed):
+    def record_volume_speed_wait(self, code, volume_speed, turnover_speed_per_min=0.0):
         count = self.volume_speed_wait_counts.get(code, 0) + 1
         self.volume_speed_wait_counts[code] = count
         if count < VOLUME_SPEED_COOLDOWN_TRIGGER:
@@ -1689,10 +1694,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.volume_speed_cooldown_until[code] = cooldown_until
         self.volume_speed_wait_counts[code] = 0
         logger.info(
-            "[거래속도 쿨다운] %s %.0f < %.0f 주/초 %d회 반복 -- %d초 대기",
+            "[거래대금속도 쿨다운] %s %.1f백만원/분 < %.1f백만원/분 (%.0f주/초) %d회 반복 -- %d초 대기",
             code,
+            turnover_speed_per_min / 1_000_000,
+            entry_strategy.MIN_TURNOVER_SPEED_PER_MIN / 1_000_000,
             volume_speed,
-            entry_strategy.MIN_VOLUME_SPEED,
             VOLUME_SPEED_COOLDOWN_TRIGGER,
             VOLUME_SPEED_COOLDOWN_SECONDS,
         )
@@ -2305,13 +2311,134 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return True, reason_code
         return False, ""
 
+    def dante_allows_ai_candidate_watch(self, prediction):
+        """AI가 바로 매수하지 않고 재평가 감시로만 올릴 수 있는 회복형 게이트."""
+        if not AI_CANDIDATE_WATCH_ENABLED:
+            return False, "watch_disabled"
+        status = str(prediction.get("status", "") or "")
+        if status not in ("wait", "blocked"):
+            return False, "status_not_watchable"
+        hard_blocked, block_reason = self.dante_hard_blocks_ai_candidate(prediction)
+        if hard_blocked:
+            return False, block_reason
+        reason_code = str(prediction.get("reason_code", "") or "")
+        watchable_codes = {
+            entry_strategy.GATE_VOLUME_SPEED,
+            entry_strategy.GATE_CHEJAN_SOFT,
+            entry_strategy.GATE_CHEJAN_HARD_NO_TREND,
+            entry_strategy.GATE_STAGE2_CHEJAN,
+            entry_strategy.GATE_STAGE2_VOLUME,
+            entry_strategy.GATE_STAGE2_PULLBACK_SHALLOW,
+            entry_strategy.GATE_BGRADE_PULLBACK_SHALLOW,
+            entry_strategy.GATE_BGRADE_NO_REVERSAL,
+            entry_strategy.GATE_STAGE2_NO_REVERSAL,
+            entry_strategy.GATE_NO_BREAKOUT,
+        }
+        if reason_code not in watchable_codes:
+            return False, "reason_not_watchable:{}".format(reason_code)
+        return True, ""
+
+    def cleanup_ai_candidate_watchlist(self, now_ts=None):
+        now_ts = now_ts or time.time()
+        for code, watch in list(self.ai_candidate_watchlist.items()):
+            if now_ts > float(watch.get("deadline", 0) or 0):
+                self.ai_candidate_watchlist.pop(code, None)
+
+    def start_ai_candidate_watch(self, code, prediction, required_score):
+        code = self.normalize_code(code)
+        self.cleanup_ai_candidate_watchlist()
+        if code not in self.ai_candidate_watchlist and len(self.ai_candidate_watchlist) >= AI_CANDIDATE_WATCH_MAX_CODES:
+            logger.info(
+                "[AI 후보 감시 제외] %s watchlist 한도 도달 %s",
+                code,
+                AI_CANDIDATE_WATCH_MAX_CODES,
+            )
+            return False
+
+        now_ts = time.time()
+        prev = self.ai_candidate_watchlist.get(code, {})
+        model_score = self.parse_float(prediction.get("model_score", 0.0), 0.0)
+        best_score = self.parse_float(prev.get("best_model_score", model_score), model_score)
+        best_score = max(best_score, model_score)
+        watch = {
+            "code": code,
+            "name": prediction.get("name", ""),
+            "started_at": float(prev.get("started_at", now_ts) or now_ts),
+            "deadline": float(prev.get("deadline", now_ts + AI_CANDIDATE_WATCH_SECONDS) or now_ts + AI_CANDIDATE_WATCH_SECONDS),
+            "last_recheck_at": now_ts,
+            "model_score": model_score,
+            "best_model_score": best_score,
+            "required_score": float(required_score),
+            "model_threshold": prediction.get("model_threshold", ""),
+            "model_target": prediction.get("model_target", ""),
+            "reason_code": prediction.get("reason_code", ""),
+            "rule_status": prediction.get("status", ""),
+            "rule_reason": prediction.get("reason", ""),
+        }
+        self.ai_candidate_watchlist[code] = watch
+        self.requeue_condition_stock(code)
+        logger.info(
+            "[AI 후보 감시 등록] %s score=%.3f required=%.3f status=%s reason=%s",
+            code,
+            model_score,
+            required_score,
+            watch["rule_status"],
+            watch["reason_code"],
+        )
+        return True
+
+    def should_continue_ai_candidate_watch(self, code):
+        code = self.normalize_code(code)
+        watch = self.ai_candidate_watchlist.get(code)
+        if watch is None:
+            return True
+        position = self.portfolio.get(code)
+        if position is not None and (position.is_holding() or position.is_pending() or position.bought_today):
+            self.ai_candidate_watchlist.pop(code, None)
+            logger.info("[AI 후보 감시 종료] %s 이미 보유/미체결/매수 처리", code)
+            return False
+        now_ts = time.time()
+        if self.current_hhmmss() >= OPENING_BUY_END:
+            self.ai_candidate_watchlist.pop(code, None)
+            logger.info("[AI 후보 감시 종료] %s 매수 가능 시간 종료", code)
+            return False
+        if now_ts > float(watch.get("deadline", 0) or 0):
+            self.ai_candidate_watchlist.pop(code, None)
+            logger.info(
+                "[AI 후보 감시 만료] %s best_score=%.3f reason=%s",
+                code,
+                self.parse_float(watch.get("best_model_score", 0.0), 0.0),
+                watch.get("reason_code", ""),
+            )
+            return False
+        last_recheck = float(watch.get("last_recheck_at", 0) or 0)
+        if now_ts - last_recheck < AI_CANDIDATE_WATCH_RECHECK_INTERVAL_SECONDS:
+            self.requeue_condition_stock(code)
+            return False
+        watch["last_recheck_at"] = now_ts
+        return True
+
     def maybe_promote_ai_candidate(self, prediction):
         if not AI_CANDIDATE_PROMOTION_ENABLED:
             return prediction
+        code = self.normalize_code(prediction.get("code", ""))
         if prediction.get("status") == "ready":
+            if code in self.ai_candidate_watchlist:
+                watch = self.ai_candidate_watchlist.pop(code, {})
+                prediction["ai_watch_started_at"] = watch.get("started_at", "")
+                prediction["ai_watch_best_model_score"] = watch.get("best_model_score", "")
+                prediction["reason"] = "{} | AI 감시 후 룰 ready".format(prediction.get("reason", "")).strip()
+                logger.info(
+                    "[AI 후보 감시 통과] %s best_score=%.3f now_ready=%s",
+                    code,
+                    self.parse_float(watch.get("best_model_score", 0.0), 0.0),
+                    prediction.get("reason_code", ""),
+                )
             return prediction
         hard_blocked, block_reason = self.dante_hard_blocks_ai_candidate(prediction)
         if hard_blocked:
+            if code in self.ai_candidate_watchlist:
+                self.ai_candidate_watchlist.pop(code, None)
             prediction["ai_candidate_block_reason"] = block_reason
             return prediction
         model_action = str(prediction.get("model_action", "") or "")
@@ -2323,19 +2450,22 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if model_score < required_score:
             return prediction
 
-        original_status = prediction.get("status", "")
-        original_reason = prediction.get("reason", "")
-        prediction["rule_status"] = original_status
-        prediction["rule_reason"] = original_reason
-        prediction["status"] = "ready"
-        prediction["stage"] = 2
-        prediction["ratio"] = 1.0
-        prediction["grade"] = prediction.get("grade") or "AI"
-        prediction["reason"] = "AI 후보 승격 score {:.3f} >= {:.3f} | 단테 {} {}".format(
+        watchable, watch_reason = self.dante_allows_ai_candidate_watch(prediction)
+        if not watchable:
+            prediction["ai_candidate_block_reason"] = watch_reason
+            return prediction
+
+        self.start_ai_candidate_watch(code, prediction, required_score)
+        prediction["ai_watch_status"] = "watching"
+        prediction["rule_status"] = prediction.get("status", "")
+        prediction["rule_reason"] = prediction.get("reason", "")
+        prediction["status"] = "wait"
+        prediction["ratio"] = 0.0
+        prediction["reason"] = "AI 후보 감시 score {:.3f} >= {:.3f} | 룰 재확인 대기: {} {}".format(
             model_score,
             required_score,
-            original_status,
-            original_reason,
+            prediction.get("rule_status", ""),
+            prediction.get("rule_reason", ""),
         )
         return prediction
 
@@ -2351,7 +2481,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             remain = int(self.volume_speed_cooldown_until.get(code, 0) - time.time())
             return {
                 "status": "blocked",
-                "reason": "거래속도 반복 부족 쿨다운 {}초 남음".format(max(remain, 0)),
+                "reason": "거래속도(거래대금) 반복 부족 쿨다운 {}초 남음".format(max(remain, 0)),
                 "reason_code": entry_strategy.GATE_VOLUME_SPEED,
             }
 
@@ -2374,6 +2504,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         elapsed_secs = max(last["received_at"] - first["received_at"], 1.0)
         volume_delta = max(last["accum_volume"] - first["accum_volume"], 0)
         volume_speed = volume_delta / elapsed_secs
+        turnover_speed_per_min = volume_speed * current_price * 60
 
         highs = [tick["high"] for tick in ticks if tick["high"] > 0]
         lows = [tick["low"] for tick in ticks if tick["low"] > 0]
@@ -2454,13 +2585,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             stage = decision.stage if decision.stage in (1, 2) else 1
 
         if decision.reason_code == entry_strategy.GATE_VOLUME_SPEED:
-            if self.record_volume_speed_wait(code, volume_speed):
+            if self.record_volume_speed_wait(code, volume_speed, turnover_speed_per_min):
                 return {
                     "status": "blocked",
                     "stage": stage,
-                    "reason": "거래속도 반복 부족 {:.0f} < {:.0f}주/초".format(
-                        volume_speed,
-                        entry_strategy.MIN_VOLUME_SPEED,
+                    "reason": "거래속도(거래대금) 반복 부족 {:.1f}백만원/분 < {:.1f}백만원/분".format(
+                        turnover_speed_per_min / 1_000_000,
+                        entry_strategy.MIN_TURNOVER_SPEED_PER_MIN / 1_000_000,
                     ),
                     "reason_code": entry_strategy.GATE_VOLUME_SPEED,
                 }
@@ -2542,6 +2673,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "spread_rate": spread_rate,
             "chejan_strength": chejan_strength,
             "volume_speed": volume_speed,
+            "turnover_speed_per_min": turnover_speed_per_min,
             "reason": decision.reason,
             "reason_code": getattr(decision, "reason_code", "") or "",
             "grade": getattr(decision, "grade", "") or "",
@@ -2590,6 +2722,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return
         if not self.should_continue_risk_too_wide_watch(code):
             return
+        if hasattr(self, "should_continue_ai_candidate_watch") and not self.should_continue_ai_candidate_watch(code):
+            return
 
         prediction = self.predict_stock(code)
         if prediction is None:
@@ -2610,6 +2744,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 logger.info("[{}차 매수 대기] {} {}".format(stage, code, prediction.get("reason", "")))
             return
         if status == "blocked":
+            if hasattr(self, "ai_candidate_watchlist"):
+                self.ai_candidate_watchlist.pop(code, None)
             self.risk_too_wide_watchlist.pop(code, None)
             logger.info("[{}차 매수 제외] {} {}".format(stage, code, prediction.get("reason", "")))
             return
@@ -3516,11 +3652,11 @@ def _log_dante_startup_banner():
     logger.info("=" * 78)
     logger.info("[단테 추세전략] A급(0봉 돌파) 감시→첫 눌림 본진입(100%%) | B급(1봉 돌파) 첫 눌림 일괄(%.0f%%)",
                 entry_strategy.DANTE_GRADE_B_RATIO * 100)
-    logger.info("[게이트] 체결강도 Hard≥%.0f / Soft%.0f~%.0f(추세상승필요) / 거래속도≥%.0f주초 / 스프레드≤%.2f%% / 관찰%.0f초 / 최소틱%d",
+    logger.info("[게이트] 체결강도 Hard≥%.0f / Soft%.0f~%.0f(추세상승필요) / 거래대금속도≥%.1f백만원/분 / 스프레드≤%.2f%% / 관찰%.0f초 / 최소틱%d",
                 entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
                 entry_strategy.MIN_CHEJAN_STRENGTH_SOFT,
                 entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
-                entry_strategy.MIN_VOLUME_SPEED,
+                entry_strategy.MIN_TURNOVER_SPEED_PER_MIN / 1_000_000,
                 entry_strategy.MAX_SPREAD_RATE * 100,
                 entry_strategy.DANTE_MIN_OBSERVATION_SECONDS,
                 entry_strategy.DANTE_MIN_TICKS)
