@@ -566,6 +566,7 @@ def write_rolling_outputs(
     window_stats: List[WindowStats],
     candidates: List[RuleCandidate],
     overrides_evidence_by_window: Dict[int, List[dict]],
+    shadow_evidence: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     os.makedirs(reviews_dir, exist_ok=True)
     yyyymmdd = as_of_date.replace("-", "")
@@ -581,6 +582,8 @@ def write_rolling_outputs(
             f"{w}d": ev for w, ev in overrides_evidence_by_window.items()
         },
     }
+    if shadow_evidence is not None:
+        summary_payload["shadow_evidence"] = shadow_evidence
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary_payload, f, ensure_ascii=False, indent=2, default=_json_default)
 
@@ -613,6 +616,7 @@ class RollingResult:
     window_stats: List[WindowStats]
     candidates: List[RuleCandidate]
     overrides_evidence_by_window: Dict[int, List[dict]]
+    shadow_evidence: Optional[Dict[str, object]] = None
     output_paths: Dict[str, str] = field(default_factory=dict)
 
 
@@ -621,6 +625,9 @@ def run_rolling(
     windows: Tuple[int, ...] = DEFAULT_WINDOWS,
     reviews_dir: str = REVIEWS_DIR_DEFAULT,
     write: bool = True,
+    include_shadow: bool = True,
+    shadow_csv: Optional[str] = None,
+    entry_csv: Optional[str] = None,
 ) -> RollingResult:
     available = discover_review_dates(reviews_dir)
     if not available:
@@ -649,10 +656,44 @@ def run_rolling(
     window_total_by_window = {w: len(candidate_rows_by_window[w]) for w in windows}
     candidates = evaluate_candidates(candidate_rows_by_window, window_total_by_window)
 
+    # === shadow 트랙(false-negative) 통합 ===
+    # tighten 룰이 같은 target 을 동시에 건드리면 release 후보를 자동으로 무력화한다.
+    # 양방향 동시 변경 → 모듈 상수 진동 위험을 PR-A 적용기 이전 단계에서 차단.
+    shadow_evidence: Optional[Dict[str, object]] = None
+    if include_shadow:
+        try:
+            from .shadow_rules import (
+                build_shadow_evidence,
+                evaluate_release_candidates,
+            )
+        except ImportError:
+            shadow_evidence = None
+        else:
+            sr_kwargs: Dict[str, object] = {}
+            if shadow_csv:
+                sr_kwargs["shadow_csv"] = shadow_csv
+            if entry_csv:
+                sr_kwargs["entry_csv"] = entry_csv
+            try:
+                shadow_evidence = build_shadow_evidence(**sr_kwargs)  # type: ignore[arg-type]
+            except FileNotFoundError:
+                shadow_evidence = None
+            else:
+                tighten_targets = {
+                    ov.target for cand in candidates for ov in cand.proposed_overrides
+                }
+                release_kwargs = dict(sr_kwargs)
+                release_kwargs["windows_to_attribute"] = list(windows)
+                release_kwargs["tighten_targets_today"] = tighten_targets
+                release_candidates = evaluate_release_candidates(**release_kwargs)  # type: ignore[arg-type]
+                candidates = list(candidates) + release_candidates
+
     paths: Dict[str, str] = {}
     if write:
         paths = write_rolling_outputs(
-            reviews_dir, as_of_date, window_stats, candidates, overrides_evidence_by_window
+            reviews_dir, as_of_date, window_stats, candidates,
+            overrides_evidence_by_window,
+            shadow_evidence=shadow_evidence,
         )
 
     return RollingResult(
@@ -661,6 +702,7 @@ def run_rolling(
         window_stats=window_stats,
         candidates=candidates,
         overrides_evidence_by_window=overrides_evidence_by_window,
+        shadow_evidence=shadow_evidence,
         output_paths=paths,
     )
 
@@ -691,6 +733,10 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         "--no-write", action="store_true",
         help="JSON 출력 생략(stdout 요약만).",
     )
+    parser.add_argument(
+        "--no-shadow", action="store_true",
+        help="shadow 트랙(거절 표본) 평가/출력을 건너뛴다(테스트/디버그용).",
+    )
     return parser.parse_args(argv)
 
 
@@ -718,17 +764,57 @@ def _print_summary(result: RollingResult) -> None:
         print(f"  - 룰 후보 {len(result.candidates)}건 (모두 auto_apply=false):")
         for c in result.candidates:
             print(
-                "      · {r} | windows={w} | confidence={c} | n={n} | consistent={x}".format(
+                "      - {r} | windows={w} | confidence={c} | n={n} | consistent={x}".format(
                     r=c.rule_id, w=c.triggered_windows, c=c.confidence,
                     n=c.n_largest_window, x=c.consistent_across_windows,
                 )
             )
+
+    # shadow 요약 — 매핑 미등록 의심 게이트는 별도로 안내해 매핑 추가 흐름을 지원.
+    if result.shadow_evidence:
+        ev = result.shadow_evidence
+        n_lab = ev.get("shadow_n_labeled", 0)
+        suspects = [
+            r for r in (ev.get("by_reason") or []) if r.get("is_suspect")
+        ]
+        candidates_n = sum(
+            1 for r in (ev.get("by_reason") or []) if r.get("is_release_candidate")
+        )
+        print(
+            f"  - shadow 트랙: 라벨링 {n_lab}건, 의심 게이트 {len(suspects)}개, "
+            f"release 후보 {candidates_n}개"
+        )
+        unmapped = [r for r in suspects if r.get("mapped_target") is None]
+        if unmapped:
+            top = sorted(unmapped, key=lambda r: -(r.get("reached_1r") or 0))[:3]
+            for r in top:
+                print(
+                    "      - 매핑 미등록 의심 게이트: {k} (n={n}, 1R={p}%)".format(
+                        k=r.get("reason_code"),
+                        n=r.get("n"),
+                        p=int((r.get("reached_1r") or 0) * 100),
+                    )
+                )
+
     if result.output_paths:
         for kind, path in result.output_paths.items():
             print(f"  - {kind}: {path}")
 
 
+def _reconfigure_stdout_utf8() -> None:
+    """Windows 콘솔 cp949 에서 em-dash 등 비-cp949 문자 출력 실패를 회피."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _reconfigure_stdout_utf8()
     args = _parse_args(list(argv) if argv is not None else sys.argv[1:])
     try:
         windows = tuple(int(x) for x in args.windows.split(",") if x.strip())
@@ -745,6 +831,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             windows=windows,
             reviews_dir=args.reviews_dir,
             write=not args.no_write,
+            include_shadow=not args.no_shadow,
         )
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)

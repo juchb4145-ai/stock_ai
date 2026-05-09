@@ -23,6 +23,9 @@ from .market_context import (
 from .rules import RuleRecommendation, recommend_rules
 from .report import write_reports
 
+# shadow_diagnostics / policy_replay 는 ``python -m`` 진입점으로만 사용하며
+# 패키지 초기화 시점에 import 하지 않는다 (RuntimeWarning 회피).
+
 __all__ = [
     "Trade",
     "load_trades",

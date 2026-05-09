@@ -4,7 +4,8 @@
   1. 손절: 현재가 ≤ stop_price → 전량 매도. 초기 stop = entry_price * (1 - R_UNIT_PCT).
   2. +1R 도달 → stop_price 를 entry_price 로 상향(BE 보장).
   3. +2R 도달 + partial_taken==False → 50% 부분 익절(partial_sell).
-  4. 부분 익절 후 잔량 추세 이탈 청산 — 다음 중 하나:
+  4. 부분 익절 후 잔량 청산 — 다음 중 하나:
+        - 고점 대비 TRAIL_HIGHEST_GIVEBACK_R 이상 이익 반납
         - 1분봉 종가가 1분봉 5MA 이탈
         - 체결강도 EXIT_MIN_CHEJAN_STRENGTH 미만으로 약화
         - 현재가가 5분봉 Envelope(13,2.5) 상단 아래로 이탈
@@ -29,6 +30,7 @@ R_UNIT_PCT = 0.015  # 1R = ±1.5%
 EXIT_BE_R = 1.0  # +1R 도달 시 BE 스탑 이동
 EXIT_PARTIAL_R = 2.0  # +2R 도달 시 부분 익절
 EXIT_PARTIAL_RATIO = 0.5  # 부분 익절 비율
+TRAIL_HIGHEST_GIVEBACK_R = 0.7  # 부분익절 후 고점 대비 N R 반납 시 잔량 청산
 EXIT_TIME_LIMIT_SECONDS = 25 * 60  # 1차 진입 후 N초 경과 + r<1R 이면 시간 손절
 EXIT_MIN_CHEJAN_STRENGTH = 80.0  # 체결강도 약화 임계
 EXIT_MA_PERIOD = 5  # 1분봉 N MA 이탈 시 청산
@@ -99,21 +101,35 @@ def evaluate_exit(ctx: ExitContext) -> ExitDecision:
 
     # 4) 부분익절 이후 잔량 추세 이탈 청산
     if pos.partial_taken:
-        # 4a) 1분봉 5MA 이탈
-        if len(ctx.minute_bars) >= EXIT_MA_PERIOD:
-            recent = ctx.minute_bars[-EXIT_MA_PERIOD:]
-            sma5 = sum(b.close for b in recent) / EXIT_MA_PERIOD
-            if cur < sma5:
+        # 4a) 고점 대비 R 단위 이익 반납
+        r_unit_abs = pos.entry_price * r_unit
+        if pos.highest_price > cur and r_unit_abs > 0:
+            giveback_r = (pos.highest_price - cur) / r_unit_abs
+            if giveback_r >= TRAIL_HIGHEST_GIVEBACK_R:
                 return ExitDecision(
                     "sell",
                     1.0,
-                    "1분봉 {}MA 이탈 (SMA {:.0f} > 현재가 {})".format(
-                        EXIT_MA_PERIOD, sma5, cur
+                    "잔량 트레일링: 고점 {} 대비 {:.2f}R 반납 (현재가 {}, R={:.2f})".format(
+                        pos.highest_price, giveback_r, cur, r
                     ),
                     update_stop_to_be=update_stop,
                 )
 
-        # 4b) 체결강도 약화
+        # 4b) 1분봉 5MA 이탈
+        if len(ctx.minute_bars) >= EXIT_MA_PERIOD:
+            recent = ctx.minute_bars[-EXIT_MA_PERIOD:]
+            sma5 = sum(b.close for b in recent) / EXIT_MA_PERIOD
+            if cur < sma5 and r < EXIT_BE_R:
+                return ExitDecision(
+                    "sell",
+                    1.0,
+                    "1분봉 {}MA 이탈 + +1R 훼손 (SMA {:.0f} > 현재가 {}, R={:.2f})".format(
+                        EXIT_MA_PERIOD, sma5, cur, r
+                    ),
+                    update_stop_to_be=update_stop,
+                )
+
+        # 4c) 체결강도 약화
         if 0 < ctx.chejan_strength < EXIT_MIN_CHEJAN_STRENGTH:
             return ExitDecision(
                 "sell",
@@ -124,7 +140,7 @@ def evaluate_exit(ctx: ExitContext) -> ExitDecision:
                 update_stop_to_be=update_stop,
             )
 
-        # 4c) 5분봉 Envelope(13,2.5) 상단 이탈
+        # 4d) 5분봉 Envelope(13,2.5) 상단 이탈
         if ctx.five_min_ind and ctx.five_min_ind.env_upper_13_25:
             env = ctx.five_min_ind.env_upper_13_25
             buffer = env * ENV_BREAK_BUFFER_PCT

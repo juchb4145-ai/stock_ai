@@ -1,13 +1,27 @@
+"""FastAPI shell for future Dante LightGBM inference.
+
+The server is intentionally conservative: by default it does not override the
+rule engine. It echoes the Dante rule decision and appends model metadata
+(`model_score`, `model_action`) so main.py can log shadow results first. Once a
+model is validated, callers can opt into enforcement per request.
+"""
+
+from __future__ import annotations
+
 import json
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-import joblib
-import numpy as np
+import pandas as pd
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import scoring
+
+try:
+    import joblib
+except ImportError:
+    joblib = None
 
 try:
     import lightgbm as lgb
@@ -15,59 +29,87 @@ except ImportError:
     lgb = None
 
 
-MODEL_PKL_PATH = os.path.join("models", "opening_lgbm.pkl")
-MODEL_TXT_PATH = os.path.join("models", "opening_lgbm.txt")
-MODEL_META_PATH = os.path.join("models", "opening_lgbm_meta.json")
-OPENING_TAKE_PROFIT_RATE = 0.012
-OPENING_MAX_SPREAD_RATE = 0.006
-EXIT_MIN_PROFIT_RATE = 0.007
-EXIT_STRONG_PROFIT_RATE = 0.018
-EXIT_TRAILING_DROP_RATE = 0.0035
-EXIT_STALL_SECONDS = 7 * 60
-EXIT_HOLD_SCORE_MIN = 0.45
-OPENING_MAX_HOLD_SECONDS = 20 * 60
-DEFAULT_ENTRY_THRESHOLD = 0.5
-ENTRY_FEATURES = list(scoring.ENTRY_FEATURE_NAMES)
+MODEL_DIR = "models"
+DANTE_MODEL_PKL_PATH = os.path.join(MODEL_DIR, "dante_lgbm.pkl")
+DANTE_MODEL_TXT_PATH = os.path.join(MODEL_DIR, "dante_lgbm.txt")
+DANTE_MODEL_META_PATH = os.path.join(MODEL_DIR, "dante_lgbm_meta.json")
+
+DEFAULT_DANTE_THRESHOLD = 0.5
+DEFAULT_TARGET = "reached_1r"
+DANTE_FEATURES = list(scoring.DANTE_ENTRY_FEATURE_NAMES)
+
+MODEL_ACTION_ALLOW = "shadow_allow"
+MODEL_ACTION_BLOCK = "shadow_block"
+MODEL_ACTION_UNAVAILABLE = "shadow_unavailable"
 
 
-app = FastAPI(title="Kiwoom LightGBM AI Server")
+app = FastAPI(title="Kiwoom Dante LightGBM AI Server")
 model = None
-model_name = "ServerFallbackScore"
-model_threshold = DEFAULT_ENTRY_THRESHOLD
-model_meta = {}
+model_name = "DanteModelUnavailable"
+model_threshold = DEFAULT_DANTE_THRESHOLD
+model_target = DEFAULT_TARGET
+model_features = list(DANTE_FEATURES)
+model_meta: Dict = {}
 
 
-class Tick(BaseModel):
-    received_at: float
-    signed_at: Optional[str] = ""
-    close: int
-    high: int
-    open: int
-    low: int
-    ask: int
-    bid: int
-    accum_volume: int
+class DanteRuleDecision(BaseModel):
+    status: str = "wait"
+    ratio: float = 0.0
+    stage: int = 1
+    grade: str = ""
+    reason: str = ""
+    reason_code: str = ""
 
 
-class EntryRequest(BaseModel):
+class DanteEntryRequest(BaseModel):
     code: str
     name: Optional[str] = ""
-    current_price: int
-    open_price: int
-    high: int
-    low: int
-    ask: int
-    bid: int
-    ticks: List[Tick]
+    current_price: int = 0
+    rule: DanteRuleDecision = Field(default_factory=DanteRuleDecision)
+    features: Dict[str, float] = Field(default_factory=dict)
+    market_regime: str = ""
+    market_gate_action: str = ""
+    market_gate_reason: str = ""
+    enforce_model: bool = False
 
 
-class EntryResponse(BaseModel):
+class DanteEntryResponse(BaseModel):
     status: str
-    score: float
-    expected_return: float
-    target_price: int
-    model_name: str
-    reason: str
+    code: str
+    name: str = ""
+    current_price: int = 0
+    ratio: float = 0.0
+    stage: int = 1
+    grade: str = ""
+    score: float = 0.0
+    model_score: float = 0.0
+    model_action: str = MODEL_ACTION_UNAVAILABLE
+    model_name: str = "DanteModelUnavailable"
+    model_target: str = DEFAULT_TARGET
+    model_threshold: float = DEFAULT_DANTE_THRESHOLD
+    reason: str = ""
+    reason_code: str = ""
+    market_regime: str = ""
+    market_gate_action: str = ""
+    market_gate_reason: str = ""
+    missing_features: List[str] = Field(default_factory=list)
+
+
+class DanteEntryPlanRequest(DanteEntryRequest):
+    ask: int = 0
+    bid: int = 0
+    breakout_high: int = 0
+    recent_low: int = 0
+
+
+class DanteEntryPlanResponse(DanteEntryResponse):
+    entry_limit_price: int = 0
+    stop_price: int = 0
+    take_profit_price: int = 0
+    risk_reward: float = 0.0
+    max_risk_pct: float = 0.0
+    expiry_seconds: int = 45
+    plan_source: str = "rule_fallback"
 
 
 class ExitRequest(BaseModel):
@@ -76,7 +118,6 @@ class ExitRequest(BaseModel):
     current_price: int
     highest_price: int
     hold_seconds: float
-    ticks: List[Tick]
 
 
 class ExitResponse(BaseModel):
@@ -86,168 +127,146 @@ class ExitResponse(BaseModel):
     model_name: str
 
 
-def load_model():
-    global model, model_name, model_threshold, model_meta
-    if os.path.exists(MODEL_PKL_PATH):
-        model = joblib.load(MODEL_PKL_PATH)
-        model_name = "LightGBM"
-    elif lgb is not None and os.path.exists(MODEL_TXT_PATH):
-        model = lgb.Booster(model_file=MODEL_TXT_PATH)
-        model_name = "LightGBM"
+def _load_meta() -> None:
+    global model_threshold, model_target, model_features, model_meta
+    if not os.path.exists(DANTE_MODEL_META_PATH):
+        return
+    try:
+        with open(DANTE_MODEL_META_PATH, "r", encoding="utf-8") as file:
+            model_meta = json.load(file)
+    except Exception as exc:
+        print("[dante model meta load failed]", exc)
+        model_meta = {}
+        return
 
-    if os.path.exists(MODEL_META_PATH):
+    threshold = model_meta.get("threshold")
+    if isinstance(threshold, (int, float)) and 0 < float(threshold) < 1:
+        model_threshold = float(threshold)
+
+    target = model_meta.get("target")
+    if isinstance(target, str) and target:
+        model_target = target
+
+    features = model_meta.get("features")
+    if isinstance(features, list) and all(isinstance(name, str) for name in features):
+        model_features = list(features)
+
+
+def load_model() -> None:
+    global model, model_name
+    _load_meta()
+    if joblib is not None and os.path.exists(DANTE_MODEL_PKL_PATH):
+        model = joblib.load(DANTE_MODEL_PKL_PATH)
+        model_name = str(model_meta.get("model_name") or "DanteLightGBM")
+    elif lgb is not None and os.path.exists(DANTE_MODEL_TXT_PATH):
+        model = lgb.Booster(model_file=DANTE_MODEL_TXT_PATH)
+        model_name = str(model_meta.get("model_name") or "DanteLightGBM")
+
+
+def _feature_vector(features: Dict[str, float]) -> tuple[pd.DataFrame, List[str]]:
+    missing = [name for name in model_features if name not in features]
+    values = []
+    for name in model_features:
         try:
-            with open(MODEL_META_PATH, "r", encoding="utf-8") as f:
-                model_meta = json.load(f)
-            threshold = model_meta.get("threshold")
-            if isinstance(threshold, (int, float)) and 0 < float(threshold) < 1:
-                model_threshold = float(threshold)
-        except Exception as exc:
-            print("[메타 로드 실패]", exc)
+            values.append(float(features.get(name, 0.0) or 0.0))
+        except (TypeError, ValueError):
+            values.append(0.0)
+    return pd.DataFrame([values], columns=model_features, dtype=float), missing
 
 
-def _ticks_as_dicts(ticks):
-    # pydantic v1/v2 호환
-    out = []
-    for tick in ticks:
-        if hasattr(tick, "model_dump"):
-            out.append(tick.model_dump())
-        else:
-            out.append(tick.dict())
-    return out
-
-
-def build_entry_features(req: EntryRequest):
-    ticks = _ticks_as_dicts(req.ticks)
-    if not ticks:
-        return None
-    return scoring.build_entry_features(
-        ticks=ticks,
-        current_price=req.current_price,
-        open_price=req.open_price,
-        high=req.high,
-        low=req.low,
-        ask=req.ask,
-        bid=req.bid,
-    )
-
-
-def fallback_entry(req: EntryRequest, features) -> EntryResponse:
-    if features is None:
-        return EntryResponse(
-            status="wait",
-            score=0.0,
-            expected_return=0.0,
-            target_price=req.current_price,
-            model_name="ServerFallbackScore",
-            reason="실시간 가격 데이터 부족",
-        )
-    spread_rate = features["spread_rate"]
-    if spread_rate < 0 or spread_rate > OPENING_MAX_SPREAD_RATE:
-        return EntryResponse(
-            status="blocked",
-            score=0.0,
-            expected_return=0.0,
-            target_price=req.current_price,
-            model_name="ServerFallbackScore",
-            reason="호가 스프레드 과다 {:.2%}".format(spread_rate),
-        )
-
-    score = scoring.compute_entry_score(features, OPENING_MAX_SPREAD_RATE)
-    expected_return = scoring.expected_return_from_score(
-        score,
-        features=features,
-        opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
-    )
-    target_price = scoring.compute_target_price(req.current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
-    return EntryResponse(
-        status="ready",
-        score=score,
-        expected_return=expected_return,
-        target_price=target_price,
-        model_name="ServerFallbackScore",
-        reason="server fallback",
-    )
-
-
-def predict_lightgbm_entry(req: EntryRequest, features) -> EntryResponse:
-    values = np.array([[features[name] for name in ENTRY_FEATURES]])
+def _predict_score(features: Dict[str, float]) -> tuple[float, List[str]]:
+    values, missing = _feature_vector(features)
     if hasattr(model, "predict_proba"):
         prediction = model.predict_proba(values)
-        score = scoring.clamp(float(prediction[0][1]))
+        score = float(prediction[0][1])
     else:
         prediction = model.predict(values)
-        score = scoring.clamp(float(prediction[0]))
-    expected_return = scoring.expected_return_from_score(
-        score,
-        features=features,
-        opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
-    )
-    target_price = scoring.compute_target_price(req.current_price, expected_return, OPENING_TAKE_PROFIT_RATE)
-
-    # 학습 시 결정된 threshold 미만이면 매수 차단 신호로 응답해 main.py가 곧바로 회피하도록 한다.
-    if score < model_threshold:
-        return EntryResponse(
-            status="blocked",
-            score=score,
-            expected_return=expected_return,
-            target_price=target_price,
-            model_name=model_name,
-            reason="lightgbm score {:.3f} < threshold {:.3f}".format(score, model_threshold),
-        )
-    return EntryResponse(
-        status="ready",
-        score=score,
-        expected_return=expected_return,
-        target_price=target_price,
-        model_name=model_name,
-        reason="lightgbm score {:.3f} >= threshold {:.3f}".format(score, model_threshold),
-    )
+        score = float(prediction[0])
+    return scoring.clamp(score), missing
 
 
-def fallback_exit(req: ExitRequest) -> ExitResponse:
-    profit_rate = req.current_price / req.entry_price - 1 if req.entry_price > 0 else 0
-    trailing_drop = req.current_price / req.highest_price - 1 if req.highest_price > 0 else 0
-    ticks = _ticks_as_dicts(req.ticks)
-
-    hold_score = scoring.compute_exit_hold_score(
-        ticks=ticks,
+def _rule_response(req: DanteEntryRequest) -> DanteEntryResponse:
+    return DanteEntryResponse(
+        status=req.rule.status,
+        code=req.code,
+        name=req.name or "",
         current_price=req.current_price,
-        profit_rate=profit_rate,
-        trailing_drop=trailing_drop,
-        hold_seconds=req.hold_seconds,
-        opening_max_spread_rate=OPENING_MAX_SPREAD_RATE,
-        exit_min_profit_rate=EXIT_MIN_PROFIT_RATE,
-        exit_strong_profit_rate=EXIT_STRONG_PROFIT_RATE,
-        exit_trailing_drop_rate=EXIT_TRAILING_DROP_RATE,
-        exit_stall_seconds=EXIT_STALL_SECONDS,
-        opening_max_hold_seconds=OPENING_MAX_HOLD_SECONDS,
+        ratio=req.rule.ratio,
+        stage=req.rule.stage,
+        grade=req.rule.grade,
+        score=req.rule.ratio,
+        reason=req.rule.reason,
+        reason_code=req.rule.reason_code,
+        market_regime=req.market_regime,
+        market_gate_action=req.market_gate_action,
+        market_gate_reason=req.market_gate_reason,
     )
 
-    if profit_rate >= EXIT_STRONG_PROFIT_RATE:
-        return ExitResponse(action="sell", score=hold_score, reason="강한 수익 구간 도달 {:.2%}".format(profit_rate), model_name="ServerFallbackScore")
-    if profit_rate >= EXIT_MIN_PROFIT_RATE and trailing_drop <= -EXIT_TRAILING_DROP_RATE:
-        return ExitResponse(action="sell", score=hold_score, reason="고점 대비 밀림 {:.2%}".format(trailing_drop), model_name="ServerFallbackScore")
-    if profit_rate >= EXIT_MIN_PROFIT_RATE and req.hold_seconds >= EXIT_STALL_SECONDS and hold_score < EXIT_HOLD_SCORE_MIN:
-        return ExitResponse(action="sell", score=hold_score, reason="상승 지속 점수 약화 {:.2f}".format(hold_score), model_name="ServerFallbackScore")
-    return ExitResponse(action="hold", score=hold_score, reason="상승 지속 점수 {:.2f}".format(hold_score), model_name="ServerFallbackScore")
+
+def _build_entry_plan(
+    req: DanteEntryPlanRequest,
+    *,
+    response: DanteEntryResponse,
+) -> DanteEntryPlanResponse:
+    current = int(req.current_price or 0)
+    bid = int(req.bid or 0)
+    ask = int(req.ask or 0)
+    recent_low = int(req.recent_low or 0)
+    if current <= 0:
+        return DanteEntryPlanResponse(**response.dict(), plan_source=response.model_name)
+
+    unit = scoring.tick_size(current)
+    if bid > 0:
+        entry_limit = min(current, bid + unit)
+    elif ask > 0:
+        entry_limit = min(current, ask)
+    else:
+        entry_limit = current
+    entry_limit = scoring.round_down_to_tick(entry_limit)
+
+    stop_anchor = recent_low if recent_low > 0 else int(entry_limit * 0.987)
+    stop_price = scoring.round_down_to_tick(stop_anchor - unit)
+    if stop_price <= 0 or stop_price >= entry_limit:
+        stop_price = scoring.round_down_to_tick(entry_limit * 0.985)
+
+    risk_per_share = max(entry_limit - stop_price, unit)
+    risk_pct = risk_per_share / entry_limit if entry_limit > 0 else 0.0
+    target_r = 2.0
+    if response.model_score and response.model_score >= max(response.model_threshold, 0.65):
+        target_r = 2.3
+    take_profit = scoring.round_up_to_tick(entry_limit + risk_per_share * target_r)
+    rr = (take_profit - entry_limit) / risk_per_share if risk_per_share > 0 else 0.0
+
+    return DanteEntryPlanResponse(
+        **response.dict(),
+        entry_limit_price=entry_limit,
+        stop_price=stop_price,
+        take_profit_price=take_profit,
+        risk_reward=round(float(rr), 3),
+        max_risk_pct=round(float(risk_pct), 5),
+        expiry_seconds=45,
+        plan_source=response.model_name,
+    )
 
 
 @app.on_event("startup")
-def startup():
+def startup() -> None:
     load_model()
 
 
 @app.get("/health")
-def health():
+def health() -> Dict:
     return {
         "ok": True,
         "model_loaded": model is not None,
         "model_name": model_name,
+        "target": model_target,
         "threshold": model_threshold,
+        "features": model_features,
+        "feature_count": len(model_features),
         "meta": {
-            k: model_meta.get(k)
-            for k in (
+            key: model_meta.get(key)
+            for key in (
                 "train_rows",
                 "valid_rows",
                 "valid_auc",
@@ -255,25 +274,72 @@ def health():
                 "valid_f1_tuned",
                 "cv_auc_mean",
                 "cv_f1_mean",
+                "positive_count",
+                "negative_count",
             )
-            if k in model_meta
+            if key in model_meta
         },
     }
 
 
-@app.post("/predict-entry", response_model=EntryResponse)
-def predict_entry(req: EntryRequest):
-    features = build_entry_features(req)
-    if features is None or model is None:
-        return fallback_entry(req, features)
-    try:
-        return predict_lightgbm_entry(req, features)
-    except Exception as exc:
-        response = fallback_entry(req, features)
-        response.reason = "model error fallback: {}".format(exc)
+@app.post("/predict-dante-entry", response_model=DanteEntryResponse)
+def predict_dante_entry(req: DanteEntryRequest) -> DanteEntryResponse:
+    response = _rule_response(req)
+    response.model_name = model_name
+    response.model_target = model_target
+    response.model_threshold = model_threshold
+
+    if model is None:
+        response.model_action = MODEL_ACTION_UNAVAILABLE
+        response.reason = "{} | model unavailable".format(response.reason).strip()
         return response
+
+    try:
+        model_score, missing = _predict_score(req.features)
+    except Exception as exc:
+        response.model_action = MODEL_ACTION_UNAVAILABLE
+        response.reason = "{} | model error fallback: {}".format(response.reason, exc).strip()
+        return response
+
+    response.model_score = model_score
+    response.score = model_score
+    response.missing_features = missing
+    response.model_action = (
+        MODEL_ACTION_ALLOW if model_score >= model_threshold else MODEL_ACTION_BLOCK
+    )
+
+    if req.enforce_model and response.model_action == MODEL_ACTION_BLOCK:
+        response.status = "blocked"
+        response.ratio = 0.0
+        response.reason = "dante model score {:.3f} < threshold {:.3f} ({})".format(
+            model_score, model_threshold, response.reason
+        )
+    else:
+        response.reason = "{} | dante model score {:.3f} {}".format(
+            response.reason,
+            model_score,
+            ">=" if model_score >= model_threshold else "<",
+        ).strip()
+    return response
+
+
+@app.post("/predict-dante-entry-plan", response_model=DanteEntryPlanResponse)
+def predict_dante_entry_plan(req: DanteEntryPlanRequest) -> DanteEntryPlanResponse:
+    response = predict_dante_entry(req)
+    return _build_entry_plan(req, response=response)
+
+
+@app.post("/predict-entry", response_model=DanteEntryResponse)
+def predict_entry(req: DanteEntryRequest) -> DanteEntryResponse:
+    """Compatibility alias while main.py migrates to /predict-dante-entry."""
+    return predict_dante_entry(req)
 
 
 @app.post("/predict-exit", response_model=ExitResponse)
-def predict_exit(req: ExitRequest):
-    return fallback_exit(req)
+def predict_exit(req: ExitRequest) -> ExitResponse:
+    return ExitResponse(
+        action="hold",
+        score=0.0,
+        reason="Dante exit model is not enabled; use rule exit strategy",
+        model_name="DanteExitUnavailable",
+    )

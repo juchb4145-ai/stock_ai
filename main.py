@@ -57,9 +57,8 @@ REALTIME_SCREEN_NO = "0160"
 # KOSPI/KOSDAQ 업종지수 실시간용 별도 스크린(종목 실시간과 충돌 방지).
 INDEX_REALTIME_SCREEN_NO = "0170"
 ORDER_SCREEN_NO = "0001"
-# 단테 룰 기반 전환 직후에는 AI 서버/구식 학습 트랙(entry_training.csv) 의 의사결정을
-# 따르지 않는다. 새 전략 데이터가 충분히 쌓일 때까지 두 트랙 모두 비활성화한다.
-AI_SERVER_ENABLED = False
+# 조건식 편입 종목 전체를 AI 후보평가 대상으로 올리고, 단테 룰은 feature/가드레일로 사용한다.
+AI_SERVER_ENABLED = True
 AI_SERVER_URL = "http://127.0.0.1:8000"
 AI_SERVER_TIMEOUT_SECONDS = 0.35
 # 학습 트랙(구학습 + 단테 + shadow) 의 enable 플래그/CSV 경로/필드 정의는
@@ -78,6 +77,44 @@ AI_SERVER_TIMEOUT_SECONDS = 0.35
 PORTFOLIO_STATE_PATH = os.path.join(TRAINING_DATA_DIR, "portfolio_state.json")
 BUY_CASH_BUFFER_RATE = 0.98
 BUY_PRICE_MARGIN_RATE = 1.005
+RISK_PER_TRADE_RATE = 0.005
+MAX_PORTFOLIO_RISK_RATE = 0.02
+MIN_ORDER_CASH = 50_000
+ENTRY_PLAN_EXPIRY_SECONDS = 45
+# 매수 미체결 만료 점검 주기 (ms). 45초 expiry 와 ±2~5초 정밀도면 충분.
+BUY_ORDER_EXPIRY_CHECK_INTERVAL_MS = 5000
+# SendOrder 직후에는 키움 미체결 TR에 주문이 몇 초 늦게 반영될 수 있다. 이 시간을 넘겼는데
+# 계좌 미체결에도 없으면 로컬 pending으로만 남은 유령 주문으로 보고 슬롯을 해제한다.
+LOCAL_PENDING_ORDER_GRACE_SECONDS = 10
+ENTRY_PLAN_MAX_ENTRY_PREMIUM_PCT = 0.001
+ENTRY_PLAN_MIN_RISK_PCT = 0.004
+ENTRY_PLAN_MAX_RISK_PCT = 0.022
+ENTRY_PLAN_MIN_RR = 1.8
+ENTRY_PLAN_TARGET_R = 2.0
+# === fib retracement 기반 patient limit (윗자리 추격 방지) ===
+# 풀백 저점에서 위로 N 비율 되돌린 자리에 patient 지정가를 둔다. 0.40 이면
+# "풀백 깊이의 40% 만 회복한 지점" — 즉 직전 고점에서 -60% 자리. 풀백이 깊을수록
+# 절대 가격 자리도 더 낮게 잡혀 종목 변동성에 자동 적응.
+ENTRY_PLAN_FIB_RATIO = 0.40
+# 풀백 저점 대비 회복(retracement) 가 N 이상이면 윗자리 추격으로 보고 plan 거절.
+# 0.60 = 풀백 저점에서 60% 이상 회복한 지점 = fib_anchor 보다 위 → 매수 금지.
+ENTRY_PLAN_MAX_RETRACEMENT = 0.60
+# 풀백 자체가 N 미만이면 (= 사실상 풀백 미발생) anchor 가 의미 없어 plan 거절.
+# breakout_high 직후 직진 상승 케이스를 거른다.
+ENTRY_PLAN_MIN_PULLBACK_DEPTH = 0.003
+# fib 분석에 사용할 1분봉 lookback 수.
+ENTRY_PLAN_PULLBACK_LOOKBACK = 15
+# 손절가는 오래된 장중 저점보다 최근 눌림 구조를 우선한다.
+ENTRY_PLAN_STOP_LOOKBACK = 8
+VOLUME_SPEED_COOLDOWN_TRIGGER = 3
+VOLUME_SPEED_COOLDOWN_SECONDS = 5 * 60
+AI_CANDIDATE_PROMOTION_ENABLED = True
+AI_CANDIDATE_MIN_SCORE = 0.62
+RISK_TOO_WIDE_WATCH_ENABLED = True
+RISK_TOO_WIDE_WATCH_SECONDS = 20 * 60
+RISK_TOO_WIDE_RECHECK_INTERVAL_SECONDS = 30
+RISK_TOO_WIDE_MAX_CODES = 30
+RISK_TOO_WIDE_MIN_MODEL_SCORE = 0.70
 MIN_EXPECTED_RETURN = 0.006
 # 비용 반영 순기대수익률 기준(매수/목표가/로그에 사용)
 ESTIMATED_BUY_FEE_RATE = 0.00015
@@ -105,9 +142,9 @@ OPENING_MAX_SPREAD_RATE = entry_strategy.MAX_SPREAD_RATE
 # 손절/시간 손절 등은 exit_strategy 모듈로 이전했다. 호환을 위해 alias 만 남긴다.
 OPENING_STOP_LOSS_RATE = -exit_strategy.R_UNIT_PCT  # -1R
 OPENING_MAX_HOLD_SECONDS = exit_strategy.EXIT_TIME_LIMIT_SECONDS                         
-# 단테 전략은 1차 추격(소량) + 2차 본진입(본물량) 분할매수 방식이라 동시 보유 종목을
-# 보수적으로 1개로 시작한다. 검증 후 점진적으로 늘린다.
-MAX_CONCURRENT_POSITIONS = 1
+# 동시 종목 수는 리스크 예산 기반 sizing 의 안전 상한이다. 실제 진입 가능 여부는
+# RISK_PER_TRADE_RATE / MAX_PORTFOLIO_RISK_RATE 가 결정한다.
+MAX_CONCURRENT_POSITIONS = 6
 MAX_DAILY_BUY_COUNT = 20
 CONDITION_PROCESS_INTERVAL_MS = 2000
 CONDITION_COOLDOWN_SECONDS = 60
@@ -147,6 +184,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.processing_condition = False
         self.last_signal_at = {}
         self.last_wait_log_at = {}
+        self.volume_speed_wait_counts = {}
+        self.volume_speed_cooldown_until = {}
         self.no_tick_codes = set()
         self.holding_codes = set()
         self.pending_order_codes = set()
@@ -170,6 +209,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # ready 표본과 같은 풀에 들어가지 않도록 별도 dict + 별도 CSV 로 분리.
         self.pending_dante_shadow_samples = {}
         self.last_dante_shadow_sample_at = {}
+        self.dante_a_watchlist = {}
+        self.dante_reentry_watchlist = {}
+        self.risk_too_wide_watchlist = {}
         self.order_context = {}
         self.last_tr_request_at = 0
         self.last_order_request_at = 0
@@ -207,6 +249,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.position_check_timer.timeout.connect(self.check_open_positions)
         self.sell_check_timer = QTimer()
         self.sell_check_timer.timeout.connect(self.check_pending_sells)
+        # 매수 미체결 만료 점검 — fib_anchor 자리에 둔 patient 지정가가 expiry_seconds
+        # 안에 안 잡히면 자동 취소해 슬롯을 해제한다.
+        self.buy_expiry_timer = QTimer()
+        self.buy_expiry_timer.timeout.connect(self.cancel_stale_buy_orders)
 
     
     def _make_kiwoom_instance(self):
@@ -282,6 +328,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.pending_order_codes.add(code)
             if chejan_side == "sell":
                 self.pending_sell_order_codes.add(code)
+            # 매수 접수 시점에만 채워두면 cancel_stale_buy_orders 가 만료된 주문에
+            # 같은 order_no 로 취소 요청을 보낼 수 있다(키움 SendOrder 는 즉시
+            # 주문번호를 주지 않음 — chejan "접수" 이벤트가 유일한 출처).
+            if chejan_side == "buy" and code and order_no:
+                ctx = self.order_context.get(code)
+                if isinstance(ctx, dict) and not ctx.get("order_no"):
+                    ctx["order_no"] = order_no
         elif order_status == "체결":
             if left_quantity_int > 0:
                 self.pending_order_codes.add(code)
@@ -297,6 +350,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             if chejan_side == "sell":
                 self.pending_sell_order_codes.discard(code)
             order_terminated = True
+            # 매수 거부/취소: 보유 quantity==0 이면 portfolio 에서 완전 제거,
+            # 부분체결 후 잔량 취소면 pending_buy=False 만 풀어 보유 종목으로 전환.
+            # 이 정리가 빠지면 should_skip_buy 의 is_pending() 가 계속 True 라
+            # 같은 종목 재진입(다음 사이클의 fib anchor 자리)이 영구 차단된다.
+            if chejan_side == "buy" and code:
+                position = self.portfolio.get(code)
+                if position is not None:
+                    if position.quantity == 0 and not position.is_holding():
+                        self._discard_position(code, save=False, persist=False)
+                    else:
+                        position.pending_buy = False
+                # A-watch 도 정리 — 다음 사이클에 새 fib_anchor 로 재평가 가능하게.
+                self.dante_a_watchlist.pop(code, None)
         self.append_trade_log(
             "chejan",
             code=code,
@@ -315,6 +381,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             score=context.get("score", ""),
             expected_return=context.get("expected_return", ""),
             model_name=context.get("model_name", ""),
+            model_score=context.get("model_score", ""),
+            model_action=context.get("model_action", ""),
+            model_target=context.get("model_target", ""),
+            model_threshold=context.get("model_threshold", ""),
             reason=context.get("reason", ""),
             hold_seconds=context.get("hold_seconds", ""),
             profit_rate=context.get("profit_rate", ""),
@@ -354,6 +424,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 position.pending_buy = left_quantity_int > 0
                 if isinstance(context, dict):
                     position.order_context = dict(context)
+                    planned_stop = self.parse_int(context.get("stop_price", 0))
+                    planned_target = self.parse_int(context.get("take_profit_price", 0))
+                    if planned_stop > 0:
+                        position.stop_price = planned_stop
+                    if planned_target > 0:
+                        position.target_price = planned_target
+                        self.best[code] = planned_target
 
                 # === 단테 분할매수 상태 갱신 ===
                 stage_executed = int(context.get("stage", 1) or 1) if isinstance(context, dict) else 1
@@ -385,7 +462,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                         position.r_unit_pct = exit_strategy.R_UNIT_PCT
                     # 평단(체결가 기반) 대비 -1R 로 stop 초기화. 가중평균이 변하면 다시 잡는다.
                     initial_stop = int(position.entry_price * (1 - position.r_unit_pct))
-                    if position.stop_price <= 0 or position.stop_price < initial_stop:
+                    if position.stop_price <= 0:
                         position.stop_price = initial_stop
                     if position.breakout_high <= 0:
                         position.breakout_high = position.entry_price
@@ -404,6 +481,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 remaining_quantity = max(self.position_quantities.get(code, 0) - executed_quantity_int, 0)
                 self.position_quantities[code] = remaining_quantity
                 if remaining_quantity <= 0 and left_quantity_int <= 0:
+                    position = self.portfolio.get(code)
+                    self.maybe_start_reentry_watch(
+                        code,
+                        position,
+                        exit_price=executed_price_int or self.parse_int(current_price),
+                        reason=context.get("reason", "") if isinstance(context, dict) else "",
+                    )
                     # _discard_position이 portfolio에서도 제거하므로 별도 동기화 불필요.
                     self._discard_position(code)
                 else:
@@ -898,7 +982,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         value = self.dynamicCall("GetCommRealData(QString, QString)", code, get_fid(fid_name)).strip()
         if not value:
             return 0
-        return abs(int(value))
+        try:
+            return abs(int(value))
+        except ValueError:
+            # 업종지수(KOSPI/KOSDAQ) 등 일부 실시간 FID 는 '+6788.38' 같이 부호+소수 형태로 들어온다.
+            try:
+                return abs(int(float(value)))
+            except (ValueError, TypeError):
+                return 0
 
     def append_realtime_tick(self, code, signed_at, close, high, open, low, ask, bid, accum_volume, chejan_strength=0.0):
         code = self.normalize_code(code)
@@ -939,6 +1030,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if position is not None and position.entry_stage >= 1 and close > 0:
             position.update_breakout_high(int(close))
             position.update_highest(int(close))
+        watch = self.dante_a_watchlist.get(code)
+        if watch is not None and close > 0:
+            watch["breakout_high"] = max(self.parse_int(watch.get("breakout_high", 0)), int(close))
+        self.update_reentry_watch(code, close)
 
         self.update_training_labels(code, close, received_at)
         self.update_dante_training_labels(code, close, received_at)
@@ -1000,6 +1095,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.last_signal_at.clear()
         self.no_tick_codes.clear()
         self.last_wait_log_at.clear()
+        self.volume_speed_wait_counts.clear()
+        self.volume_speed_cooldown_until.clear()
         self.last_sell_skip_log_at.clear()
         self.pending_sell_intents.clear()
         self.pending_sell_order_codes.clear()
@@ -1010,6 +1107,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.pending_dante_samples.clear()
         self.last_dante_shadow_sample_at.clear()
         self.pending_dante_shadow_samples.clear()
+        self.dante_a_watchlist.clear()
+        self.dante_reentry_watchlist.clear()
+        self.risk_too_wide_watchlist.clear()
         logger.info("[일일초기화] {} 매수 후보/대기 상태 초기화".format(today))
 
     def normalize_code(self, code):
@@ -1073,6 +1173,53 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # 동안 잘못된 should_skip_buy 결과가 나올 수 있음).
         if persist:
             self.save_portfolio_state()
+
+    def maybe_start_reentry_watch(self, code, position=None, *, exit_price=0, reason=""):
+        code = self.normalize_code(code)
+        if not code or position is None:
+            return
+        entry_price = self.parse_int(getattr(position, "entry_price", 0))
+        exit_price = self.parse_int(exit_price)
+        if entry_price <= 0 or exit_price <= 0:
+            return
+        gross_profit = exit_price / entry_price - 1
+        if gross_profit < exit_strategy.EXIT_BE_R * exit_strategy.R_UNIT_PCT:
+            return
+        breakout_high = max(
+            self.parse_int(getattr(position, "breakout_high", 0)),
+            self.parse_int(getattr(position, "highest_price", 0)),
+            exit_price,
+        )
+        now = time.time()
+        self.dante_reentry_watchlist[code] = {
+            "started_at": now,
+            "deadline": now + entry_strategy.REENTRY_WATCH_WINDOW_SECONDS,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "breakout_high": breakout_high,
+            "pullback_low": exit_price,
+            "reason": reason,
+        }
+        self.register_realtime_stock(code)
+        self.requeue_condition_stock(code)
+        logger.info(
+            "[re-entry watch start] %s entry=%s exit=%s high=%s profit=%.2f%%",
+            code,
+            entry_price,
+            exit_price,
+            breakout_high,
+            gross_profit * 100,
+        )
+
+    def update_reentry_watch(self, code, close):
+        code = self.normalize_code(code)
+        watch = self.dante_reentry_watchlist.get(code)
+        if watch is None or close <= 0:
+            return
+        price = int(close)
+        watch["breakout_high"] = max(self.parse_int(watch.get("breakout_high", 0)), price)
+        low = self.parse_int(watch.get("pullback_low", 0))
+        watch["pullback_low"] = price if low <= 0 else min(low, price)
 
     def save_best(self):
         # 쓰기 도중 종료되어도 best.dat이 깨지지 않도록 임시 파일 → rename 으로 교체
@@ -1210,8 +1357,33 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 left_quantity = order[8]
                 if left_quantity > 0:
                     new_pending.add(code)
-            # 방금 보낸 주문이 TR 응답에 아직 반영되지 않은 경우를 대비해 합집합으로 병합
-            self.pending_order_codes = new_pending | self.pending_order_codes
+            # 방금 보낸 주문이 TR 응답에 아직 반영되지 않은 경우만 짧게 보존한다.
+            # 유예시간 이후에도 계좌 미체결에 없으면 로컬 유령 주문이므로 슬롯을 해제한다.
+            previous_pending = set(self.pending_order_codes)
+            keep_local_pending = set()
+            stale_local_pending = []
+            for code in previous_pending - new_pending:
+                ctx = self.order_context.get(code, {})
+                side = ctx.get("side", "") if isinstance(ctx, dict) else ""
+                placed_at = float(ctx.get("placed_at", 0) or 0) if isinstance(ctx, dict) else 0.0
+                is_recent = placed_at > 0 and now - placed_at < LOCAL_PENDING_ORDER_GRACE_SECONDS
+                if is_recent:
+                    keep_local_pending.add(code)
+                    continue
+                if side == "buy" and code not in holding_codes:
+                    stale_local_pending.append(code)
+            self.pending_order_codes = new_pending | keep_local_pending
+            for code in stale_local_pending:
+                logger.warning(
+                    "[미체결 정리] %s 계좌 미체결 없음 -- 로컬 매수 pending 해제",
+                    code,
+                )
+                self.pending_order_codes.discard(code)
+                self.bought_codes.discard(code)
+                self._discard_position(code, save=False, persist=False)
+            if stale_local_pending:
+                self.save_best()
+                self.save_portfolio_state()
             order_ok = True
         except Exception as e:
             logger.error("미체결 조회 실패: %s", e)
@@ -1238,15 +1410,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         """매수를 건너뛰어야 하는지 판단.
 
         stage:
-          1 = 1차 추격 매수 (A급 0봉 돌파)
-          2 = 본진입 — A급 75% 분할 본진입 또는 B급 100% 일괄 본진입
+          1 = A급 0봉 돌파 감시 시작(매수 없음)
+          2 = 본진입 — A급/B급 첫 눌림 100% 본진입
         grade:
           "A" 또는 "B". B급 stage=2 는 신규 종목에서 한 번에 매수하므로 Position 미존재가 정상.
         """
         position = self.portfolio.get(code)
         if stage == 2:
             # B급 일괄 매수: position 미존재가 정상.
-            if grade == "B" and (position is None or position.entry_stage == 0):
+            if grade in ("A", "B", "AI") and (position is None or position.entry_stage == 0):
                 if position is not None and position.entry_stage >= 2:
                     logger.info("[B급 매수 제외] {} 이미 본진입 완료".format(code))
                     return True
@@ -1316,7 +1488,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         try:
             if not os.path.exists(path):
                 return None
-            df = pd.read_csv(path, encoding="utf-8-sig")
+            # 열 개수 불일치 행은 이후 줄에서 깨져도 전체 로드 실패하지 않도록 스킵(구학습 트랙 레거시 CSV).
+            try:
+                df = pd.read_csv(path, encoding="utf-8-sig", on_bad_lines="skip")
+            except TypeError:
+                # pandas <= 1.2.x
+                df = pd.read_csv(path, encoding="utf-8-sig")
             if "score" not in df.columns or "return_10m" not in df.columns:
                 return None
             df = df[["score", "return_10m"]].copy()
@@ -1364,12 +1541,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             net = gross_p - ESTIMATED_ROUND_TRIP_COST_RATE
             tuned = max(MIN_NET_EXPECTED_RETURN, min(net, DYNAMIC_MIN_NET_RETURN_CEILING))
             logger.info(
-                "[entry calibration] 동적 매수 임계값 적용: P%.0f gross=%+.2%%, 비용=%.2%%, net=%+.2%% → 임계 %.2%%",
+                "[entry calibration] 동적 매수 임계값 적용: P%.0f gross=%+.2f%%, 비용=%.2f%%, net=%+.2f%% → 임계 %.2f%%",
                 DYNAMIC_MIN_NET_RETURN_PERCENTILE * 100,
-                gross_p,
-                ESTIMATED_ROUND_TRIP_COST_RATE,
-                net,
-                tuned,
+                gross_p * 100,
+                ESTIMATED_ROUND_TRIP_COST_RATE * 100,
+                net * 100,
+                tuned * 100,
             )
             return tuned
         except Exception as exc:
@@ -1493,6 +1670,34 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.last_wait_log_at[code] = now
         return True
 
+    def is_volume_speed_cooling_down(self, code):
+        until = float(self.volume_speed_cooldown_until.get(code, 0) or 0)
+        if until <= 0:
+            return False
+        if time.time() >= until:
+            self.volume_speed_cooldown_until.pop(code, None)
+            self.volume_speed_wait_counts.pop(code, None)
+            return False
+        return True
+
+    def record_volume_speed_wait(self, code, volume_speed):
+        count = self.volume_speed_wait_counts.get(code, 0) + 1
+        self.volume_speed_wait_counts[code] = count
+        if count < VOLUME_SPEED_COOLDOWN_TRIGGER:
+            return False
+        cooldown_until = time.time() + VOLUME_SPEED_COOLDOWN_SECONDS
+        self.volume_speed_cooldown_until[code] = cooldown_until
+        self.volume_speed_wait_counts[code] = 0
+        logger.info(
+            "[거래속도 쿨다운] %s %.0f < %.0f 주/초 %d회 반복 -- %d초 대기",
+            code,
+            volume_speed,
+            entry_strategy.MIN_VOLUME_SPEED,
+            VOLUME_SPEED_COOLDOWN_TRIGGER,
+            VOLUME_SPEED_COOLDOWN_SECONDS,
+        )
+        return True
+
     def call_ai_server(self, endpoint, payload):
         if not AI_SERVER_ENABLED:
             return None
@@ -1544,14 +1749,611 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             for tick in ticks
         ]
 
+    def attach_dante_ai_shadow(self, code, name, current_price, ctx, decision, *, stage, breakout_high=0):
+        """Call the Dante AI server in shadow mode and attach score metadata."""
+        decision.model_score = ""
+        decision.model_action = "ai_disabled" if not AI_SERVER_ENABLED else "shadow_unavailable"
+        decision.model_target = ""
+        decision.model_threshold = ""
+        decision.model_name = "DanteRule"
+
+        five_min = ctx.five_min_ind
+        env_upper = five_min.env_upper_13_25 if five_min is not None else None
+        bb_upper = five_min.bb_upper_55_2 if five_min is not None else None
+        closes_count = five_min.closes_count if five_min is not None else 0
+        obs_elapsed = ctx.now_ts - (ctx.condition_registered_at or ctx.now_ts)
+        features = scoring.build_dante_entry_features(
+            current_price=current_price,
+            chejan_strength=ctx.chejan_strength,
+            volume_speed=ctx.volume_speed,
+            spread_rate=ctx.spread_rate,
+            obs_elapsed_sec=obs_elapsed,
+            env_upper_13=env_upper,
+            bb_upper_55=bb_upper,
+            five_min_closes_count=closes_count,
+            breakout_high=breakout_high,
+            minute_bars=ctx.minute_bars,
+            chejan_strength_history=ctx.chejan_strength_history,
+            is_breakout_zero_bar=ctx.is_breakout_zero_bar,
+            is_breakout_prev_bar=ctx.is_breakout_prev_bar,
+            upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
+            open_return=ctx.open_return,
+        )
+        payload = {
+            "code": code,
+            "name": name,
+            "current_price": current_price,
+            "rule": {
+                "status": decision.status,
+                "ratio": decision.ratio,
+                "stage": stage,
+                "grade": getattr(decision, "grade", "") or "",
+                "reason": decision.reason,
+                "reason_code": getattr(decision, "reason_code", "") or "",
+            },
+            "features": features,
+            "market_regime": getattr(decision, "market_regime", "") or "",
+            "market_gate_action": getattr(decision, "market_gate_action", "") or "",
+            "market_gate_reason": getattr(decision, "market_gate_reason", "") or "",
+            "enforce_model": False,
+        }
+        response = self.call_ai_server("/predict-dante-entry", payload)
+        if not isinstance(response, dict):
+            return features
+
+        decision.model_score = response.get("model_score", "")
+        decision.model_action = response.get("model_action", "")
+        decision.model_target = response.get("model_target", "")
+        decision.model_threshold = response.get("model_threshold", "")
+        decision.model_name = response.get("model_name", "DanteLightGBM")
+        return features
+
+    def recent_pullback_low(self, code, fallback_price=0, lookback=5):
+        bars = self.minute_aggregator.all_bars(code)
+        lows = [
+            self.parse_int(getattr(bar, "low", 0))
+            for bar in bars[-lookback:]
+            if self.parse_int(getattr(bar, "low", 0)) > 0
+        ]
+        return min(lows) if lows else self.parse_int(fallback_price)
+
+    def recent_structural_pullback_low(self, code, fallback_price=0, lookback=8):
+        """최근 1분봉에서 눌림 후 회복 구조가 확인된 저점을 손절 기준으로 사용한다."""
+        bars = self.minute_aggregator.all_bars(code)
+        recent = list(bars[-lookback:]) if bars else []
+        fallback = self.parse_int(fallback_price)
+        valid_lows = [
+            self.parse_int(getattr(bar, "low", 0))
+            for bar in recent
+            if self.parse_int(getattr(bar, "low", 0)) > 0
+        ]
+        if not valid_lows:
+            return fallback
+
+        # 음봉 뒤 양봉 전환이 있으면 그 전환 구간의 저점을 우선한다.
+        for idx in range(len(recent) - 1, 0, -1):
+            prev = recent[idx - 1]
+            cur = recent[idx]
+            prev_open = self.parse_int(getattr(prev, "open", 0))
+            prev_close = self.parse_int(getattr(prev, "close", 0))
+            cur_open = self.parse_int(getattr(cur, "open", 0))
+            cur_close = self.parse_int(getattr(cur, "close", 0))
+            prev_low = self.parse_int(getattr(prev, "low", 0))
+            cur_low = self.parse_int(getattr(cur, "low", 0))
+            if (
+                prev_open > 0
+                and prev_close > 0
+                and cur_open > 0
+                and cur_close > 0
+                and prev_low > 0
+                and cur_low > 0
+                and prev_close < prev_open
+                and cur_close > cur_open
+            ):
+                return min(prev_low, cur_low)
+
+        # 전환 패턴이 명확하지 않으면 최근 저점 중 현재가가 회복한 마지막 저점을 사용한다.
+        for bar in reversed(recent):
+            low = self.parse_int(getattr(bar, "low", 0))
+            close = self.parse_int(getattr(bar, "close", 0))
+            if low > 0 and fallback > low and (close > low or fallback >= close):
+                return low
+
+        return min(valid_lows)
+
+    def build_rule_entry_plan(self, prediction):
+        """fib retracement 기반 patient 지정가 계획.
+
+        - breakout_high(=hint) 와 breakout_high 이후 최저 low 를 잡고,
+          fib_anchor = low + (high - low) * ENTRY_PLAN_FIB_RATIO 자리에 발주.
+        - 풀백 자체가 너무 얕거나(MIN_PULLBACK_DEPTH 미만) 풀백 저점에서 60%
+          이상 회복(MAX_RETRACEMENT 초과) 한 윗자리는 plan 비어 있음으로 거절 →
+          호출측 validate_entry_plan 가 "가격계획 데이터 부족" 으로 매수 보류.
+        - fib 자료가 없을 때만 기존 보수적 fallback (bid+1tick / ask / current_price)
+          를 쓰지만 stop 은 여전히 풀백 저점 - 1tick (또는 -1R) 으로 잡는다.
+        """
+        code = prediction.get("code", "")
+        current_price = self.parse_int(prediction.get("current_price", 0))
+        if current_price <= 0:
+            return {}
+        bid = self.parse_int(prediction.get("bid", 0))
+        ask = self.parse_int(prediction.get("ask", 0))
+        unit = scoring.tick_size(current_price)
+        breakout_high_hint = self.parse_int(prediction.get("breakout_high", 0))
+
+        bars = self.minute_aggregator.all_bars(code) if code else []
+        anchor_high, anchor_low, anchor_valid = entry_strategy.compute_pullback_anchor(
+            bars,
+            breakout_high_hint=breakout_high_hint,
+            lookback=ENTRY_PLAN_PULLBACK_LOOKBACK,
+        )
+
+        pullback_depth = 0.0
+        retracement = 0.0
+        plan_source = "rule_fallback"
+        fib_anchor = 0
+        if anchor_valid and anchor_high > 0 and anchor_low > 0 and anchor_low < anchor_high:
+            pullback_depth = (anchor_high - anchor_low) / anchor_high
+            if pullback_depth < ENTRY_PLAN_MIN_PULLBACK_DEPTH:
+                # 풀백 자체가 -0.3% 미만 — anchor 가 사실상 high 와 같음. 매수 거절.
+                return {}
+            span = anchor_high - anchor_low
+            retracement = (current_price - anchor_low) / span if span > 0 else 0.0
+            if retracement > ENTRY_PLAN_MAX_RETRACEMENT:
+                # 풀백 저점에서 60% 이상 회복 — 윗자리 추격 자리. 매수 거절.
+                return {}
+            fib_anchor = int(anchor_low + span * ENTRY_PLAN_FIB_RATIO)
+            entry_limit = min(current_price, fib_anchor)
+            plan_source = "rule_fib_retracement"
+        else:
+            # fib 분석 불가 — breakout_high/low 추적 부족(편입 직후 등). 보수 fallback.
+            if bid > 0:
+                entry_limit = min(current_price, bid + unit)
+            elif ask > 0:
+                entry_limit = min(current_price, ask)
+            else:
+                entry_limit = current_price
+        entry_limit = scoring.round_down_to_tick(entry_limit)
+
+        recent_low = self.parse_int(prediction.get("recent_low", 0))
+        if anchor_valid and anchor_low > 0:
+            # fib anchor 는 넓게 보되, 손절 기준은 최근 눌림 저점을 우선해 오래된 저점으로
+            # 손절폭이 과도하게 벌어지는 케이스를 줄인다.
+            stop_anchor = max(anchor_low, recent_low) if recent_low > 0 else anchor_low
+        else:
+            stop_anchor = recent_low if recent_low > 0 else int(entry_limit * (1 - exit_strategy.R_UNIT_PCT))
+        if stop_anchor >= entry_limit:
+            stop_anchor = int(entry_limit * (1 - exit_strategy.R_UNIT_PCT))
+        structure_stop = scoring.round_down_to_tick(stop_anchor - unit)
+        max_risk_stop = scoring.round_up_to_tick(entry_limit * (1 - ENTRY_PLAN_MAX_RISK_PCT))
+        min_risk_stop = scoring.round_down_to_tick(entry_limit * (1 - ENTRY_PLAN_MIN_RISK_PCT))
+        stop_price = max(structure_stop, max_risk_stop)
+        stop_price = min(stop_price, min_risk_stop)
+        if stop_price <= 0 or stop_price >= entry_limit:
+            stop_price = scoring.round_down_to_tick(entry_limit * (1 - exit_strategy.R_UNIT_PCT))
+
+        risk_per_share = max(entry_limit - stop_price, unit)
+        take_profit = scoring.round_up_to_tick(entry_limit + risk_per_share * ENTRY_PLAN_TARGET_R)
+        risk_pct = risk_per_share / entry_limit if entry_limit > 0 else 0.0
+        rr = (take_profit - entry_limit) / risk_per_share if risk_per_share > 0 else 0.0
+        return {
+            "entry_limit_price": entry_limit,
+            "stop_price": stop_price,
+            "take_profit_price": take_profit,
+            "risk_reward": rr,
+            "max_risk_pct": risk_pct,
+            "expiry_seconds": ENTRY_PLAN_EXPIRY_SECONDS,
+            "plan_source": plan_source,
+            "fib_anchor": fib_anchor,
+            "pullback_high": anchor_high,
+            "pullback_low": anchor_low,
+            "pullback_depth": pullback_depth,
+            "retracement": retracement,
+        }
+
+    def request_dante_entry_plan(self, code, prediction):
+        rule_plan = self.build_rule_entry_plan(prediction)
+        payload = {
+            "code": code,
+            "name": prediction.get("name", ""),
+            "current_price": self.parse_int(prediction.get("current_price", 0)),
+            "ask": self.parse_int(prediction.get("ask", 0)),
+            "bid": self.parse_int(prediction.get("bid", 0)),
+            "breakout_high": self.parse_int(prediction.get("breakout_high", 0)),
+            "recent_low": self.parse_int(prediction.get("recent_low", 0)),
+            "rule": {
+                "status": prediction.get("status", "wait"),
+                "ratio": float(prediction.get("ratio", 0.0) or 0.0),
+                "stage": int(prediction.get("stage", 1) or 1),
+                "grade": prediction.get("grade", ""),
+                "reason": prediction.get("reason", ""),
+                "reason_code": prediction.get("reason_code", ""),
+            },
+            "features": prediction.get("dante_features", {}),
+            "market_regime": prediction.get("market_regime", ""),
+            "market_gate_action": prediction.get("market_gate_action", ""),
+            "market_gate_reason": prediction.get("market_gate_reason", ""),
+            "enforce_model": False,
+        }
+        response = self.call_ai_server("/predict-dante-entry-plan", payload)
+        if isinstance(response, dict):
+            plan = dict(rule_plan)
+            for key in (
+                "entry_limit_price",
+                "stop_price",
+                "take_profit_price",
+                "risk_reward",
+                "max_risk_pct",
+                "expiry_seconds",
+                "plan_source",
+                "model_name",
+                "model_score",
+                "model_action",
+                "model_target",
+                "model_threshold",
+            ):
+                if key in response:
+                    plan[key] = response.get(key)
+
+            # AI 응답이 entry_limit 을 fib_anchor 위로 끌어올렸으면 rule plan 의
+            # fib_anchor 로 cap. 윗자리 추격 방지를 클라 측에서 단일 가드로 강제.
+            rule_fib_anchor = self.parse_int(rule_plan.get("fib_anchor", 0))
+            ai_entry = self.parse_int(plan.get("entry_limit_price", 0))
+            if rule_fib_anchor > 0 and ai_entry > rule_fib_anchor:
+                plan["entry_limit_price"] = rule_fib_anchor
+                existing_source = plan.get("plan_source", "") or ""
+                plan["plan_source"] = (
+                    "{}+fib_capped".format(existing_source) if existing_source else "fib_capped"
+                )
+            entry_limit = self.parse_int(plan.get("entry_limit_price", 0))
+            stop_price = self.parse_int(plan.get("stop_price", 0))
+            if entry_limit > 0 and stop_price > 0:
+                unit = scoring.tick_size(entry_limit)
+                max_risk_stop = scoring.round_up_to_tick(entry_limit * (1 - ENTRY_PLAN_MAX_RISK_PCT))
+                min_risk_stop = scoring.round_down_to_tick(entry_limit * (1 - ENTRY_PLAN_MIN_RISK_PCT))
+                capped_stop = max(stop_price, max_risk_stop)
+                capped_stop = min(capped_stop, min_risk_stop)
+                if capped_stop != stop_price and 0 < capped_stop < entry_limit:
+                    model_score = self.parse_float(plan.get("model_score", 0.0), 0.0)
+                    model_threshold = self.parse_float(plan.get("model_threshold", 0.0), 0.0)
+                    target_r = 2.3 if model_score >= max(model_threshold, 0.65) else ENTRY_PLAN_TARGET_R
+                    risk_per_share = max(entry_limit - capped_stop, unit)
+                    plan["stop_price"] = capped_stop
+                    plan["take_profit_price"] = scoring.round_up_to_tick(entry_limit + risk_per_share * target_r)
+                    plan["risk_reward"] = round(
+                        (plan["take_profit_price"] - entry_limit) / risk_per_share,
+                        3,
+                    )
+                    plan["max_risk_pct"] = round(risk_per_share / entry_limit, 5)
+                    existing_source = plan.get("plan_source", "") or ""
+                    plan["plan_source"] = (
+                        "{}+risk_capped".format(existing_source) if existing_source else "risk_capped"
+                    )
+            return plan
+        return rule_plan
+
+    def validate_entry_plan(self, prediction, plan):
+        current_price = self.parse_int(prediction.get("current_price", 0))
+        entry_limit = self.parse_int(plan.get("entry_limit_price", 0))
+        stop_price = self.parse_int(plan.get("stop_price", 0))
+        take_profit = self.parse_int(plan.get("take_profit_price", 0))
+        if current_price <= 0 or entry_limit <= 0 or stop_price <= 0 or take_profit <= 0:
+            return False, "가격계획 데이터 부족"
+        if entry_limit > current_price * (1 + ENTRY_PLAN_MAX_ENTRY_PREMIUM_PCT):
+            return False, "지정가가 현재가 대비 과도하게 높음"
+        if stop_price >= entry_limit:
+            return False, "손절가가 매수가 이상"
+        if take_profit <= entry_limit:
+            return False, "익절가가 매수가 이하"
+        risk_pct = (entry_limit - stop_price) / entry_limit
+        if risk_pct < ENTRY_PLAN_MIN_RISK_PCT:
+            return False, "손절폭 과소 {:.2%}".format(risk_pct)
+        if risk_pct > ENTRY_PLAN_MAX_RISK_PCT:
+            return False, "손절폭 과대 {:.2%}".format(risk_pct)
+        rr = (take_profit - entry_limit) / (entry_limit - stop_price)
+        if rr < ENTRY_PLAN_MIN_RR:
+            return False, "손익비 부족 {:.2f}R".format(rr)
+        return True, "지정가 계획 OK entry={} stop={} target={} risk={:.2%} rr={:.2f}".format(
+            entry_limit, stop_price, take_profit, risk_pct, rr
+        )
+
+    def is_risk_too_wide_plan_rejection(self, plan_reason):
+        return str(plan_reason or "").startswith("손절폭 과대")
+
+    def _plan_risk_pct(self, plan):
+        entry_limit = self.parse_int(plan.get("entry_limit_price", 0))
+        stop_price = self.parse_int(plan.get("stop_price", 0))
+        if entry_limit <= 0 or stop_price <= 0 or stop_price >= entry_limit:
+            return 0.0
+        return (entry_limit - stop_price) / entry_limit
+
+    def cleanup_risk_too_wide_watchlist(self, now_ts=None):
+        now_ts = now_ts or time.time()
+        for code, watch in list(self.risk_too_wide_watchlist.items()):
+            if now_ts > float(watch.get("deadline", 0) or 0):
+                self.risk_too_wide_watchlist.pop(code, None)
+
+    def qualifies_risk_too_wide_watch(self, prediction, plan, plan_reason):
+        if not RISK_TOO_WIDE_WATCH_ENABLED:
+            return False
+        if not self.is_risk_too_wide_plan_rejection(plan_reason):
+            return False
+        if prediction.get("market_gate_action", "") == entry_strategy.MARKET_ACTION_BLOCK_ALL:
+            return False
+        model_score = self.parse_float(plan.get("model_score", prediction.get("model_score", 0.0)), 0.0)
+        if model_score >= RISK_TOO_WIDE_MIN_MODEL_SCORE:
+            return True
+        reason_code = str(prediction.get("reason_code", "") or "")
+        ready_codes = {
+            entry_strategy.READY_AGRADE_FIRST,
+            entry_strategy.READY_AGRADE_SECOND,
+            entry_strategy.READY_BGRADE_PULLBACK,
+            entry_strategy.READY_REENTRY_PULLBACK,
+        }
+        return reason_code in ready_codes
+
+    def start_risk_too_wide_watch(self, code, prediction, plan, plan_reason):
+        code = self.normalize_code(code)
+        if not self.qualifies_risk_too_wide_watch(prediction, plan, plan_reason):
+            return False
+        self.cleanup_risk_too_wide_watchlist()
+        if code not in self.risk_too_wide_watchlist and len(self.risk_too_wide_watchlist) >= RISK_TOO_WIDE_MAX_CODES:
+            logger.info(
+                "[손절폭 재감시 제외] %s watchlist 한도 도달 %s",
+                code,
+                RISK_TOO_WIDE_MAX_CODES,
+            )
+            return False
+
+        now_ts = time.time()
+        risk_pct = self._plan_risk_pct(plan)
+        prev = self.risk_too_wide_watchlist.get(code, {})
+        best_risk_pct = self.parse_float(prev.get("best_risk_pct", risk_pct), risk_pct)
+        if risk_pct > 0:
+            best_risk_pct = min(best_risk_pct, risk_pct) if best_risk_pct > 0 else risk_pct
+        watch = {
+            "code": code,
+            "name": prediction.get("name", ""),
+            "started_at": float(prev.get("started_at", now_ts) or now_ts),
+            "deadline": float(prev.get("deadline", now_ts + RISK_TOO_WIDE_WATCH_SECONDS) or now_ts + RISK_TOO_WIDE_WATCH_SECONDS),
+            "last_recheck_at": now_ts,
+            "model_score": plan.get("model_score", prediction.get("model_score", "")),
+            "model_name": plan.get("model_name", prediction.get("model_name", "")),
+            "reason_code": prediction.get("reason_code", ""),
+            "entry_limit_price": self.parse_int(plan.get("entry_limit_price", 0)),
+            "stop_price": self.parse_int(plan.get("stop_price", 0)),
+            "risk_pct": risk_pct,
+            "best_risk_pct": best_risk_pct,
+            "plan_reason": plan_reason,
+        }
+        self.risk_too_wide_watchlist[code] = watch
+        self.requeue_condition_stock(code)
+        logger.info(
+            "[손절폭 재감시 등록] %s risk=%.2f%% best=%.2f%% model=%s deadline=%.0fs",
+            code,
+            risk_pct * 100,
+            best_risk_pct * 100,
+            watch.get("model_score", ""),
+            max(watch["deadline"] - now_ts, 0),
+        )
+        return True
+
+    def should_continue_risk_too_wide_watch(self, code):
+        code = self.normalize_code(code)
+        watch = self.risk_too_wide_watchlist.get(code)
+        if watch is None:
+            return True
+        position = self.portfolio.get(code)
+        if position is not None and (position.is_holding() or position.is_pending() or position.bought_today):
+            self.risk_too_wide_watchlist.pop(code, None)
+            logger.info("[손절폭 재감시 종료] %s 이미 보유/미체결/매수 처리", code)
+            return False
+        now_ts = time.time()
+        if self.current_hhmmss() >= OPENING_BUY_END:
+            self.risk_too_wide_watchlist.pop(code, None)
+            logger.info("[손절폭 재감시 종료] %s 매수 가능 시간 종료", code)
+            return False
+        if now_ts > float(watch.get("deadline", 0) or 0):
+            self.risk_too_wide_watchlist.pop(code, None)
+            logger.info(
+                "[손절폭 재감시 만료] %s best_risk=%.2f%%",
+                code,
+                self.parse_float(watch.get("best_risk_pct", 0.0), 0.0) * 100,
+            )
+            return False
+        last_recheck = float(watch.get("last_recheck_at", 0) or 0)
+        if now_ts - last_recheck < RISK_TOO_WIDE_RECHECK_INTERVAL_SECONDS:
+            self.requeue_condition_stock(code)
+            return False
+        watch["last_recheck_at"] = now_ts
+        return True
+
+    def estimate_position_plan_risk(self, position):
+        """현재 포지션/미체결이 계획상 감수하는 원화 리스크를 계산한다."""
+        if position is None:
+            return 0
+        entry_price = self.parse_int(getattr(position, "entry_price", 0))
+        stop_price = self.parse_int(getattr(position, "stop_price", 0))
+        if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
+            return 0
+
+        quantity = self.parse_int(getattr(position, "quantity", 0))
+        planned_quantity = self.parse_int(getattr(position, "planned_quantity", 0))
+        if getattr(position, "partial_taken", False) and quantity > 0:
+            risk_quantity = quantity
+        elif (
+            (getattr(position, "entry_stage", 0) < 2 or getattr(position, "pending_buy", False))
+            and planned_quantity > 0
+        ):
+            risk_quantity = planned_quantity
+        elif quantity > 0:
+            risk_quantity = quantity
+        else:
+            risk_quantity = planned_quantity
+
+        if risk_quantity <= 0:
+            return 0
+        return max(entry_price - stop_price, 0) * risk_quantity
+
+    def current_open_position_risk(self, *, exclude_code=""):
+        """보유/미체결 포지션의 계획 리스크 합계."""
+        total = 0
+        if not hasattr(self.portfolio, "items"):
+            return total
+        for code, position in self.portfolio.items():
+            if exclude_code and code == exclude_code:
+                continue
+            if not (
+                position.is_holding()
+                or position.is_pending()
+                or self.parse_int(getattr(position, "planned_quantity", 0)) > 0
+            ):
+                continue
+            total += self.estimate_position_plan_risk(position)
+        return total
+
+    def build_position_size_plan(self, *, code, deposit, entry_limit_price, stop_price):
+        """총 리스크 예산과 현금 한도를 동시에 만족하는 계획 수량을 계산한다."""
+        entry_limit_price = self.parse_int(entry_limit_price)
+        stop_price = self.parse_int(stop_price)
+        deposit = self.parse_int(deposit)
+        risk_per_share = entry_limit_price - stop_price
+        if deposit <= 0 or entry_limit_price <= 0 or risk_per_share <= 0:
+            return {
+                "planned_quantity": 0,
+                "reason": "sizing_input_invalid",
+                "risk_per_share": max(risk_per_share, 0),
+            }
+
+        used_portfolio_risk = self.current_open_position_risk(exclude_code=code)
+        portfolio_risk_budget = int(deposit * MAX_PORTFOLIO_RISK_RATE)
+        remaining_portfolio_risk = max(portfolio_risk_budget - used_portfolio_risk, 0)
+        per_trade_risk_budget = int(deposit * RISK_PER_TRADE_RATE)
+        risk_budget = min(per_trade_risk_budget, remaining_portfolio_risk)
+
+        risk_quantity = risk_budget // risk_per_share if risk_per_share > 0 else 0
+        cash_budget = int(deposit * BUY_CASH_BUFFER_RATE)
+        cash_quantity = cash_budget // entry_limit_price if entry_limit_price > 0 else 0
+        planned_quantity = int(min(risk_quantity, cash_quantity))
+        order_cash = planned_quantity * entry_limit_price
+
+        if planned_quantity <= 0:
+            reason = "portfolio_risk_exhausted" if remaining_portfolio_risk <= 0 else "risk_or_cash_quantity_zero"
+        elif order_cash < MIN_ORDER_CASH:
+            planned_quantity = 0
+            reason = "below_min_order_cash"
+        elif risk_quantity <= cash_quantity:
+            reason = "risk_capped"
+        else:
+            reason = "cash_capped"
+
+        return {
+            "planned_quantity": planned_quantity,
+            "reason": reason,
+            "risk_per_share": risk_per_share,
+            "risk_budget": risk_budget,
+            "per_trade_risk_budget": per_trade_risk_budget,
+            "portfolio_risk_budget": portfolio_risk_budget,
+            "used_portfolio_risk": used_portfolio_risk,
+            "remaining_portfolio_risk": remaining_portfolio_risk,
+            "risk_quantity": int(risk_quantity),
+            "cash_quantity": int(cash_quantity),
+            "cash_budget": cash_budget,
+            "order_cash": order_cash,
+        }
+
+    def format_position_size_plan(self, sizing_plan):
+        if not isinstance(sizing_plan, dict):
+            return ""
+        return (
+            "sizing={reason}, risk/share={risk_per_share}, risk_budget={risk_budget}, "
+            "used_risk={used_portfolio_risk}/{portfolio_risk_budget}, "
+            "qty risk/cash={risk_quantity}/{cash_quantity}, min_cash={min_cash}"
+        ).format(
+            reason=sizing_plan.get("reason", ""),
+            risk_per_share=sizing_plan.get("risk_per_share", 0),
+            risk_budget=sizing_plan.get("risk_budget", 0),
+            used_portfolio_risk=sizing_plan.get("used_portfolio_risk", 0),
+            portfolio_risk_budget=sizing_plan.get("portfolio_risk_budget", 0),
+            risk_quantity=sizing_plan.get("risk_quantity", 0),
+            cash_quantity=sizing_plan.get("cash_quantity", 0),
+            min_cash=MIN_ORDER_CASH,
+        )
+
+    def dante_hard_blocks_ai_candidate(self, prediction):
+        reason_code = str(prediction.get("reason_code", "") or "")
+        market_gate_action = prediction.get("market_gate_action", "")
+        if market_gate_action == entry_strategy.MARKET_ACTION_BLOCK_ALL:
+            return True, "market risk_off"
+        # Tier A 데이터 위생 — 틱·관찰시간·5분봉 캐시가 부족하면 피처 품질을 보장할 수 없으므로
+        # AI 점수로 승격하지 않음(모델이 학습 시 못 본 분포/노이즈 입력 방지).
+        hard_codes = {
+            entry_strategy.GATE_TICKS_INSUFFICIENT,
+            entry_strategy.GATE_OBSERVATION_SHORT,
+            entry_strategy.GATE_FIVEMIN_CACHE,
+            entry_strategy.GATE_ALREADY_ENTERED,
+            entry_strategy.GATE_PRICE_DATA,
+            entry_strategy.GATE_STAGE2_PRICE_DATA,
+            entry_strategy.GATE_SPREAD,
+            entry_strategy.GATE_STAGE2_SPREAD,
+            entry_strategy.GATE_OVERHEAT_OPEN,
+            entry_strategy.GATE_OVERHEAT_BB55,
+            entry_strategy.GATE_STAGE2_DRAWDOWN,
+            entry_strategy.GATE_BGRADE_DRAWDOWN,
+        }
+        if reason_code in hard_codes:
+            return True, reason_code
+        return False, ""
+
+    def maybe_promote_ai_candidate(self, prediction):
+        if not AI_CANDIDATE_PROMOTION_ENABLED:
+            return prediction
+        if prediction.get("status") == "ready":
+            return prediction
+        hard_blocked, block_reason = self.dante_hard_blocks_ai_candidate(prediction)
+        if hard_blocked:
+            prediction["ai_candidate_block_reason"] = block_reason
+            return prediction
+        model_action = str(prediction.get("model_action", "") or "")
+        if model_action != "shadow_allow":
+            return prediction
+        model_score = self.parse_float(prediction.get("model_score", 0.0), 0.0)
+        model_threshold = self.parse_float(prediction.get("model_threshold", 0.0), 0.0)
+        required_score = max(AI_CANDIDATE_MIN_SCORE, model_threshold)
+        if model_score < required_score:
+            return prediction
+
+        original_status = prediction.get("status", "")
+        original_reason = prediction.get("reason", "")
+        prediction["rule_status"] = original_status
+        prediction["rule_reason"] = original_reason
+        prediction["status"] = "ready"
+        prediction["stage"] = 2
+        prediction["ratio"] = 1.0
+        prediction["grade"] = prediction.get("grade") or "AI"
+        prediction["reason"] = "AI 후보 승격 score {:.3f} >= {:.3f} | 단테 {} {}".format(
+            model_score,
+            required_score,
+            original_status,
+            original_reason,
+        )
+        return prediction
+
     def score_opening_trade(self, code):
-        """단테조건식 편입 종목에 대해 1차(추격) 또는 2차(눌림 본진입) 매수 가능 여부 평가."""
+        """단테조건식 편입 종목에 대해 A급 감시 또는 첫 눌림 본진입 가능 여부 평가."""
         code = self.normalize_code(code)
         now = self.current_hhmmss()
         if now < OPENING_BUY_START:
             return {"status": "wait", "reason": "매수 시작 전"}
         if now > OPENING_BUY_END:
             return {"status": "blocked", "reason": "매수 시간 종료"}
+        if self.is_volume_speed_cooling_down(code):
+            remain = int(self.volume_speed_cooldown_until.get(code, 0) - time.time())
+            return {
+                "status": "blocked",
+                "reason": "거래속도 반복 부족 쿨다운 {}초 남음".format(max(remain, 0)),
+                "reason_code": entry_strategy.GATE_VOLUME_SPEED,
+            }
 
         ticks = self.realtime_ticks.get(code, [])
         if not ticks:
@@ -1629,12 +2431,78 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             market_state=market_snapshot,
         )
 
-        if position is not None and position.entry_stage == 1:
+        reentry_watch = self.dante_reentry_watchlist.get(code)
+        watch = self.dante_a_watchlist.get(code)
+        if reentry_watch is not None and (position is None or position.entry_stage == 0):
+            decision = entry_strategy.evaluate_reentry_after_exit(ctx, reentry_watch)
+            stage = 2
+            if decision.status == "blocked":
+                self.dante_reentry_watchlist.pop(code, None)
+        elif watch is not None and (position is None or position.entry_stage == 0):
+            decision = entry_strategy.evaluate_a_grade_watch_entry(
+                ctx,
+                breakout_high=self.parse_int(watch.get("breakout_high", 0)),
+                watch_started_at=float(watch.get("started_at", 0) or 0),
+                pullback_window_deadline=float(watch.get("deadline", 0) or 0),
+            )
+            stage = 2
+        elif position is not None and position.entry_stage == 1:
             decision = entry_strategy.evaluate_second_entry(ctx)
             stage = 2
         else:
             decision = entry_strategy.evaluate_first_entry(ctx)
             stage = decision.stage if decision.stage in (1, 2) else 1
+
+        if decision.reason_code == entry_strategy.GATE_VOLUME_SPEED:
+            if self.record_volume_speed_wait(code, volume_speed):
+                return {
+                    "status": "blocked",
+                    "stage": stage,
+                    "reason": "거래속도 반복 부족 {:.0f} < {:.0f}주/초".format(
+                        volume_speed,
+                        entry_strategy.MIN_VOLUME_SPEED,
+                    ),
+                    "reason_code": entry_strategy.GATE_VOLUME_SPEED,
+                }
+        else:
+            self.volume_speed_wait_counts.pop(code, None)
+
+        if decision.reason_code == entry_strategy.WATCH_AGRADE_BREAKOUT:
+            watch = self.dante_a_watchlist.get(code)
+            if watch is None:
+                watch = {
+                    "started_at": ctx.now_ts,
+                    "deadline": ctx.now_ts + entry_strategy.PULLBACK_WINDOW_MAX_SECONDS,
+                    "breakout_high": current_price,
+                }
+                self.dante_a_watchlist[code] = watch
+                logger.info("[A급 감시 시작] %s %s 현재가 %s", code, name, current_price)
+            else:
+                watch["breakout_high"] = max(self.parse_int(watch.get("breakout_high", 0)), current_price)
+            self.requeue_condition_stock(code)
+        elif decision.status == "blocked" and code in self.dante_a_watchlist:
+            self.dante_a_watchlist.pop(code, None)
+
+        if reentry_watch is not None:
+            ai_breakout_high = self.parse_int(reentry_watch.get("breakout_high", 0))
+        elif watch is not None:
+            ai_breakout_high = self.parse_int(watch.get("breakout_high", 0))
+        elif position is not None:
+            ai_breakout_high = self.parse_int(getattr(position, "breakout_high", 0))
+        else:
+            ai_breakout_high = 0
+        if hasattr(self, "attach_dante_ai_shadow"):
+            dante_features = self.attach_dante_ai_shadow(
+                code,
+                name,
+                current_price,
+                ctx,
+                decision,
+                stage=stage,
+                breakout_high=ai_breakout_high,
+            )
+        else:
+            dante_features = {}
 
         # Phase A 학습 트랙 — ready 시점의 모든 입력을 즉시 캡처해 사후 라벨링 큐에 등록한다.
         # 매수 발주/체결 결과와 무관하게 게이트가 'ready' 라고 판단한 표본을 모두 누적한다.
@@ -1663,7 +2531,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             except Exception as exc:
                 logger.warning("[단테 shadow] sample 등록 실패 {} {}".format(code, exc))
 
-        return {
+        prediction = {
             "status": decision.status,
             "code": code,
             "name": name,
@@ -1675,6 +2543,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "chejan_strength": chejan_strength,
             "volume_speed": volume_speed,
             "reason": decision.reason,
+            "reason_code": getattr(decision, "reason_code", "") or "",
             "grade": getattr(decision, "grade", "") or "",
             "is_breakout_zero_bar": is_breakout_zero,
             "is_breakout_prev_bar": is_breakout_prev,
@@ -1682,12 +2551,32 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "px_over_bb55_pct": px_over_bb55,
             "open_return": open_return,
             "chejan_strength_history": chejan_history,
-            "model_name": "DanteRule",
+            "ask": ask,
+            "bid": bid,
+            "breakout_high": ai_breakout_high,
+            "recent_low": (
+                self.recent_structural_pullback_low(
+                    code,
+                    current_price,
+                    lookback=ENTRY_PLAN_STOP_LOOKBACK,
+                )
+                if hasattr(self, "recent_structural_pullback_low")
+                else current_price
+            ),
+            "dante_features": dante_features,
+            "model_name": getattr(decision, "model_name", "DanteRule") or "DanteRule",
+            "model_score": getattr(decision, "model_score", "") or "",
+            "model_action": getattr(decision, "model_action", "") or "",
+            "model_target": getattr(decision, "model_target", "") or "",
+            "model_threshold": getattr(decision, "model_threshold", "") or "",
             # 매크로 dry-run 메타 — place_buy_order 등 trade_log 호출처에서 그대로 사용.
             "market_regime": getattr(decision, "market_regime", "") or "",
             "market_gate_action": getattr(decision, "market_gate_action", "") or "",
             "market_gate_reason": getattr(decision, "market_gate_reason", "") or "",
         }
+        if hasattr(self, "maybe_promote_ai_candidate"):
+            return self.maybe_promote_ai_candidate(prediction)
+        return prediction
 
     def handle_condition_stock(self, code):
         code = self.normalize_code(code)
@@ -1698,6 +2587,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.condition_registered_at[code] = time.time()
             self.requeue_condition_stock(code)
             logger.info("[조건편입 관찰] {} 실시간 등록 - 단테 1차 게이트 대기".format(code))
+            return
+        if not self.should_continue_risk_too_wide_watch(code):
             return
 
         prediction = self.predict_stock(code)
@@ -1719,7 +2610,20 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 logger.info("[{}차 매수 대기] {} {}".format(stage, code, prediction.get("reason", "")))
             return
         if status == "blocked":
+            self.risk_too_wide_watchlist.pop(code, None)
             logger.info("[{}차 매수 제외] {} {}".format(stage, code, prediction.get("reason", "")))
+            return
+
+        market_gate_action = prediction.get("market_gate_action", "")
+        if market_gate_action == entry_strategy.MARKET_ACTION_BLOCK_ALL:
+            self.risk_too_wide_watchlist.pop(code, None)
+            logger.info("[매수 제외] %s market gate block_all: %s", code, prediction.get("market_gate_reason", ""))
+            return
+        if (
+            market_gate_action == entry_strategy.MARKET_ACTION_BLOCK_CHASE_ONLY
+            and prediction.get("reason_code") == entry_strategy.READY_AGRADE_FIRST
+        ):
+            logger.info("[매수 제외] %s weak market chase block", code)
             return
 
         self.update_account_status()
@@ -1731,47 +2635,92 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if ratio <= 0:
             return
 
+        plan = self.request_dante_entry_plan(code, prediction)
+        plan_ok, plan_reason = self.validate_entry_plan(prediction, plan)
+        if not plan_ok:
+            watch_started = self.start_risk_too_wide_watch(code, prediction, plan, plan_reason)
+            if code in self.risk_too_wide_watchlist and not watch_started and not self.is_risk_too_wide_plan_rejection(plan_reason):
+                self.risk_too_wide_watchlist.pop(code, None)
+            logger.info("[매수 제외] %s AI 지정가 계획 거절: %s", code, plan_reason)
+            self.append_trade_log(
+                "buy_skip",
+                code=code,
+                name=prediction.get("name", ""),
+                side="buy",
+                quantity=0,
+                current_price=prediction.get("current_price", ""),
+                score=prediction.get("score", ""),
+                model_name=plan.get("model_name", prediction.get("model_name", "DanteRule")),
+                model_score=plan.get("model_score", prediction.get("model_score", "")),
+                model_action=plan.get("model_action", prediction.get("model_action", "")),
+                model_target=plan.get("model_target", prediction.get("model_target", "")),
+                model_threshold=plan.get("model_threshold", prediction.get("model_threshold", "")),
+                reason="AI 지정가 계획 거절",
+                message=plan_reason,
+                market_regime=prediction.get("market_regime", ""),
+                market_gate_action=prediction.get("market_gate_action", ""),
+                market_gate_reason=prediction.get("market_gate_reason", ""),
+            )
+            return
+        if code in self.risk_too_wide_watchlist:
+            watch = self.risk_too_wide_watchlist.pop(code, {})
+            logger.info(
+                "[손절폭 재감시 통과] %s best_risk=%.2f%% -> %s",
+                code,
+                self.parse_float(watch.get("best_risk_pct", 0.0), 0.0) * 100,
+                plan_reason,
+            )
+        prediction.update(plan)
+        prediction["entry_plan_reason"] = plan_reason
+
         self.place_buy_order(code, prediction, ratio=ratio, stage=stage)
 
     def place_buy_order(self, code, prediction, *, ratio, stage):
         """단테 분할매수 발주.
 
-        stage == 1 (1차 추격):
-          - 종목당 총 예산을 기반으로 planned_quantity 산정.
-          - order_quantity = planned_quantity * ratio (1차 비율) → 시장가 주문.
+        stage == 1:
+          - A급은 이제 매수하지 않고 감시만 하므로 이 경로는 구형 호환용이다.
         stage == 2 (본진입):
-          - position.planned_quantity 에서 이미 체결된 1차 수량을 뺀 잔여를 시장가 주문.
+          - 단테 룰 후보 + AI/룰 가격계획이 통과한 지정가로 주문.
         """
         code = self.normalize_code(code)
         current_price = self.parse_int(prediction.get("current_price", 0))
         if current_price <= 0:
             logger.info("[매수 보류] {} 현재가 0".format(code))
             return
+        entry_limit_price = self.parse_int(prediction.get("entry_limit_price", 0))
+        stop_price = self.parse_int(prediction.get("stop_price", 0))
+        take_profit_price = self.parse_int(prediction.get("take_profit_price", 0))
+        if entry_limit_price <= 0 or stop_price <= 0 or take_profit_price <= 0:
+            logger.info("[매수 보류] {} 지정가/손절/익절 계획 부족".format(code))
+            return
 
         deposit = self.get_deposit(force=True)
         position = self.portfolio.get(code)
 
-        ticks = self.realtime_ticks.get(code, [])
-        last_ask = ticks[-1].get("ask", 0) if ticks else 0
-        reference_price = max(current_price, last_ask) if last_ask > 0 else current_price
-        unit_cost = max(int(reference_price * BUY_PRICE_MARGIN_RATE), 1)
+        unit_cost = max(entry_limit_price, 1)
 
         grade = str(prediction.get("grade", "") or "")
-        b_grade_lump_sum = (
+        pullback_lump_sum = (
             stage == 2
             and (position is None or position.entry_stage == 0)
-            and grade == "B"
+            and grade in ("A", "B", "AI")
         )
+        sizing_plan = {}
 
         if stage == 1:
-            position_count = len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
-            remaining_slots = max(MAX_CONCURRENT_POSITIONS - position_count, 1)
-            full_budget = int(deposit * BUY_CASH_BUFFER_RATE / remaining_slots)
-            planned_quantity = full_budget // unit_cost if unit_cost > 0 else 0
+            sizing_plan = self.build_position_size_plan(
+                code=code,
+                deposit=deposit,
+                entry_limit_price=entry_limit_price,
+                stop_price=stop_price,
+            )
+            planned_quantity = self.parse_int(sizing_plan.get("planned_quantity", 0))
             if planned_quantity <= 0:
+                sizing_message = self.format_position_size_plan(sizing_plan)
                 logger.info(
-                    "[매수 보류] {} 예수금 부족: 종목당 예산 {}, 단가 {}, 가능 예수금 {}".format(
-                        code, full_budget, unit_cost, deposit
+                    "[매수 보류] {} 리스크/현금 예산 부족: 단가 {}, 가능 예수금 {}, {}".format(
+                        code, unit_cost, deposit, sizing_message
                     )
                 )
                 self.append_trade_log(
@@ -1783,10 +2732,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     current_price=current_price,
                     score=prediction.get("score", ""),
                     model_name=prediction.get("model_name", ""),
-                    reason="예수금 부족",
-                    message="단테 1차 stage 보류, 종목당 예산 {}, 단가 {}, 가능 {}".format(
-                        full_budget, unit_cost, deposit
-                    ),
+                    model_score=prediction.get("model_score", ""),
+                    model_action=prediction.get("model_action", ""),
+                    model_target=prediction.get("model_target", ""),
+                    model_threshold=prediction.get("model_threshold", ""),
+                    reason="리스크 예산 부족",
+                    message="단테 1차 stage 보류, {}".format(sizing_message),
                     market_regime=prediction.get("market_regime", ""),
                     market_gate_action=prediction.get("market_gate_action", ""),
                     market_gate_reason=prediction.get("market_gate_reason", ""),
@@ -1795,20 +2746,46 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             order_quantity = max(int(planned_quantity * ratio), 1)
             # 잔여 분(2차분)이 1주 이상 남도록 캡 — 1차에서 전량 다 사버리면 본진입이 무의미.
             order_quantity = min(order_quantity, max(planned_quantity - 1, 1))
-        elif b_grade_lump_sum:
+        elif pullback_lump_sum:
             # B급(1봉전 돌파만) — 1차/2차 분리 없이 첫 눌림에서 한 번에 본진입(ratio=1.0).
-            position_count = len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
-            remaining_slots = max(MAX_CONCURRENT_POSITIONS - position_count, 1)
-            full_budget = int(deposit * BUY_CASH_BUFFER_RATE / remaining_slots)
-            planned_quantity = full_budget // unit_cost if unit_cost > 0 else 0
+            sizing_plan = self.build_position_size_plan(
+                code=code,
+                deposit=deposit,
+                entry_limit_price=entry_limit_price,
+                stop_price=stop_price,
+            )
+            planned_quantity = self.parse_int(sizing_plan.get("planned_quantity", 0))
             if planned_quantity <= 0:
+                sizing_message = self.format_position_size_plan(sizing_plan)
                 logger.info(
-                    "[B급 매수 보류] {} 예수금 부족: 종목당 예산 {}, 단가 {}, 가능 {}".format(
-                        code, full_budget, unit_cost, deposit
+                    "[B급 매수 보류] {} 리스크/현금 예산 부족: 단가 {}, 가능 {}, {}".format(
+                        code, unit_cost, deposit, sizing_message
                     )
+                )
+                self.append_trade_log(
+                    "buy_skip",
+                    code=code,
+                    name=prediction.get("name", ""),
+                    side="buy",
+                    quantity=0,
+                    current_price=current_price,
+                    score=prediction.get("score", ""),
+                    model_name=prediction.get("model_name", "DanteRule"),
+                    model_score=prediction.get("model_score", ""),
+                    model_action=prediction.get("model_action", ""),
+                    model_target=prediction.get("model_target", ""),
+                    model_threshold=prediction.get("model_threshold", ""),
+                    reason="리스크 예산 부족",
+                    message=sizing_message,
+                    market_regime=prediction.get("market_regime", ""),
+                    market_gate_action=prediction.get("market_gate_action", ""),
+                    market_gate_reason=prediction.get("market_gate_reason", ""),
                 )
                 return
             order_quantity = planned_quantity  # ratio==1.0 이므로 전량
+            if prediction.get("reason_code") == entry_strategy.READY_REENTRY_PULLBACK:
+                order_quantity = max(int(planned_quantity * ratio), 1)
+                order_quantity = min(order_quantity, planned_quantity)
         else:
             if position is None:
                 logger.info("[2차 매수 보류] {} Position 없음".format(code))
@@ -1826,8 +2803,35 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             order_quantity = remaining
             planned_quantity = position.planned_quantity
 
-        # 예수금 한 번 더 안전 체크(시장가 슬리피지 대비).
+        # 예수금 한 번 더 안전 체크(지정가 기준).
         needed_cash = unit_cost * order_quantity
+        if needed_cash < MIN_ORDER_CASH:
+            sizing_message = self.format_position_size_plan(sizing_plan)
+            logger.info(
+                "[{}차 매수 보류] {} 최소 주문금액 미달(needed {}, min {}, {})".format(
+                    stage, code, needed_cash, MIN_ORDER_CASH, sizing_message
+                )
+            )
+            self.append_trade_log(
+                "buy_skip",
+                code=code,
+                name=prediction.get("name", ""),
+                side="buy",
+                quantity=0,
+                current_price=current_price,
+                score=prediction.get("score", ""),
+                model_name=prediction.get("model_name", "DanteRule"),
+                model_score=prediction.get("model_score", ""),
+                model_action=prediction.get("model_action", ""),
+                model_target=prediction.get("model_target", ""),
+                model_threshold=prediction.get("model_threshold", ""),
+                reason="최소 주문금액 미달",
+                message="needed {}, min {}, {}".format(needed_cash, MIN_ORDER_CASH, sizing_message),
+                market_regime=prediction.get("market_regime", ""),
+                market_gate_action=prediction.get("market_gate_action", ""),
+                market_gate_reason=prediction.get("market_gate_reason", ""),
+            )
+            return
         if needed_cash > deposit:
             adjusted = deposit // unit_cost if unit_cost > 0 else 0
             if adjusted <= 0:
@@ -1838,9 +2842,21 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 )
                 return
             order_quantity = adjusted
+            needed_cash = unit_cost * order_quantity
+            if needed_cash < MIN_ORDER_CASH:
+                logger.info(
+                    "[{}차 매수 보류] {} 예수금 조정 후 최소 주문금액 미달(needed {}, min {})".format(
+                        stage, code, needed_cash, MIN_ORDER_CASH
+                    )
+                )
+                return
 
-        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, 0, "03")
-        if grade == "B":
+        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, entry_limit_price, "00")
+        if pullback_lump_sum and grade == "A":
+            reason_label = "Dante A-watch pullback entry"
+        elif grade == "AI":
+            reason_label = "AI 후보 지정가 매수"
+        elif grade == "B":
             reason_label = "단테 B급 일괄 매수"
         else:
             reason_label = "단테 {}차 매수 (A급)".format(stage)
@@ -1856,39 +2872,81 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "chejan_strength": prediction.get("chejan_strength", 0.0),
             "volume_speed": prediction.get("volume_speed", 0.0),
             "model_name": prediction.get("model_name", "DanteRule"),
+            "model_score": prediction.get("model_score", ""),
+            "model_action": prediction.get("model_action", ""),
+            "model_target": prediction.get("model_target", ""),
+            "model_threshold": prediction.get("model_threshold", ""),
+            "entry_limit_price": entry_limit_price,
+            "stop_price": stop_price,
+            "take_profit_price": take_profit_price,
+            "risk_reward": prediction.get("risk_reward", ""),
+            "max_risk_pct": prediction.get("max_risk_pct", ""),
+            "position_sizing": sizing_plan.get("reason", ""),
+            "risk_per_share": sizing_plan.get("risk_per_share", ""),
+            "risk_budget": sizing_plan.get("risk_budget", ""),
+            "used_portfolio_risk": sizing_plan.get("used_portfolio_risk", ""),
+            "portfolio_risk_budget": sizing_plan.get("portfolio_risk_budget", ""),
+            "expiry_seconds": prediction.get("expiry_seconds", ENTRY_PLAN_EXPIRY_SECONDS),
+            "plan_source": prediction.get("plan_source", ""),
             "reason": "{} ({})".format(reason_label, prediction.get("reason", "")),
+            # cancel_stale_buy_orders 가 만료 점검에 사용. order_no 는 chejan "접수"
+            # 이벤트가 도착할 때 채워진다(키움이 send_order 응답으로 즉시 주는 게 아님).
+            "placed_at": time.time(),
+            "order_no": "",
         }
         self.append_trade_log(
             "buy_order",
             code=code,
             name=prediction.get("name", ""),
             side="buy",
-            order_type="시장가",
+            order_type="지정가",
             order_result=result,
             quantity=order_quantity,
-            order_price=0,
+            order_price=entry_limit_price,
             current_price=current_price,
-            entry_price=current_price,
+            entry_price=entry_limit_price,
+            target_price=take_profit_price,
             score=prediction.get("score", 0.0),
             model_name=prediction.get("model_name", "DanteRule"),
+            model_score=prediction.get("model_score", ""),
+            model_action=prediction.get("model_action", ""),
+            model_target=prediction.get("model_target", ""),
+            model_threshold=prediction.get("model_threshold", ""),
             reason=reason_label,
-            message="{}, planned {}, ratio {:.2f}, 단가 {}, 사유 {}".format(
-                reason_label, planned_quantity, ratio, unit_cost, prediction.get("reason", "")
+            message="{}, planned {}, ratio {:.2f}, limit {}, stop {}, target {}, {}, {}".format(
+                reason_label,
+                planned_quantity,
+                ratio,
+                entry_limit_price,
+                stop_price,
+                take_profit_price,
+                self.format_position_size_plan(sizing_plan),
+                prediction.get("entry_plan_reason", prediction.get("reason", "")),
             ),
             market_regime=prediction.get("market_regime", ""),
             market_gate_action=prediction.get("market_gate_action", ""),
             market_gate_reason=prediction.get("market_gate_reason", ""),
         )
         if result == 0:
-            self.order_prices[code] = current_price
+            self.order_prices[code] = entry_limit_price
             self.entry_times[code] = time.time()
             self.highest_prices[code] = current_price
             self.pending_order_codes.add(code)
             self.bought_codes.add(code)
+            self.best[code] = take_profit_price
+            self.target_returns[code] = self.estimate_net_target_return(entry_limit_price, take_profit_price)
+            self.save_best()
+            if prediction.get("reason_code") == entry_strategy.READY_REENTRY_PULLBACK:
+                self.dante_reentry_watchlist.pop(code, None)
+            if pullback_lump_sum and grade == "A":
+                self.dante_a_watchlist.pop(code, None)
 
             # Position 채움. 1차 발주 시점에 planned_quantity / pullback_window_deadline 셋업.
             position = self.portfolio.get_or_create(code, name=prediction.get("name", ""))
-            position.entry_price = current_price
+            position.entry_price = entry_limit_price
+            position.stop_price = stop_price
+            position.target_price = take_profit_price
+            position.target_return = self.estimate_net_target_return(entry_limit_price, take_profit_price)
             position.entry_time = position.entry_time or time.time()
             position.update_highest(current_price)
             position.pending_buy = True
@@ -1902,7 +2960,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 # 윈도우는 1차 체결 시 정확히 잡지만, 발주 시점에도 미리 한 번 세팅.
                 position.pullback_window_deadline = time.time() + entry_strategy.PULLBACK_WINDOW_MAX_SECONDS
                 position.entry1_time = position.entry1_time or time.time()
-            elif b_grade_lump_sum:
+            elif pullback_lump_sum:
                 # B급은 1차+2차를 한 번에 매수했으므로 분할 윈도우 없음, planned == 전량.
                 position.planned_quantity = planned_quantity
                 position.r_unit_pct = exit_strategy.R_UNIT_PCT
@@ -1918,11 +2976,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.save_portfolio_state()
             logger.info(
                 "[{} 매수 주문] {} 수량 {}/{} 현재가 {} 단가 {} 등급={} 사유 {}".format(
-                    "B급 일괄" if b_grade_lump_sum else "{}차".format(stage),
+                    reason_label,
                     prediction.get("name", ""),
                     order_quantity,
                     planned_quantity,
-                    current_price,
+                    entry_limit_price,
                     unit_cost,
                     grade or "?",
                     prediction.get("reason", ""),
@@ -1931,11 +2989,80 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         else:
             logger.error(
                 "[{} 매수 실패] {} SendOrder 결과 {}".format(
-                    "B급 일괄" if b_grade_lump_sum else "{}차".format(stage),
+                    reason_label,
                     code,
                     result,
                 )
             )
+
+    def cancel_stale_buy_orders(self):
+        """매수 patient 지정가 중 expiry_seconds 가 지난 미체결을 SendOrder 로 취소한다.
+
+        취소가 발사되면 키움이 chejan "취소" 이벤트를 보내고, _on_receive_chejan 의
+        해당 분기가 pending_order_codes / order_context / portfolio.pending_buy 를
+        정리한다. 이 메서드는 발주만 보낸다. 같은 종목에 두 번 취소가 발사되지 않도록
+        ctx 에 ``cancel_requested_at`` 마킹 후 다음 호출에서 스킵한다.
+        """
+        now = time.time()
+        for code in list(self.pending_order_codes):
+            # 매도 미체결은 기존 큐가 따로 처리한다.
+            if code in self.pending_sell_order_codes:
+                continue
+            ctx = self.order_context.get(code)
+            if not isinstance(ctx, dict):
+                continue
+            if ctx.get("side") != "buy":
+                continue
+            order_no = str(ctx.get("order_no", "") or "")
+            placed_at = float(ctx.get("placed_at", 0) or 0)
+            expiry = float(ctx.get("expiry_seconds", ENTRY_PLAN_EXPIRY_SECONDS) or ENTRY_PLAN_EXPIRY_SECONDS)
+            if not order_no or placed_at <= 0 or expiry <= 0:
+                continue
+            elapsed = now - placed_at
+            if elapsed < expiry:
+                continue
+            # 이미 한 번 취소를 발사한 주문은 재발사 금지(키움 chejan 응답 지연 대비).
+            cancel_requested_at = float(ctx.get("cancel_requested_at", 0) or 0)
+            if cancel_requested_at > 0 and now - cancel_requested_at < 10.0:
+                continue
+
+            result = self.send_order(
+                "buy_cancel",
+                ORDER_SCREEN_NO,
+                3,
+                code,
+                0,
+                0,
+                "00",
+                order_no,
+            )
+            ctx["cancel_requested_at"] = now
+            logger.info(
+                "[매수 미체결 취소] %s order_no=%s elapsed=%.0fs expiry=%.0fs result=%s",
+                code, order_no, elapsed, expiry, result,
+            )
+            try:
+                self.append_trade_log(
+                    "buy_cancel",
+                    code=code,
+                    name=ctx.get("name", ""),
+                    side="buy",
+                    order_no=order_no,
+                    order_result=result,
+                    order_price=ctx.get("entry_limit_price", ""),
+                    entry_price=ctx.get("entry_limit_price", ""),
+                    target_price=ctx.get("take_profit_price", ""),
+                    score=ctx.get("score", ""),
+                    model_name=ctx.get("model_name", ""),
+                    model_score=ctx.get("model_score", ""),
+                    model_action=ctx.get("model_action", ""),
+                    model_target=ctx.get("model_target", ""),
+                    model_threshold=ctx.get("model_threshold", ""),
+                    reason="buy_order_expired",
+                    message="elapsed {:.0f}s > expiry {:.0f}s".format(elapsed, expiry),
+                )
+            except Exception as exc:  # 로그 실패는 동작 영향 없게 swallow.
+                logger.warning("[매수 미체결 취소] trade_log 기록 실패 %s %s", code, exc)
 
     def register_realtime_stock(self, code):
         code = self.normalize_code(code)
@@ -2387,9 +3514,7 @@ def _log_dante_startup_banner():
     소프트 롤아웃 1일차에 운영자가 게이트/청산 임계값을 즉시 확인할 수 있도록 한다.
     """
     logger.info("=" * 78)
-    logger.info("[단테 추세전략] A급(0봉 돌파) 1차 추격(%.0f%%)→눌림 본진입(%.0f%%) | B급(1봉 돌파) 첫 눌림 일괄(%.0f%%)",
-                entry_strategy.DANTE_FIRST_ENTRY_RATIO * 100,
-                entry_strategy.DANTE_SECOND_ENTRY_RATIO * 100,
+    logger.info("[단테 추세전략] A급(0봉 돌파) 감시→첫 눌림 본진입(100%%) | B급(1봉 돌파) 첫 눌림 일괄(%.0f%%)",
                 entry_strategy.DANTE_GRADE_B_RATIO * 100)
     logger.info("[게이트] 체결강도 Hard≥%.0f / Soft%.0f~%.0f(추세상승필요) / 거래속도≥%.0f주초 / 스프레드≤%.2f%% / 관찰%.0f초 / 최소틱%d",
                 entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
@@ -2399,9 +3524,12 @@ def _log_dante_startup_banner():
                 entry_strategy.MAX_SPREAD_RATE * 100,
                 entry_strategy.DANTE_MIN_OBSERVATION_SECONDS,
                 entry_strategy.DANTE_MIN_TICKS)
-    logger.info("[가짜돌파/과열] 5분봉 윗꼬리≤%.0f%% / 시가대비≤+%.0f%% / BB55 거리≤+%.1f%%",
+    logger.info("[가짜돌파/과열] 5분봉 윗꼬리≤%.0f%% / 시가대비≤+%.0f%%(09:30~ %.0f%%, 11:00~ %.0f%%, 14:00~ %.0f%%; 눌림구조 필요) / BB55 거리≤+%.1f%%",
                 entry_strategy.MAX_UPPER_WICK_RATIO * 100,
                 entry_strategy.OVERHEATED_OPEN_RETURN * 100,
+                entry_strategy.OVERHEATED_OPEN_RETURN_MORNING * 100,
+                entry_strategy.OVERHEATED_OPEN_RETURN_MIDDAY * 100,
+                entry_strategy.OVERHEATED_OPEN_RETURN_LATE * 100,
                 entry_strategy.OVERHEATED_BB55_DISTANCE * 100)
     logger.info("[눌림] %.2f%% ~ %.2f%% (고점대비 -%.2f%% 초과 시 차단), 음봉%d~%d 후 양봉반전, 윈도우 %d초",
                 entry_strategy.PULLBACK_MIN_PCT * 100,
@@ -2457,6 +3585,7 @@ def main():
     kiwoom.check_open_positions()
     kiwoom.position_check_timer.start(POSITION_CHECK_INTERVAL_MS)
     kiwoom.sell_check_timer.start(SELL_CHECK_INTERVAL_MS)
+    kiwoom.buy_expiry_timer.start(BUY_ORDER_EXPIRY_CHECK_INTERVAL_MS)
 
     # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 — 조건검색 시작 전에 1회 등록.
     kiwoom.register_realtime_indices()

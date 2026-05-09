@@ -124,6 +124,37 @@ class PartialExitTests(unittest.TestCase):
         self.assertNotEqual(d.action, "partial_sell")
 
 
+class TrailingRemainderTests(unittest.TestCase):
+    def test_sells_remainder_when_giveback_exceeds_trailing_r(self):
+        pos = base_position(entry_price=10_000, partial_taken=True)
+        pos.highest_price = 10_405  # 405원 = 2.7R 고점
+        # 10_405 → 10_300 반납폭 105원 = 0.7R
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
+        self.assertEqual(d.action, "sell")
+        self.assertIn("잔량 트레일링", d.reason)
+        self.assertIn("0.70R", d.reason)
+
+    def test_does_not_apply_trailing_before_partial(self):
+        pos = base_position(entry_price=10_000, partial_taken=False)
+        pos.highest_price = 10_405
+        # 부분익절 전에는 고점 대비 0.7R 이상 반납해도 잔량 트레일링이 아니다.
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_295))
+        self.assertEqual(d.action, "hold")
+
+    def test_holds_when_highest_price_missing_after_partial(self):
+        pos = base_position(entry_price=10_000, partial_taken=True)
+        pos.highest_price = 0
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
+        self.assertEqual(d.action, "hold")
+
+    def test_holds_when_giveback_is_below_trailing_r(self):
+        pos = base_position(entry_price=10_000, partial_taken=True)
+        pos.highest_price = 10_360
+        # 60원 반납 = 0.4R 이므로 0.7R 트레일링 미달.
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
+        self.assertEqual(d.action, "hold")
+
+
 class TrendExitTests(unittest.TestCase):
     def _bars_with_5ma_below(self, *, current: int) -> List[MinuteBar]:
         ts = time.time() - 60 * 6
@@ -137,12 +168,19 @@ class TrendExitTests(unittest.TestCase):
         bars.append(make_bar(ts=ts, close=current))
         return bars
 
-    def test_sells_remainder_on_5ma_break_after_partial(self):
+    def test_sells_remainder_on_5ma_break_after_partial_when_below_1r(self):
+        pos = base_position(entry_price=10_000, partial_taken=True)
+        bars = self._bars_with_5ma_below(current=10_100)
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_100, minute_bars=bars))
+        self.assertEqual(d.action, "sell")
+        self.assertIn("MA", d.reason)
+        self.assertIn("+1R", d.reason)
+
+    def test_holds_remainder_on_5ma_break_after_partial_while_above_1r(self):
         pos = base_position(entry_price=10_000, partial_taken=True)
         bars = self._bars_with_5ma_below(current=10_290)
         d = xs.evaluate_exit(ctx(position=pos, current_price=10_290, minute_bars=bars))
-        self.assertEqual(d.action, "sell")
-        self.assertIn("MA", d.reason)
+        self.assertEqual(d.action, "hold")
 
     def test_does_not_apply_5ma_exit_before_partial(self):
         pos = base_position(entry_price=10_000, partial_taken=False)

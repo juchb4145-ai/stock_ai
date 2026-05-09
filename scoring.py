@@ -99,6 +99,14 @@ def round_up_to_tick(price: float) -> int:
     return int(math.ceil(price / unit) * unit)
 
 
+def round_down_to_tick(price: float) -> int:
+    """가격을 해당 호가 단위로 내림 처리한다."""
+    if price is None or price <= 0:
+        return 0
+    unit = tick_size(price)
+    return int(math.floor(price / unit) * unit)
+
+
 def gaussian_score(value: float, optimal: float, sigma: float) -> float:
     """optimal 부근에서 1, 멀어질수록 0에 가까워지는 종형 점수."""
     if sigma <= 0:

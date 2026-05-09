@@ -342,6 +342,7 @@ def write_markdown(
     path: str,
     target_date: str,
     intraday_summary: Optional[Dict[str, List[str]]] = None,
+    shadow_diagnostics_section: Optional[List[str]] = None,
 ) -> None:
     out: List[str] = []
     out.append(f"# {target_date} 매매 복기")
@@ -361,6 +362,10 @@ def write_markdown(
     out.append("## 다음 거래일 룰 추천")
     out.extend(_rule_lines(recs))
     out.append("")
+    if shadow_diagnostics_section:
+        out.append("## 거절 표본 사후 결과 (shadow 진단)")
+        out.extend(shadow_diagnostics_section)
+        out.append("")
     out.append("---")
     out.append("> 자동 생성. `data/reviews/rule_overrides_*.json` 의 proposed_overrides 는")
     out.append("> PR-A(dry_run) 적용기에서만 검토되며, 본 모듈은 자동 적용하지 않습니다.")
@@ -379,13 +384,49 @@ def write_reports(
     target_date: str,
     out_dir: str = REVIEW_DIR_DEFAULT,
     intraday_summary: Optional[Dict[str, List[str]]] = None,
+    include_shadow_diagnostics: bool = True,
+    shadow_csv: Optional[str] = None,
+    entry_csv: Optional[str] = None,
 ) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, f"trade_review_{target_date}.csv")
     md_path = os.path.join(out_dir, f"daily_review_{target_date}.md")
     json_path = os.path.join(out_dir, f"rule_overrides_{target_date}.json")
     write_trade_csv(trades, csv_path)
+
+    # shadow 진단 섹션 — 부수효과로 shadow_diagnostics_*.md 도 갱신.
+    # CSV 가 없거나 어떤 이유로 실패해도 daily_review 본문 작성을 막지 않는다.
+    shadow_section: Optional[List[str]] = None
+    shadow_paths: Dict[str, str] = {}
+    if include_shadow_diagnostics:
+        try:
+            from .shadow_diagnostics import build_daily_review_section
+        except ImportError:
+            shadow_section = None
+        else:
+            kwargs: Dict[str, object] = {"out_dir": out_dir}
+            if shadow_csv:
+                kwargs["shadow_csv"] = shadow_csv
+            if entry_csv:
+                kwargs["entry_csv"] = entry_csv
+            try:
+                shadow_section = build_daily_review_section(target_date, **kwargs)
+            except FileNotFoundError as exc:
+                shadow_section = [f"- shadow CSV 미발견: {exc}"]
+            except Exception as exc:  # 진단 실패해도 daily_review 자체는 살림
+                shadow_section = [f"- shadow 진단 실패: {exc}"]
+            else:
+                cum_md = os.path.join(out_dir, "shadow_diagnostics_all.md")
+                day_md = os.path.join(
+                    out_dir, f"shadow_diagnostics_{target_date.replace('-', '')}.md"
+                )
+                if os.path.exists(cum_md):
+                    shadow_paths["shadow_diagnostics_all"] = cum_md
+                if os.path.exists(day_md):
+                    shadow_paths["shadow_diagnostics_day"] = day_md
+
     write_markdown(trades, recs, md_path, target_date,
-                   intraday_summary=intraday_summary)
+                   intraday_summary=intraday_summary,
+                   shadow_diagnostics_section=shadow_section)
     write_rule_overrides_json(recs, json_path, target_date)
-    return {"csv": csv_path, "md": md_path, "json": json_path}
+    return {"csv": csv_path, "md": md_path, "json": json_path, **shadow_paths}

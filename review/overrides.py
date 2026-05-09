@@ -68,6 +68,14 @@ TARGET_WHITELIST: Dict[str, Dict[str, float]] = {
     "entry_strategy.OVERHEATED_OPEN_RETURN": {"min": 0.03, "max": 0.20},
     "entry_strategy.OVERHEATED_BB55_DISTANCE": {"min": 0.01, "max": 0.10},
     "entry_strategy.DANTE_FIRST_ENTRY_RATIO": {"min": 0.0,  "max": 0.50},
+    # entry_strategy — shadow release 후보(false-negative 완화) 대상
+    # 1회 by 폭은 review/shadow_rules.py:_GATE_RELEASE_MAPPING 에서 결정.
+    # 본 hard cap 은 어떤 룰(tighten/release) 도 절대 넘기지 못하는 안전 경계.
+    "entry_strategy.MIN_CHEJAN_STRENGTH_SOFT": {"min": 80.0,  "max": 200.0},
+    "entry_strategy.MIN_CHEJAN_STRENGTH_HARD": {"min": 100.0, "max": 200.0},
+    "entry_strategy.MIN_VOLUME_SPEED":         {"min": 200.0, "max": 1500.0},
+    # PULLBACK_MIN_PCT 의 hard cap max 는 PULLBACK_MAX_PCT(0.015) 와 충돌 회피.
+    "entry_strategy.PULLBACK_MIN_PCT":         {"min": 0.001, "max": 0.013},
     # exit_strategy
     "exit_strategy.EXIT_BE_R":           {"min": 0.30, "max": 1.50},
     "exit_strategy.EXIT_PARTIAL_R":      {"min": 1.00, "max": 3.50},

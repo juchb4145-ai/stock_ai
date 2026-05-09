@@ -78,6 +78,10 @@ DANTE_TRAINING_FIELDS = [
     "entry_price",
     "ratio",
     "reason",
+    "model_score",
+    "model_action",
+    "model_target",
+    "model_threshold",
 ] + list(scoring.DANTE_ENTRY_FEATURE_NAMES) + [
     "return_5m",
     "return_10m",
@@ -148,6 +152,10 @@ TRADE_LOG_FIELDS = [
     "score",
     "expected_return",
     "model_name",
+    "model_score",
+    "model_action",
+    "model_target",
+    "model_threshold",
     "reason",
     "hold_seconds",
     "profit_rate",
@@ -180,6 +188,30 @@ def _attach_market_meta(row: Dict[str, Any], ctx: Any, decision: Any) -> None:
             row[key] = ""
     row["market_gate_action"] = getattr(decision, "market_gate_action", "") or ""
     row["market_gate_reason"] = getattr(decision, "market_gate_reason", "") or ""
+
+
+def _ensure_csv_header(path: str, fieldnames: list, *, log_label: str) -> None:
+    os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+        return
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        if all(field in existing_fields for field in fieldnames):
+            return
+        rows = list(reader)
+    backup_path = "{}.bak_{}".format(path, time.strftime("%Y%m%d%H%M%S"))
+    os.replace(path, backup_path)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for old_row in rows:
+            row = {field: old_row.get(field, "") for field in fieldnames}
+            writer.writerow(row)
+    logger.info("[%s] 헤더 확장: backup=%s", log_label, backup_path)
 
 
 def _is_regular_dante_capture_session(ts: float) -> bool:
@@ -321,12 +353,7 @@ class TrainingRecorderMixin:
     def ensure_dante_training_data_file(self) -> None:
         if not DANTE_TRAINING_DATA_ENABLED:
             return
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(DANTE_TRAINING_CSV):
-            return
-        with open(DANTE_TRAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=DANTE_TRAINING_FIELDS)
-            writer.writeheader()
+        _ensure_csv_header(DANTE_TRAINING_CSV, DANTE_TRAINING_FIELDS, log_label="dante_entry_training")
 
     def append_dante_training_row(self, row: Dict[str, Any]) -> None:
         if not DANTE_TRAINING_DATA_ENABLED:
@@ -399,6 +426,10 @@ class TrainingRecorderMixin:
             "entry_price": int(current_price),
             "ratio": float(getattr(decision, "ratio", 0.0)),
             "reason": getattr(decision, "reason", ""),
+            "model_score": getattr(decision, "model_score", ""),
+            "model_action": getattr(decision, "model_action", ""),
+            "model_target": getattr(decision, "model_target", ""),
+            "model_threshold": getattr(decision, "model_threshold", ""),
         }
         row.update(features)
         for horizon in DANTE_TRAINING_LABEL_HORIZONS:
@@ -492,12 +523,7 @@ class TrainingRecorderMixin:
     def ensure_dante_shadow_training_data_file(self) -> None:
         if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
             return
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(DANTE_SHADOW_TRAINING_CSV):
-            return
-        with open(DANTE_SHADOW_TRAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=DANTE_SHADOW_TRAINING_FIELDS)
-            writer.writeheader()
+        _ensure_csv_header(DANTE_SHADOW_TRAINING_CSV, DANTE_SHADOW_TRAINING_FIELDS, log_label="dante_shadow_training")
 
     def append_dante_shadow_training_row(self, row: Dict[str, Any]) -> None:
         if not DANTE_SHADOW_TRAINING_DATA_ENABLED:
@@ -604,6 +630,10 @@ class TrainingRecorderMixin:
             "entry_price": int(current_price),
             "ratio": 0.0,
             "reason": getattr(decision, "reason", ""),
+            "model_score": getattr(decision, "model_score", ""),
+            "model_action": getattr(decision, "model_action", ""),
+            "model_target": getattr(decision, "model_target", ""),
+            "model_threshold": getattr(decision, "model_threshold", ""),
         }
         row.update(features)
         for horizon in DANTE_TRAINING_LABEL_HORIZONS:
@@ -696,12 +726,7 @@ class TrainingRecorderMixin:
     # ------------------------------------------------------------------
 
     def ensure_trade_log_file(self) -> None:
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(TRADE_LOG_CSV):
-            return
-        with open(TRADE_LOG_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
-            writer.writeheader()
+        _ensure_csv_header(TRADE_LOG_CSV, TRADE_LOG_FIELDS, log_label="trade_log")
 
     def append_trade_log(self, event: str, **kwargs: Any) -> None:
         self.ensure_trade_log_file()

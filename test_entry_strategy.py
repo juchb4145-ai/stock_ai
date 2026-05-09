@@ -135,11 +135,12 @@ def make_market_snap(*, regime: str, pct: float = 0.0) -> ms.MarketSnapshot:
 
 
 class FirstEntryTests(unittest.TestCase):
-    def test_ready_when_all_gates_pass(self):
+    def test_starts_a_grade_watch_when_all_gates_pass(self):
         ctx = build_ctx()
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
-        self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
+        self.assertEqual(d.status, "wait")
+        self.assertAlmostEqual(d.ratio, 0.0)
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
 
     def test_blocks_on_excessive_spread(self):
         ctx = build_ctx(spread_rate=0.02)  # 2% 스프레드
@@ -184,7 +185,7 @@ class FirstEntryTests(unittest.TestCase):
         self.assertEqual(d.status, "wait")
         self.assertIn("추세", d.reason)
 
-    def test_passes_when_above_5min_bb55(self):
+    def test_starts_watch_when_above_5min_bb55(self):
         ind = FiveMinIndicators(
             bb_upper_45_2=10_500,
             bb_upper_55_2=10_400,
@@ -208,7 +209,8 @@ class FirstEntryTests(unittest.TestCase):
             open_return=0.02,
         )
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
 
     def test_blocks_if_position_already_entered(self):
         pos = Position(code="000001", entry_stage=1, entry_price=10_000)
@@ -223,14 +225,14 @@ class FirstEntryTests(unittest.TestCase):
         self.assertIn("0봉/1봉", d.reason)
         self.assertEqual(d.reason_code, es.GATE_NO_BREAKOUT)
 
-    def test_a_grade_ready_with_grade_field(self):
+    def test_a_grade_watch_with_grade_field(self):
         ctx = build_ctx(is_breakout_zero_bar=True, is_breakout_prev_bar=False)
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.status, "wait")
         self.assertEqual(d.grade, "A")
-        self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
+        self.assertAlmostEqual(d.ratio, 0.0)
         self.assertEqual(d.stage, 1)
-        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
 
     def test_blocks_on_fake_breakout_upper_wick(self):
         ctx = build_ctx(upper_wick_ratio_zero_bar=0.55)  # > MAX_UPPER_WICK_RATIO
@@ -256,14 +258,16 @@ class FirstEntryTests(unittest.TestCase):
         # 120 이상이면 추세 미상이어도 통과
         ctx = build_ctx(chejan_strength=125.0, chejan_strength_history=[])
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
 
     def test_chejan_strength_soft_with_rising_history_passes(self):
         # 100~120 사이 + 뒷 절반 평균이 앞 절반보다 크고 100 이상이면 통과
         history = [101.0, 105.0, 108.0, 112.0, 115.0, 118.0]
         ctx = build_ctx(chejan_strength=115.0, chejan_strength_history=history)
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
 
     def test_chejan_strength_soft_without_rising_blocks(self):
         # 100~120 사이지만 추세 평탄/하락이면 wait
@@ -364,6 +368,77 @@ class SecondEntryTests(unittest.TestCase):
         self.assertAlmostEqual(d.ratio, es.DANTE_SECOND_ENTRY_RATIO)
         self.assertEqual(d.reason_code, es.READY_AGRADE_SECOND)
 
+    def test_a_grade_watch_enters_full_size_on_first_pullback(self):
+        bars = self._bars_with_pullback(neg_count=2)
+        ctx = build_ctx(position=None, current_price=bars[-1].close, minute_bars=bars)
+        d = es.evaluate_a_grade_watch_entry(
+            ctx,
+            breakout_high=10_300,
+            watch_started_at=time.time() - 120,
+            pullback_window_deadline=time.time() + 600,
+        )
+        self.assertEqual(d.status, "ready")
+        self.assertAlmostEqual(d.ratio, 1.0)
+        self.assertEqual(d.stage, 2)
+        self.assertEqual(d.grade, "A")
+        self.assertEqual(d.reason_code, es.READY_AGRADE_SECOND)
+
+    def test_reentry_ready_after_deep_pullback_and_entry_recovery(self):
+        ts = time.time() - 60 * 5
+        bars = [
+            make_bar(ts=ts, open_=10_000, high=10_400, low=10_000, close=10_350),
+            make_bar(ts=ts + 60, open_=10_350, high=10_360, low=10_100, close=10_120),
+            make_bar(ts=ts + 120, open_=10_120, high=10_180, low=10_000, close=10_040),
+            make_bar(ts=ts + 180, open_=10_040, high=10_240, low=10_030, close=10_220),
+        ]
+        ctx = build_ctx(
+            position=None,
+            current_price=10_220,
+            minute_bars=bars,
+            chejan_strength=130,
+            volume_speed=1_000,
+        )
+        watch = {
+            "deadline": time.time() + 600,
+            "entry_price": 10_200,
+            "exit_price": 10_300,
+            "breakout_high": 10_400,
+            "pullback_low": 10_000,
+        }
+
+        d = es.evaluate_reentry_after_exit(ctx, watch)
+
+        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.stage, 2)
+        self.assertEqual(d.reason_code, es.READY_REENTRY_PULLBACK)
+
+    def test_reentry_waits_until_entry_price_recovery(self):
+        ts = time.time() - 60 * 3
+        bars = [
+            make_bar(ts=ts, open_=10_300, high=10_350, low=10_050, close=10_080),
+            make_bar(ts=ts + 60, open_=10_080, high=10_120, low=10_000, close=10_040),
+            make_bar(ts=ts + 120, open_=10_040, high=10_120, low=10_030, close=10_100),
+        ]
+        ctx = build_ctx(
+            position=None,
+            current_price=10_100,
+            minute_bars=bars,
+            chejan_strength=130,
+            volume_speed=1_000,
+        )
+        watch = {
+            "deadline": time.time() + 600,
+            "entry_price": 10_200,
+            "exit_price": 10_300,
+            "breakout_high": 10_400,
+            "pullback_low": 10_000,
+        }
+
+        d = es.evaluate_reentry_after_exit(ctx, watch)
+
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_STAGE2_NO_REVERSAL)
+
     def test_waits_when_pullback_too_shallow(self):
         pos = self._position_after_stage1(breakout_high=10_300)
         bars = self._bars_with_pullback(neg_count=2)
@@ -388,13 +463,25 @@ class SecondEntryTests(unittest.TestCase):
         # 음봉 없이 곧장 진행 (현재봉도 양봉이지만 직전이 양봉)
         ts = time.time() - 60
         bars = [
-            make_bar(ts=ts, open_=10_200, high=10_280, low=10_180, close=10_270),
-            make_bar(ts=ts + 60, open_=10_270, high=10_300, low=10_250, close=10_290),
+            make_bar(ts=ts, open_=10_200, high=10_280, low=10_270, close=10_275),
+            make_bar(ts=ts + 60, open_=10_275, high=10_300, low=10_270, close=10_290),
         ]
         ctx = build_ctx(position=pos, current_price=10_220, minute_bars=bars)
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("음봉", d.reason)
+
+    def test_ready_on_positive_current_bar_after_recent_low_touch(self):
+        pos = self._position_after_stage1(breakout_high=10_300)
+        ts = time.time() - 60
+        bars = [
+            make_bar(ts=ts, open_=10_220, high=10_285, low=10_205, close=10_270),
+            make_bar(ts=ts + 60, open_=10_210, high=10_290, low=10_180, close=10_260),
+        ]
+        ctx = build_ctx(position=pos, current_price=10_260, minute_bars=bars)
+        d = es.evaluate_second_entry(ctx)
+        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.reason_code, es.READY_AGRADE_SECOND)
 
     def test_blocks_when_window_expired(self):
         pos = self._position_after_stage1(breakout_high=10_300)
@@ -430,8 +517,8 @@ class MarketDryRunGateTests(unittest.TestCase):
         # ctx.market_state=None 시 neutral fallback → action=dry_run_allow
         ctx = build_ctx()
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
-        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
         self.assertEqual(d.market_regime, ms.REGIME_NEUTRAL)
         self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
         self.assertEqual(d.market_gate_reason, "")
@@ -448,21 +535,22 @@ class MarketDryRunGateTests(unittest.TestCase):
         snap = make_market_snap(regime=ms.REGIME_STRONG, pct=0.01)
         ctx = build_ctx(market_state=snap)
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
         self.assertEqual(d.market_regime, ms.REGIME_STRONG)
         self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
 
-    def test_weak_blocks_a_grade_chase_only_but_status_unchanged(self):
+    def test_weak_allows_a_grade_watch_because_no_chase_buy(self):
         # weak 매크로 + A급 0봉 추격 ready → action=block_chase_only, status 는 그대로 ready
         snap = make_market_snap(regime=ms.REGIME_WEAK, pct=-0.008)
         ctx = build_ctx(market_state=snap)
         d = es.evaluate_first_entry(ctx)
-        self.assertEqual(d.status, "ready")
-        self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
-        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        self.assertEqual(d.status, "wait")
+        self.assertAlmostEqual(d.ratio, 0.0)
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
         self.assertEqual(d.market_regime, ms.REGIME_WEAK)
-        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_CHASE_ONLY)
-        self.assertEqual(d.market_gate_reason, es.MARKET_GATE_WEAK_CHASE_BLOCK)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+        self.assertEqual(d.market_gate_reason, "")
 
     def test_weak_allows_b_grade_pullback(self):
         # weak 매크로 + B급 첫 눌림 ready → action=allow (chase 가 아니므로)
@@ -497,14 +585,14 @@ class MarketDryRunGateTests(unittest.TestCase):
         self.assertEqual(d.reason_code, es.GATE_SPREAD)
         self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
 
-    def test_risk_off_marks_block_all_for_a_grade_ready(self):
+    def test_risk_off_marks_block_all_for_a_grade_watch(self):
         snap = make_market_snap(regime=ms.REGIME_RISK_OFF, pct=-0.02)
         ctx = build_ctx(market_state=snap)
         d = es.evaluate_first_entry(ctx)
         # status/ratio/reason_code 는 변경 없음
-        self.assertEqual(d.status, "ready")
-        self.assertAlmostEqual(d.ratio, es.DANTE_FIRST_ENTRY_RATIO)
-        self.assertEqual(d.reason_code, es.READY_AGRADE_FIRST)
+        self.assertEqual(d.status, "wait")
+        self.assertAlmostEqual(d.ratio, 0.0)
+        self.assertEqual(d.reason_code, es.WATCH_AGRADE_BREAKOUT)
         # 메타만 block_all
         self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
         self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)

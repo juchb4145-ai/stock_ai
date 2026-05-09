@@ -226,9 +226,18 @@
 
 #### 5.0.2 `data/dante_shadow_training.csv` — wait/blocked 표본 (false-negative 측정)
 
-게이트가 거른 후보를 같은 horizon 으로 사후 라벨링. 첫 컬럼 `decision_status` 가 `"wait"` / `"blocked"`. 데이터 부족(틱/관찰시간/5분봉 캐시) 으로 거른 표본은 의미가 없어 **자동 제외** 됩니다 — `wait/blocked` 사유가 *전략 임계 미달* 인 표본만 캡처. cooldown 90초.
+게이트가 거른 후보를 같은 horizon 으로 사후 라벨링. 첫 두 컬럼은 `decision_status` (`"wait"` / `"blocked"`) + `reason_code` (`GATE_*` / `READY_*` enum). 데이터 부족(틱/관찰시간/5분봉 캐시) 으로 거른 표본은 의미가 없어 **자동 제외** 됩니다 — `wait/blocked` 사유가 *전략 임계 미달* 인 표본만 캡처. cooldown 90초.
 
-분석 시 같은 분석 파이프라인(예: 정책 재현) 에 두 CSV 를 함께 입력하면 "거른 종목 vs 통과 종목" 의 도달률 비교가 가능합니다. 헤더는 `[decision_status] + DANTE_TRAINING_FIELDS` 로 호환.
+진단은 `review/shadow_diagnostics.py` 에서 담당합니다. `python -m review.shadow_diagnostics` 로 단독 실행 가능하며, `analyze_today.py` (= `review.report.write_reports`) 가 매일 자동 호출해 다음 두 산출물을 갱신합니다:
+
+- `data/reviews/shadow_diagnostics_YYYYMMDD.md` — 그날 라벨링 완료 표본 통계
+- `data/reviews/shadow_diagnostics_all.md` — 전체 누적 통계 (reason_code 별 reached_1r% / hit_stop% / avg max_25m + ready 비교 행)
+
+`daily_review_*.md` 본문에는 이 누적 통계의 요약 (의심 게이트 Top N) 만 짧게 들어갑니다. 의심 판정 임계는 `n ≥ 5` 와 `reached_1r% ≥ 30%` (모듈 상수 `MIN_N_FOR_SUSPECT` / `SUSPECT_REACHED_1R_RATIO` 로 조정).
+
+`review/shadow_rules.py` 는 위 진단의 통계를 받아 *자동 적용 후보* (`release_overtight_gate__<GATE_*>`) 를 발행합니다. 이는 `review/rolling.py` 가 매일 만드는 `data/reviews/rule_candidates_YYYYMMDD.json` 의 `candidates` 배열에 `block_fake_breakout` 등 기존 tighten 후보와 함께 들어갑니다. release 후보는 ① `n ≥ 8` ② `reached_1r ≥ 30%` ③ `hit_stop ≤ 50%` ④ `_GATE_RELEASE_MAPPING` 에 명시 등록 — 4중 안전장치를 모두 통과해야 발행되며, 같은 target 을 tighten 후보가 동시에 건드리면 자동으로 `reason_no_apply="release_blocked_by_tighten:<target>"` 마킹됩니다 (`allow_auto_apply=False` 유지). 누적 통계 전체는 `rolling_summary_YYYYMMDD.json` 의 `shadow_evidence` 섹션에 노출되어 매핑 미등록 의심 게이트도 운영자가 즉시 식별할 수 있습니다.
+
+분석 시 같은 분석 파이프라인(예: 정책 재현) 에 두 CSV 를 함께 입력하면 "거른 종목 vs 통과 종목" 의 도달률 비교가 가능합니다. 헤더는 `[decision_status, reason_code] + DANTE_TRAINING_FIELDS` 로 호환되며, 옛 헤더로 만들어진 CSV 는 `python -m review.shadow_diagnostics --migrate-header` 로 안전하게 표준화할 수 있습니다.
 
 #### 5.0.3 `data/portfolio_state.json` — 장중 크래시 복원 영속화
 

@@ -113,9 +113,13 @@ python analyze_today.py 2026-04-30
   - csv:  data\reviews\trade_review_2026-04-30.csv
   - md:   data\reviews\daily_review_2026-04-30.md
   - json: data\reviews\rule_overrides_2026-04-30.json
+  - shadow_diagnostics_all: data\reviews\shadow_diagnostics_all.md
+  - shadow_diagnostics_day: data\reviews\shadow_diagnostics_20260430.md
 ```
 
 매크로 JSON 이 없으면 "시장 컨텍스트: 데이터 없음 (market_context_*.json 미작성)" 으로 표시되고 trade_review 의 매크로 컬럼은 빈 값으로 남습니다. 분석 자체는 계속 진행됩니다.
+
+`shadow_diagnostics_*` 두 파일은 `data/dante_shadow_training.csv` (게이트가 거른 wait/blocked 표본) 의 25분 사후 라벨을 reason_code 별로 집계한 진단 리포트입니다. `daily_review_*.md` 의 **거절 표본 사후 결과 (shadow 진단)** 섹션이 이 결과의 요약본을 그대로 노출합니다. 단독 실행은 `python -m review.shadow_diagnostics` (옵션: `--date YYYY-MM-DD`, `--migrate-header`).
 
 이 단계 후에는 `data/reviews/daily_review_2026-04-30.md` 를 직접 열어 **사람이 먼저 한 번 읽어 보는 것이 권장**됩니다. 그날 매매가 정상이었는지, 분류가 합리적인지 1분만 보면 확인할 수 있습니다.
 
@@ -133,6 +137,7 @@ python -m review.rolling 2026-04-30
 | `--windows 5,10,20` | 윈도우 변경 (기본 `5,10,20`)                     |
 | `--reviews-dir`     | trade_review_*.csv 위치 (기본 `data/reviews`) |
 | `--no-write`        | JSON 출력 없이 stdout 요약만                     |
+| `--no-shadow`       | shadow 트랙(거절 표본) 평가/출력 건너뛰기 (디버그용)        |
 
 
 성공 출력 예시:
@@ -143,14 +148,27 @@ python -m review.rolling 2026-04-30
   [10d] dates=10건 trades=58 avg_r=-0.02R win=43% pf=0.95 confidence=high
   [20d] dates=20건 trades=110 avg_r=-0.01R win=44% pf=0.97 confidence=high
   - 룰 후보 3건 (모두 auto_apply=false):
-      · break_even_cut    | windows=[5, 10, 20] | confidence=high   | n=42 | consistent=True
-      · take_profit_faster| windows=[10, 20]    | confidence=medium | n=15 | consistent=False
-      · wait_for_pullback | windows=[10, 20]    | confidence=medium | n=22 | consistent=False
+      - break_even_cut    | windows=[5, 10, 20] | confidence=high   | n=42 | consistent=True
+      - take_profit_faster| windows=[10, 20]    | confidence=medium | n=15 | consistent=False
+      - wait_for_pullback | windows=[10, 20]    | confidence=medium | n=22 | consistent=False
+  - shadow 트랙: 라벨링 198건, 의심 게이트 6개, release 후보 0개
+      - 매핑 미등록 의심 게이트: GATE_CHEJAN_SOFT (n=5, 1R=100%)
+      - 매핑 미등록 의심 게이트: GATE_STAGE2_NO_REVERSAL (n=7, 1R=85%)
+      - 매핑 미등록 의심 게이트: GATE_STAGE2_PULLBACK_SHALLOW (n=9, 1R=66%)
   - summary:    data\reviews\rolling_summary_20260430.json
   - candidates: data\reviews\rule_candidates_20260430.json
 ```
 
 `rolling_summary_*.json` 의 각 윈도우는 `n_total` (전체 거래 수) 와 `n_candidate` (v2 분류기 거래 수 — confidence 결정에 사용) 두 가지를 둡니다. v1 fallback 비율을 보려면 `by_classifier_version` 키 확인.
+
+`rolling_summary_*.json` 의 `shadow_evidence` 섹션은 `data/dante_shadow_training.csv` (게이트가 거른 wait/blocked 표본) 의 reason_code 별 25분 라벨 통계입니다. 자동 적용 후보(`release_overtight_gate__<GATE_*>`)는 다음 4중 안전장치를 모두 통과한 reason_code 만 발행되며 (`review/shadow_rules.py` 참고):
+
+- `n ≥ MIN_N_FOR_RELEASE` (=8)
+- `reached_1r ≥ SUSPECT_REACHED_1R_RATIO` (=30%)
+- `hit_stop ≤ MAX_HIT_STOP_FOR_RELEASE` (=50%, 게이트가 결국 잘 거른 표본 제외)
+- `_GATE_RELEASE_MAPPING` 에 명시적으로 등록된 GATE 이고 화이트리스트 target 만
+
+같은 target 을 tighten 룰(예: `block_fake_breakout`)이 동시에 건드리면 release 후보는 자동으로 `reason_no_apply="release_blocked_by_tighten:<target>"` 로 마킹돼 PR-A 적용기에서 setattr 되지 않습니다 (`allow_auto_apply=False` 유지). 새 reason_code 매핑을 추가하려면 `review/shadow_rules.py` 의 `_GATE_RELEASE_MAPPING` 에 `_GateRelease` 항목을 명시적으로 등록하세요.
 
 ### 단계 5 — dry_run 으로 검토
 
