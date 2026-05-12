@@ -55,6 +55,20 @@ TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
 TRAINING_SAMPLE_COOLDOWN_SECONDS = 30
 TRAINING_LABEL_HORIZONS = (300, 600, 1200)
 
+# === 현재 운용 전략/조건식 로그 메타 ===
+TRADE_LOG_STRATEGY_NAME = "퀀트조건식"
+TRADE_LOG_RULE_VERSION = "quant_condition_v1"
+TRADE_LOG_CONDITION_NAME = "퀀트조건식"
+TRADE_LOG_CONDITION_FORMULA = "A and J and N and P and S and T"
+TRADE_LOG_CONDITION_RULES = (
+    "A: [5분]0봉전 Bollinger Band(20,2) 종가 상한선 상향돌파 | "
+    "J: 체결강도 110.0% 이상 1000.0% 이하 | "
+    "N: [일]거래대금 5000 이상 | "
+    "P: [일]1봉전 대비 0봉전 거래량 비율 200% 이상 | "
+    "S: [5분]0봉전 이평이격도(종가, 20) 98%~103% | "
+    "T: [일]1봉전 대비 0봉전 주가등락률 15% 이하"
+)
+
 # === 단테 학습 트랙 (Phase A) ===
 DANTE_TRAINING_DATA_ENABLED = True
 DANTE_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_entry_training.csv")
@@ -135,6 +149,11 @@ TRAINING_ENTRY_FIELDS = [
 TRADE_LOG_FIELDS = [
     "logged_at",
     "event",
+    "strategy_name",
+    "rule_version",
+    "condition_name",
+    "condition_formula",
+    "condition_rules",
     "code",
     "name",
     "side",
@@ -156,7 +175,12 @@ TRADE_LOG_FIELDS = [
     "model_action",
     "model_target",
     "model_threshold",
+    "reason_code",
     "reason",
+    "plan_source",
+    "capture_price",
+    "pullback_pct",
+    "chejan_strength",
     "hold_seconds",
     "profit_rate",
     "message",
@@ -413,6 +437,9 @@ class TrainingRecorderMixin:
             is_breakout_prev_bar=ctx.is_breakout_prev_bar,
             upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
             open_return=ctx.open_return,
+            atr_5m_pct=getattr(ctx, "atr_5m_pct", 0.0) or 0.0,
+            intraday_vwap=getattr(ctx, "intraday_vwap", 0.0) or 0.0,
+            pullback_low_after_high=getattr(ctx, "pullback_low_after_high", 0) or 0,
         )
 
         sample_id = uuid.uuid4().hex
@@ -615,6 +642,9 @@ class TrainingRecorderMixin:
             is_breakout_prev_bar=ctx.is_breakout_prev_bar,
             upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
             open_return=ctx.open_return,
+            atr_5m_pct=getattr(ctx, "atr_5m_pct", 0.0) or 0.0,
+            intraday_vwap=getattr(ctx, "intraday_vwap", 0.0) or 0.0,
+            pullback_low_after_high=getattr(ctx, "pullback_low_after_high", 0) or 0,
         )
 
         sample_id = uuid.uuid4().hex
@@ -733,6 +763,11 @@ class TrainingRecorderMixin:
         row: Dict[str, Any] = {field: "" for field in TRADE_LOG_FIELDS}
         row["logged_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         row["event"] = event
+        row["strategy_name"] = TRADE_LOG_STRATEGY_NAME
+        row["rule_version"] = TRADE_LOG_RULE_VERSION
+        row["condition_name"] = TRADE_LOG_CONDITION_NAME
+        row["condition_formula"] = TRADE_LOG_CONDITION_FORMULA
+        row["condition_rules"] = TRADE_LOG_CONDITION_RULES
         for key, value in kwargs.items():
             if key in row:
                 row[key] = value

@@ -39,6 +39,10 @@ from training_recorder import (
     DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS,
     DANTE_SHADOW_TRAINING_FIELDS,
     ENTRY_FEATURE_NAMES,
+    TRADE_LOG_CONDITION_FORMULA,
+    TRADE_LOG_CONDITION_RULES,
+    TRADE_LOG_RULE_VERSION,
+    TRADE_LOG_STRATEGY_NAME,
     TRAINING_ENTRY_FIELDS,
     TRADE_LOG_FIELDS,
 )
@@ -46,18 +50,17 @@ from training_recorder import (
 
 logger = setup_logging()
 
-# ===== 단테조건식 추세전략 =====
-# 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 단테조건식.xls 의 본 조건은
-# 5분봉 BB(45,2)/BB(55,2) 및 Envelope(13,2.5)/Envelope(22,2.5) 동시 상향돌파 +
-# 일거래량 5만 + 체결강도 100% 게이트로 구성된다. 영웅문에서 저장된 실제 이름이
-# 다르다면 이 한 줄만 수정한다.
-CONDITION_NAME = "단테떡상이"
+# ===== 퀀트조건식 눌림 전략 =====
+# 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 조건식 자체의 A/J/N/P/S/T
+# 필터는 영웅문 조건검색이 담당하고, 이 프로그램은 편입 후 실시간으로 포착가 대비
+# -1.5% 눌림 + 체결강도 100% 이상만 진입 트리거로 확인한다.
+CONDITION_NAME = "퀀트조건식"
 CONDITION_SCREEN_NO = "0150"
 REALTIME_SCREEN_NO = "0160"
 # KOSPI/KOSDAQ 업종지수 실시간용 별도 스크린(종목 실시간과 충돌 방지).
 INDEX_REALTIME_SCREEN_NO = "0170"
 ORDER_SCREEN_NO = "0001"
-# 조건식 편입 종목 전체를 AI 후보평가 대상으로 올리고, 단테 룰은 feature/가드레일로 사용한다.
+# 조건식 편입 종목 전체를 AI 후보평가 대상으로 올리고, 퀀트조건식 룰은 feature/가드레일로 사용한다.
 AI_SERVER_ENABLED = True
 AI_SERVER_URL = "http://127.0.0.1:8000"
 AI_SERVER_TIMEOUT_SECONDS = 0.35
@@ -80,6 +83,28 @@ BUY_PRICE_MARGIN_RATE = 1.005
 RISK_PER_TRADE_RATE = 0.005
 MAX_PORTFOLIO_RISK_RATE = 0.02
 MIN_ORDER_CASH = 50_000
+SAFE_PULLBACK_MIN_DROP_PCT = 0.015
+SAFE_PULLBACK_MAX_DROP_PCT = 0.999
+SAFE_PULLBACK_RUNAWAY_PCT = 0.030
+SAFE_PULLBACK_VOLUME_RATIO_MAX = 0.30
+SAFE_PULLBACK_CASH_RATE = 0.10
+SAFE_PULLBACK_FIRST_ENTRY_RATIO = 0.50
+SAFE_PULLBACK_MAX_POSITIONS = 3
+SAFE_PULLBACK_STOP_LOSS_PCT = 0.015
+SAFE_PULLBACK_TAKE_PROFIT_PCT = 0.020
+SAFE_PULLBACK_TARGET_NEAR_PCT = 0.003
+SAFE_PULLBACK_ASK_BID_RATIO_MIN = 2.0
+SAFE_PULLBACK_BIG_BUY_MULT = 3.0
+SAFE_PULLBACK_BIG_BUY_MIN_QTY = 1_000
+SAFE_PULLBACK_SECOND_WINDOW_SECONDS = 10 * 60
+SAFE_PULLBACK_SECOND_MIN_REBOUND_PCT = 0.003
+SAFE_PULLBACK_SECOND_MAX_CHASE_PCT = 0.012
+QUANT_ENTRY_PULLBACK_PCT = SAFE_PULLBACK_MIN_DROP_PCT
+QUANT_ENTRY_CHEJAN_STRENGTH_MIN = 100.0
+QUANT_TAKE_PROFIT_PCT = SAFE_PULLBACK_TAKE_PROFIT_PCT
+QUANT_STOP_LOSS_PCT = SAFE_PULLBACK_STOP_LOSS_PCT
+QUANT_PLAN_SOURCE = "quant_condition_pullback"
+QUANT_GRADE = "QUANT"
 ENTRY_PLAN_EXPIRY_SECONDS = 45
 # 매수 미체결 만료 점검 주기 (ms). 45초 expiry 와 ±2~5초 정밀도면 충분.
 BUY_ORDER_EXPIRY_CHECK_INTERVAL_MS = 5000
@@ -108,9 +133,10 @@ ENTRY_PLAN_PULLBACK_LOOKBACK = 15
 ENTRY_PLAN_STOP_LOOKBACK = 8
 VOLUME_SPEED_COOLDOWN_TRIGGER = 3
 VOLUME_SPEED_COOLDOWN_SECONDS = 5 * 60
-AI_CANDIDATE_PROMOTION_ENABLED = True
+MODEL_ASSIST_ONLY = True
+AI_CANDIDATE_PROMOTION_ENABLED = False
 AI_CANDIDATE_MIN_SCORE = 0.62
-AI_CANDIDATE_WATCH_ENABLED = True
+AI_CANDIDATE_WATCH_ENABLED = False
 AI_CANDIDATE_WATCH_SECONDS = 20 * 60
 AI_CANDIDATE_WATCH_RECHECK_INTERVAL_SECONDS = 30
 AI_CANDIDATE_WATCH_MAX_CODES = 30
@@ -119,6 +145,12 @@ RISK_TOO_WIDE_WATCH_SECONDS = 20 * 60
 RISK_TOO_WIDE_RECHECK_INTERVAL_SECONDS = 30
 RISK_TOO_WIDE_MAX_CODES = 30
 RISK_TOO_WIDE_MIN_MODEL_SCORE = 0.70
+PULLBACK_RECOVERY_WATCH_REASON_CODES = {
+    entry_strategy.GATE_STAGE2_PULLBACK_DEEP,
+    entry_strategy.GATE_BGRADE_PULLBACK_DEEP,
+    entry_strategy.GATE_STAGE2_VWAP_LOST,
+    entry_strategy.GATE_BGRADE_VWAP_LOST,
+}
 MIN_EXPECTED_RETURN = 0.006
 # 비용 반영 순기대수익률 기준(매수/목표가/로그에 사용)
 ESTIMATED_BUY_FEE_RATE = 0.00015
@@ -135,9 +167,15 @@ MIN_NET_EXPECTED_RETURN = 0.006
 DYNAMIC_MIN_NET_RETURN_PERCENTILE = 0.5
 DYNAMIC_MIN_NET_RETURN_CEILING = 0.015
 # 매수 가능 시간(장 마감 직전 강제 청산 시점은 OPENING_FORCE_EXIT 동일).
-OPENING_BUY_START = 90500
-OPENING_BUY_END = 143000
-OPENING_FORCE_EXIT = 151500
+TIME_FILTER_MORNING_START = 90000
+TIME_FILTER_MORNING_END = 100000
+TIME_FILTER_MIDDAY_END = 140000
+TIME_FILTER_CLOSING_END = 152000
+TIME_FILTER_CLOSING_MIN_TURNOVER = 10_000_000_000
+TIME_FILTER_CLOSING_TOP_RANK = 10
+OPENING_BUY_START = TIME_FILTER_MORNING_START
+OPENING_BUY_END = TIME_FILTER_CLOSING_END
+OPENING_FORCE_EXIT = TIME_FILTER_CLOSING_END
 # 실시간 틱 버퍼 크기 / 최소 틱 수 (단테 1차 게이트가 사용)
 OPENING_MIN_TICKS = entry_strategy.DANTE_MIN_TICKS
 OPENING_TICK_LIMIT = 40
@@ -148,9 +186,9 @@ OPENING_STOP_LOSS_RATE = -exit_strategy.R_UNIT_PCT  # -1R
 OPENING_MAX_HOLD_SECONDS = exit_strategy.EXIT_TIME_LIMIT_SECONDS                         
 # 동시 종목 수는 리스크 예산 기반 sizing 의 안전 상한이다. 실제 진입 가능 여부는
 # RISK_PER_TRADE_RATE / MAX_PORTFOLIO_RISK_RATE 가 결정한다.
-MAX_CONCURRENT_POSITIONS = 6
+MAX_CONCURRENT_POSITIONS = SAFE_PULLBACK_MAX_POSITIONS
 MAX_DAILY_BUY_COUNT = 20
-CONDITION_PROCESS_INTERVAL_MS = 2000
+CONDITION_PROCESS_INTERVAL_MS = 1000
 CONDITION_COOLDOWN_SECONDS = 60
 WAIT_LOG_COOLDOWN_SECONDS = 30
 REALTIME_TICK_WAIT_TIMEOUT_SECONDS = 60
@@ -203,6 +241,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.realtime_registered_codes = set()
         self.realtime_code_screens = {}
         self.realtime_ticks = {}
+        self.orderbook_snapshots = {}
         self.condition_registered_at = {}
         self.pending_training_samples = {}
         self.last_training_sample_at = {}
@@ -213,6 +252,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # ready 표본과 같은 풀에 들어가지 않도록 별도 dict + 별도 CSV 로 분리.
         self.pending_dante_shadow_samples = {}
         self.last_dante_shadow_sample_at = {}
+        self.monitoring_dict = {}
         self.dante_a_watchlist = {}
         self.dante_reentry_watchlist = {}
         self.ai_candidate_watchlist = {}
@@ -552,12 +592,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         codes = [code for code in code_list.split(';') if code]
         logger.info("[조건검색 초기조회] {}({}) {}건".format(condition_name, condition_index, len(codes)))
         for code in codes:
-            self.enqueue_condition_stock(code, condition_name, "I")
+            self.register_condition_detected_stock(code, condition_name, "I")
 
     def _on_receive_real_condition(self, code, event_type, condition_name, condition_index):
         if event_type == "I":
             logger.info("[조건편입] {} {}({})".format(code, condition_name, condition_index))
-            self.enqueue_condition_stock(code, condition_name, event_type)
+            self.register_condition_detected_stock(code, condition_name, event_type)
         elif event_type == "D":
             logger.info("[조건이탈] {} {}({})".format(code, condition_name, condition_index))
 
@@ -806,6 +846,29 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return True
         return False
 
+    def register_condition_detected_stock(self, code, condition_name="", event_type="I"):
+        """조건식 포착 직후 실시간 등록과 감시 큐 등록을 한 번에 수행한다."""
+        code = self.normalize_code(code)
+        if not code:
+            return
+        watch = self.ensure_monitoring_stock(code)
+        watch["condition_name"] = condition_name or CONDITION_NAME
+        watch["condition_event_type"] = event_type
+        watch["condition_formula"] = TRADE_LOG_CONDITION_FORMULA
+        if code not in self.realtime_registered_codes:
+            self.register_realtime_stock(code)
+            self.condition_registered_at[code] = time.time()
+            logger.info(
+                "[조건편입 실시간등록] %s %s event=%s screen=%s - 첫 실시간 체결가를 포착가로 사용",
+                code,
+                condition_name or CONDITION_NAME,
+                event_type,
+                self.realtime_code_screens.get(code, ""),
+            )
+        else:
+            self.condition_registered_at.setdefault(code, time.time())
+        self.enqueue_condition_stock(code, condition_name, event_type)
+
     def enqueue_condition_stock(self, code, condition_name="", event_type="I"):
         code = self.normalize_code(code)
         if not code:
@@ -1002,6 +1065,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.no_tick_codes.discard(code)
             self.requeue_condition_stock(code)
         received_at = time.time()
+        ticks = self.realtime_ticks.setdefault(code, [])
+        prev_accum_volume = self.parse_int(ticks[-1].get("accum_volume", 0)) if ticks else 0
+        volume_delta = max(self.parse_int(accum_volume) - prev_accum_volume, 0) if prev_accum_volume > 0 else 0
         tick = {
             "received_at": received_at,
             "signed_at": signed_at,
@@ -1012,9 +1078,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "ask": ask,
             "bid": bid,
             "accum_volume": accum_volume,
+            "volume_delta": volume_delta,
             "chejan_strength": chejan_strength,
         }
-        ticks = self.realtime_ticks.setdefault(code, [])
         ticks.append(tick)
         if len(ticks) > OPENING_TICK_LIMIT:
             del ticks[:-OPENING_TICK_LIMIT]
@@ -1038,6 +1104,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         watch = self.dante_a_watchlist.get(code)
         if watch is not None and close > 0:
             watch["breakout_high"] = max(self.parse_int(watch.get("breakout_high", 0)), int(close))
+        self.update_monitoring_tick(code, tick)
         self.update_reentry_watch(code, close)
 
         self.update_training_labels(code, close, received_at)
@@ -1053,6 +1120,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             price = self.get_real_int(s_code, "현재가")
             if price > 0:
                 self.market_state.update(str(s_code), float(price), time.time())
+        elif real_type == "주식호가잔량":
+            self.update_orderbook_snapshot(s_code)
         elif real_type == "주식체결":
             signed_at = self.dynamicCall("GetCommRealData(QString, QString)", s_code, get_fid("체결시간"))
             close = self.get_real_int(s_code, "현재가")
@@ -1112,6 +1181,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.pending_dante_samples.clear()
         self.last_dante_shadow_sample_at.clear()
         self.pending_dante_shadow_samples.clear()
+        self.monitoring_dict.clear()
         self.dante_a_watchlist.clear()
         self.dante_reentry_watchlist.clear()
         self.risk_too_wide_watchlist.clear()
@@ -1423,7 +1493,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         position = self.portfolio.get(code)
         if stage == 2:
             # B급 일괄 매수: position 미존재가 정상.
-            if grade in ("A", "B", "AI") and (position is None or position.entry_stage == 0):
+            if grade in ("A", "B", "AI", "SAFE") and (position is None or position.entry_stage == 0):
+                if position is not None and position.is_holding():
+                    logger.info("[매수 제외] {} 이미 보유 중".format(code))
+                    return True
                 if position is not None and position.entry_stage >= 2:
                     logger.info("[B급 매수 제외] {} 이미 본진입 완료".format(code))
                     return True
@@ -1479,6 +1552,119 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
     def is_opening_buy_time(self):
         now = self.current_hhmmss()
         return OPENING_BUY_START <= now <= OPENING_BUY_END
+
+    def realtime_daily_turnover(self, code, *, current_price=0, accum_volume=0):
+        code = self.normalize_code(code)
+        price = self.parse_int(current_price)
+        volume = self.parse_int(accum_volume)
+        if (price <= 0 or volume <= 0) and code in self.realtime_ticks:
+            ticks = self.realtime_ticks.get(code, [])
+            if ticks:
+                last = ticks[-1]
+                price = price if price > 0 else self.parse_int(last.get("close", 0))
+                volume = volume if volume > 0 else self.parse_int(last.get("accum_volume", 0))
+        if price <= 0 or volume <= 0:
+            return 0
+        return price * volume
+
+    def realtime_turnover_rank(self, code, *, current_turnover=0):
+        code = self.normalize_code(code)
+        turnovers = {}
+        for tracked_code, ticks in self.realtime_ticks.items():
+            if not ticks:
+                continue
+            last = ticks[-1]
+            turnover = self.realtime_daily_turnover(
+                tracked_code,
+                current_price=last.get("close", 0),
+                accum_volume=last.get("accum_volume", 0),
+            )
+            if turnover > 0:
+                turnovers[self.normalize_code(tracked_code)] = turnover
+        if current_turnover > 0:
+            turnovers[code] = max(self.parse_int(current_turnover), turnovers.get(code, 0))
+        if not turnovers or code not in turnovers:
+            return 0, len(turnovers)
+        rank = 1 + sum(1 for turnover in turnovers.values() if turnover > turnovers[code])
+        return rank, len(turnovers)
+
+    def evaluate_time_filter(self, code, *, current_price=0, accum_volume=0):
+        now = self.current_hhmmss()
+        if now < TIME_FILTER_MORNING_START:
+            return {
+                "ok": False,
+                "status": "wait",
+                "reason": "TimeFilter: 매수 시작 전",
+                "phase": "preopen",
+            }
+        if now >= TIME_FILTER_CLOSING_END:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "TimeFilter: 15:20 이후 신규 매수 금지",
+                "phase": "closed",
+            }
+
+        daily_turnover = self.realtime_daily_turnover(
+            code,
+            current_price=current_price,
+            accum_volume=accum_volume,
+        )
+        if now < TIME_FILTER_MORNING_END:
+            return {
+                "ok": True,
+                "phase": "morning",
+                "weight": 1.2,
+                "reason": "TimeFilter morning: 조건식 거래대금 필터 신뢰, 적극 매매 구간",
+                "daily_turnover": daily_turnover,
+            }
+
+        if now < TIME_FILTER_MIDDAY_END:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "TimeFilter midday: 10:00~14:00 횡보장 구간 신규 매수 금지",
+                "phase": "midday",
+                "daily_turnover": daily_turnover,
+            }
+
+        rank, ranked_count = self.realtime_turnover_rank(code, current_turnover=daily_turnover)
+        if daily_turnover < TIME_FILTER_CLOSING_MIN_TURNOVER:
+            return {
+                "ok": False,
+                "status": "wait",
+                "reason": "TimeFilter closing: 누적 거래대금 {:.1f}억 < {:.1f}억".format(
+                    daily_turnover / 100_000_000,
+                    TIME_FILTER_CLOSING_MIN_TURNOVER / 100_000_000,
+                ),
+                "phase": "closing",
+                "daily_turnover": daily_turnover,
+                "turnover_rank": rank,
+                "ranked_count": ranked_count,
+            }
+        if rank <= 0 or rank > TIME_FILTER_CLOSING_TOP_RANK:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "TimeFilter closing: 거래대금 순위 {}/{} > Top{}".format(
+                    rank,
+                    ranked_count,
+                    TIME_FILTER_CLOSING_TOP_RANK,
+                ),
+                "phase": "closing",
+                "daily_turnover": daily_turnover,
+                "turnover_rank": rank,
+                "ranked_count": ranked_count,
+            }
+        return {
+            "ok": True,
+            "phase": "closing",
+            "weight": 0.8,
+            "reason": "TimeFilter closing: 거래대금 Top{} 종목".format(rank),
+            "daily_turnover": daily_turnover,
+            "turnover_rank": rank,
+            "ranked_count": ranked_count,
+        }
 
     def clamp(self, value, low=0.0, high=1.0):
         return max(low, min(high, value))
@@ -1667,6 +1853,476 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if code not in self.pending_condition_codes:
             self.pending_condition_codes.append(code)
 
+    def ensure_monitoring_stock(self, code, *, capture_price=0):
+        code = self.normalize_code(code)
+        watch = self.monitoring_dict.get(code)
+        if watch is None:
+            now = time.time()
+            capture = self.parse_int(capture_price)
+            watch = {
+                "capture_price": capture,
+                "status": "WATCHING",
+                "detected_at": now,
+                "ready_at": 0.0,
+                "target_price": scoring.round_down_to_tick(
+                    capture * (1 - SAFE_PULLBACK_MIN_DROP_PCT)
+                ) if capture > 0 else 0,
+                "capture_accum_volume": 0,
+                "ready_accum_volume": 0,
+                "breakout_volume": 0,
+                "big_buy_seen": False,
+                "big_buy_qty": 0,
+                "last_price": 0,
+                "last_reason": "",
+                "condition_name": CONDITION_NAME,
+                "condition_formula": TRADE_LOG_CONDITION_FORMULA,
+                "rule_version": TRADE_LOG_RULE_VERSION,
+            }
+            self.monitoring_dict[code] = watch
+            logger.info(
+                "[퀀트조건식 감시 등록] %s capture=%s target=%s status=WATCHING",
+                code,
+                watch["capture_price"],
+                watch["target_price"],
+            )
+        elif capture_price and self.parse_int(watch.get("capture_price", 0)) <= 0:
+            watch["capture_price"] = self.parse_int(capture_price)
+            watch["target_price"] = scoring.round_down_to_tick(
+                self.parse_int(capture_price) * (1 - SAFE_PULLBACK_MIN_DROP_PCT)
+            )
+            logger.info("[포착가 저장] %s capture=%s", code, watch["capture_price"])
+        return watch
+
+    def clear_monitoring_stock(self, code, reason=""):
+        code = self.normalize_code(code)
+        watch = self.monitoring_dict.pop(code, None)
+        if watch is not None:
+            logger.info("[감시 해제] %s %s", code, reason)
+
+    def monitoring_volume_5m(self, code):
+        bars = self.minute_aggregator.all_bars(code)
+        if not bars:
+            return 0
+        return sum(max(self.parse_int(getattr(bar, "volume", 0)), 0) for bar in bars[-5:])
+
+    def update_orderbook_snapshot(self, code):
+        code = self.normalize_code(code)
+        ask_total = self.get_real_int(code, "매도호가 총잔량")
+        bid_total = self.get_real_int(code, "매수호가 총잔량")
+        if ask_total <= 0:
+            ask_total = sum(self.get_real_int(code, "매도호가 수량{}".format(i)) for i in range(1, 11))
+        if bid_total <= 0:
+            bid_total = sum(self.get_real_int(code, "매수호가 수량{}".format(i)) for i in range(1, 11))
+        if ask_total <= 0 and bid_total <= 0:
+            return self.orderbook_snapshots.get(code, {})
+        snapshot = {
+            "ask_total": ask_total,
+            "bid_total": bid_total,
+            "ask_bid_ratio": (ask_total / bid_total) if bid_total > 0 else 0.0,
+            "updated_at": time.time(),
+        }
+        self.orderbook_snapshots[code] = snapshot
+        return snapshot
+
+    def orderbook_wall_confirmed(self, code):
+        snapshot = self.update_orderbook_snapshot(code)
+        ask_total = self.parse_int(snapshot.get("ask_total", 0))
+        bid_total = self.parse_int(snapshot.get("bid_total", 0))
+        if ask_total <= 0 or bid_total <= 0:
+            return False, "호가 총잔량 대기"
+        ratio = ask_total / bid_total
+        if ratio <= SAFE_PULLBACK_ASK_BID_RATIO_MIN:
+            return False, "매도잔량/매수잔량 {:.2f} <= {:.1f}".format(
+                ratio, SAFE_PULLBACK_ASK_BID_RATIO_MIN
+            )
+        return True, "매도잔량 우위 {:.2f}배".format(ratio)
+
+    def is_big_buyer_tick(self, code, tick):
+        volume_delta = self.parse_int(tick.get("volume_delta", 0))
+        if volume_delta < SAFE_PULLBACK_BIG_BUY_MIN_QTY:
+            return False
+        if self.parse_float(tick.get("chejan_strength", 0.0), 0.0) < 100.0:
+            return False
+        ticks = self.realtime_ticks.get(code, [])
+        if len(ticks) >= 2 and self.parse_int(tick.get("close", 0)) < self.parse_int(ticks[-2].get("close", 0)):
+            return False
+        recent = [
+            self.parse_int(t.get("volume_delta", 0))
+            for t in ticks[-10:-1]
+            if self.parse_int(t.get("volume_delta", 0)) > 0
+        ]
+        avg_delta = (sum(recent) / len(recent)) if recent else SAFE_PULLBACK_BIG_BUY_MIN_QTY
+        return volume_delta >= max(SAFE_PULLBACK_BIG_BUY_MIN_QTY, avg_delta * SAFE_PULLBACK_BIG_BUY_MULT)
+
+    def recent_big_buyer_confirmed(self, code, *, lookback=5):
+        ticks = self.realtime_ticks.get(code, [])
+        if not ticks:
+            return False, "빅바이어 체결 대기"
+        recent = ticks[-lookback:]
+        best = 0
+        for tick in recent:
+            volume_delta = self.parse_int(tick.get("volume_delta", 0))
+            best = max(best, volume_delta)
+            if self.is_big_buyer_tick(code, tick):
+                return True, "빅바이어 재확인 {}주".format(volume_delta)
+        return False, "빅바이어 부족 max={}주".format(best)
+
+    def second_entry_orderbook_confirmed(self, code):
+        snapshot = self.update_orderbook_snapshot(code)
+        ask_total = self.parse_int(snapshot.get("ask_total", 0))
+        bid_total = self.parse_int(snapshot.get("bid_total", 0))
+        if ask_total <= 0 or bid_total <= 0:
+            return False, "호가 총잔량 대기"
+        ratio = ask_total / bid_total
+        if ratio > SAFE_PULLBACK_ASK_BID_RATIO_MIN:
+            return True, "매도벽 유지 {:.2f}배".format(ratio)
+        if bid_total >= ask_total:
+            return True, "매도벽 흡수 bid/ask {:.2f}".format(bid_total / ask_total if ask_total > 0 else 0)
+        return False, "호가 흡수 미확인 ask/bid {:.2f}".format(ratio)
+
+    def update_monitoring_tick(self, code, tick):
+        code = self.normalize_code(code)
+        watch = self.monitoring_dict.get(code)
+        if watch is None:
+            return
+        close = self.parse_int(tick.get("close", 0))
+        if close <= 0:
+            return
+        accum_volume = self.parse_int(tick.get("accum_volume", 0))
+        watch["last_price"] = close
+        if self.parse_int(watch.get("capture_price", 0)) <= 0:
+            watch["capture_price"] = close
+            watch["target_price"] = scoring.round_down_to_tick(close * (1 - SAFE_PULLBACK_MIN_DROP_PCT))
+            watch["capture_accum_volume"] = accum_volume
+            watch["breakout_volume"] = max(self.monitoring_volume_5m(code), 0)
+            logger.info(
+                "[퀀트조건식 포착가 저장] %s capture=%s entry_trigger=%s(-%.2f%%) strength_min=%.0f",
+                code,
+                close,
+                watch["target_price"],
+                QUANT_ENTRY_PULLBACK_PCT * 100,
+                QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+            )
+            return
+
+        capture_price = self.parse_int(watch.get("capture_price", 0))
+        if capture_price <= 0:
+            return
+        pullback = (capture_price - close) / capture_price
+        if watch.get("status") == "WATCHING" and pullback < SAFE_PULLBACK_MIN_DROP_PCT:
+            volume_5m = self.monitoring_volume_5m(code)
+            accum_delta = max(accum_volume - self.parse_int(watch.get("capture_accum_volume", 0)), 0)
+            watch["breakout_volume"] = max(
+                self.parse_int(watch.get("breakout_volume", 0)),
+                volume_5m,
+                accum_delta,
+            )
+        if self.is_big_buyer_tick(code, tick):
+            volume_delta = self.parse_int(tick.get("volume_delta", 0))
+            watch["big_buy_seen"] = True
+            watch["big_buy_qty"] = max(self.parse_int(watch.get("big_buy_qty", 0)), volume_delta)
+
+    def market_filter_pauses_buy(self):
+        snapshot = self.market_state.snapshot()
+        slope_1m = getattr(snapshot, "market_slope_1m", None)
+        slope_3m = getattr(snapshot, "market_slope_3m", None)
+        regime = getattr(snapshot, "market_regime", "") or ""
+        if regime in ("weak", "risk_off"):
+            return True, "지수 하락 regime={}".format(regime)
+        if slope_1m is not None and slope_1m < 0:
+            return True, "지수 1분봉 하락 slope={:.2%}".format(slope_1m)
+        if slope_3m is not None and slope_3m < 0:
+            return True, "지수 3분 추세 하락 slope={:.2%}".format(slope_3m)
+        return False, ""
+
+    def support_confirmed_for_safe_pullback(self, code):
+        ind = self.five_min_cache.get(code)
+        if ind is not None:
+            cur_open = getattr(ind, "cur_open", None)
+            cur_close = getattr(ind, "last_close", None)
+            if cur_open and cur_close and cur_close > cur_open:
+                return True, "5분봉 양봉"
+            cur_low = getattr(ind, "cur_low", None)
+            prev_low = getattr(ind, "prev_low", None)
+            prev_close = getattr(ind, "prev_close", None)
+            if cur_low and prev_low and cur_close and prev_close and cur_low >= prev_low and cur_close >= prev_close:
+                return True, "5분봉 하락세 둔화"
+
+        bars = self.minute_aggregator.all_bars(code)
+        if len(bars) >= 3:
+            recent = bars[-3:]
+            if recent[-1].close >= recent[-2].close and recent[-1].low >= min(b.low for b in recent[:-1]):
+                return True, "1분봉 저점 방어"
+        return False, "지지 확인 전"
+
+    def active_position_count(self):
+        return len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
+
+    def score_safe_pullback_trade(self, code):
+        code = self.normalize_code(code)
+        watch = self.ensure_monitoring_stock(code)
+        ticks = self.realtime_ticks.get(code, [])
+        if not ticks:
+            return {"status": "wait", "stage": 2, "reason": "실시간 첫 틱 대기", "reason_code": "SAFE_WAIT_TICK"}
+
+        tick = ticks[-1]
+        current_price = self.parse_int(tick.get("close", 0))
+        if current_price <= 0:
+            return {"status": "wait", "stage": 2, "reason": "현재가 없음", "reason_code": "SAFE_NO_PRICE"}
+
+        time_filter = self.evaluate_time_filter(
+            code,
+            current_price=current_price,
+            accum_volume=tick.get("accum_volume", 0),
+        )
+        if not time_filter.get("ok"):
+            return {
+                "status": time_filter.get("status", "blocked"),
+                "stage": 2,
+                "code": code,
+                "name": self.get_code_name(code),
+                "current_price": current_price,
+                "ratio": 0.0,
+                "reason": time_filter.get("reason", "TimeFilter block"),
+                "reason_code": "TIME_FILTER",
+                "time_filter_phase": time_filter.get("phase", ""),
+                "time_filter_weight": time_filter.get("weight", 0.0),
+                "daily_turnover": time_filter.get("daily_turnover", 0),
+                "turnover_rank": time_filter.get("turnover_rank", 0),
+                "ranked_count": time_filter.get("ranked_count", 0),
+            }
+
+        self.update_monitoring_tick(code, tick)
+        capture_price = self.parse_int(watch.get("capture_price", 0))
+        if capture_price <= 0:
+            return {"status": "wait", "stage": 2, "reason": "포착가 저장 대기", "reason_code": "SAFE_NO_CAPTURE"}
+
+        name = self.get_code_name(code)
+        pullback_pct = (capture_price - current_price) / capture_price
+        chejan_strength = self.parse_float(tick.get("chejan_strength", 0.0), 0.0)
+        target_price = self.parse_int(watch.get("target_price", 0))
+        if target_price <= 0:
+            target_price = scoring.round_down_to_tick(capture_price * (1 - QUANT_ENTRY_PULLBACK_PCT))
+            watch["target_price"] = target_price
+
+        if pullback_pct < QUANT_ENTRY_PULLBACK_PCT:
+            watch["status"] = "WATCHING"
+            return {
+                "status": "wait",
+                "stage": 2,
+                "reason": "퀀트조건식 눌림 대기 {:.2%} < {:.2%} (capture={} trigger={})".format(
+                    pullback_pct,
+                    QUANT_ENTRY_PULLBACK_PCT,
+                    capture_price,
+                    target_price,
+                ),
+                "reason_code": "SAFE_PULLBACK_SHALLOW",
+                "capture_price": capture_price,
+                "pullback_pct": pullback_pct,
+                "chejan_strength": chejan_strength,
+            }
+        if chejan_strength < QUANT_ENTRY_CHEJAN_STRENGTH_MIN:
+            return {
+                "status": "wait",
+                "stage": 2,
+                "reason": "퀀트조건식 체결강도 대기 {:.1f} < {:.0f} (pullback {:.2%})".format(
+                    chejan_strength,
+                    QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+                    pullback_pct,
+                ),
+                "reason_code": "SAFE_CHEJAN_WAIT",
+                "capture_price": capture_price,
+                "pullback_pct": pullback_pct,
+                "chejan_strength": chejan_strength,
+            }
+
+        if watch.get("status") != "READY":
+            watch["status"] = "READY"
+            watch["ready_at"] = time.time()
+            watch["ready_accum_volume"] = self.parse_int(tick.get("accum_volume", 0))
+            logger.info(
+                "[퀀트조건식 매수 준비] %s capture=%s current=%s pullback=%.2f%% strength=%.1f",
+                code,
+                capture_price,
+                current_price,
+                pullback_pct * 100,
+                chejan_strength,
+            )
+
+        if self.active_position_count() >= SAFE_PULLBACK_MAX_POSITIONS:
+            return {
+                "status": "wait",
+                "stage": 2,
+                "reason": "최대 보유 종목 {}개 도달".format(SAFE_PULLBACK_MAX_POSITIONS),
+                "reason_code": "SAFE_MAX_POSITIONS",
+            }
+
+        entry_limit_price = scoring.round_down_to_tick(current_price)
+        stop_price = scoring.round_down_to_tick(entry_limit_price * (1 - QUANT_STOP_LOSS_PCT))
+        take_profit_price = scoring.round_up_to_tick(entry_limit_price * (1 + QUANT_TAKE_PROFIT_PCT))
+        return {
+            "status": "ready",
+            "code": code,
+            "name": name,
+            "current_price": current_price,
+            "ratio": 1.0,
+            "stage": 2,
+            "score": 1.0,
+            "grade": QUANT_GRADE,
+            "reason": "포착가 대비 눌림 {:.2%} >= {:.2%} + 체결강도 {:.1f} >= {:.0f}".format(
+                pullback_pct,
+                QUANT_ENTRY_PULLBACK_PCT,
+                chejan_strength,
+                QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+            ),
+            "reason_code": "QUANT_PULLBACK_READY",
+            "capture_price": capture_price,
+            "safe_target_price": target_price,
+            "entry_limit_price": entry_limit_price,
+            "stop_price": stop_price,
+            "take_profit_price": take_profit_price,
+            "order_gubun": "00",
+            "plan_source": QUANT_PLAN_SOURCE,
+            "entry_plan_reason": "퀀트조건식 포착가 -1.5% 눌림 지정가, +2% 익절/-1.5% 손절",
+            "chejan_strength": chejan_strength,
+            "pullback_pct": pullback_pct,
+            "volume_speed": 0.0,
+            "spread_rate": 0.0,
+            "daily_turnover": time_filter.get("daily_turnover", 0),
+            "turnover_rank": time_filter.get("turnover_rank", 0),
+            "ranked_count": time_filter.get("ranked_count", 0),
+            "time_filter_phase": time_filter.get("phase", ""),
+            "time_filter_weight": time_filter.get("weight", 1.0),
+        }
+
+    def score_safe_pullback_second_entry(self, code, position):
+        code = self.normalize_code(code)
+        ticks = self.realtime_ticks.get(code, [])
+        if not ticks:
+            return {"status": "wait", "stage": 2, "reason": "SAFE 2차 실시간 틱 대기", "reason_code": "SAFE_SECOND_WAIT_TICK"}
+
+        current_price = self.parse_int(ticks[-1].get("close", 0))
+        if current_price <= 0:
+            return {"status": "wait", "stage": 2, "reason": "SAFE 2차 현재가 없음", "reason_code": "SAFE_SECOND_NO_PRICE"}
+
+        time_filter = self.evaluate_time_filter(
+            code,
+            current_price=current_price,
+            accum_volume=ticks[-1].get("accum_volume", 0),
+        )
+        if not time_filter.get("ok"):
+            return {
+                "status": time_filter.get("status", "blocked"),
+                "stage": 2,
+                "code": code,
+                "name": getattr(position, "name", "") or self.get_code_name(code),
+                "current_price": current_price,
+                "ratio": 0.0,
+                "reason": time_filter.get("reason", "TimeFilter block"),
+                "reason_code": "TIME_FILTER",
+                "time_filter_phase": time_filter.get("phase", ""),
+                "time_filter_weight": time_filter.get("weight", 0.0),
+                "daily_turnover": time_filter.get("daily_turnover", 0),
+                "turnover_rank": time_filter.get("turnover_rank", 0),
+                "ranked_count": time_filter.get("ranked_count", 0),
+            }
+
+        planned_quantity = self.parse_int(getattr(position, "planned_quantity", 0))
+        held_quantity = self.parse_int(getattr(position, "quantity", 0))
+        remaining = max(planned_quantity - held_quantity, 0)
+        if planned_quantity <= 0 or remaining <= 0:
+            return {
+                "status": "blocked",
+                "stage": 2,
+                "reason": "SAFE 2차 잔여수량 없음 planned={} held={}".format(planned_quantity, held_quantity),
+                "reason_code": "SAFE_SECOND_NO_REMAINING",
+            }
+
+        now_ts = time.time()
+        entry1_time = float(getattr(position, "entry1_time", 0.0) or getattr(position, "entry_time", 0.0) or now_ts)
+        if now_ts - entry1_time > SAFE_PULLBACK_SECOND_WINDOW_SECONDS:
+            return {
+                "status": "blocked",
+                "stage": 2,
+                "reason": "SAFE 2차 윈도우 만료 {:.0f}s".format(now_ts - entry1_time),
+                "reason_code": "SAFE_SECOND_WINDOW_EXPIRED",
+            }
+
+        base_price = self.parse_int(getattr(position, "entry_price", 0))
+        if base_price <= 0 and isinstance(getattr(position, "order_context", None), dict):
+            base_price = self.parse_int(position.order_context.get("entry_limit_price", 0))
+        if base_price <= 0:
+            return {"status": "wait", "stage": 2, "reason": "SAFE 2차 기준가 없음", "reason_code": "SAFE_SECOND_NO_BASE"}
+
+        rebound_pct = current_price / base_price - 1
+        if rebound_pct < SAFE_PULLBACK_SECOND_MIN_REBOUND_PCT:
+            return {
+                "status": "wait",
+                "stage": 2,
+                "reason": "SAFE 2차 반등 부족 {:.2%} < {:.2%}".format(
+                    rebound_pct, SAFE_PULLBACK_SECOND_MIN_REBOUND_PCT
+                ),
+                "reason_code": "SAFE_SECOND_REBOUND_WAIT",
+            }
+        if rebound_pct > SAFE_PULLBACK_SECOND_MAX_CHASE_PCT:
+            return {
+                "status": "wait",
+                "stage": 2,
+                "reason": "SAFE 2차 추격 방지 {:.2%} > {:.2%}".format(
+                    rebound_pct, SAFE_PULLBACK_SECOND_MAX_CHASE_PCT
+                ),
+                "reason_code": "SAFE_SECOND_CHASE_WAIT",
+            }
+
+        self.refresh_five_min_indicators(code)
+        support_ok, support_reason = self.support_confirmed_for_safe_pullback(code)
+        if not support_ok:
+            return {"status": "wait", "stage": 2, "reason": "SAFE 2차 {}".format(support_reason), "reason_code": "SAFE_SECOND_SUPPORT_WAIT"}
+
+        orderbook_ok, orderbook_reason = self.second_entry_orderbook_confirmed(code)
+        if not orderbook_ok:
+            return {"status": "wait", "stage": 2, "reason": "SAFE 2차 {}".format(orderbook_reason), "reason_code": "SAFE_SECOND_ORDERBOOK_WAIT"}
+
+        big_ok, big_reason = self.recent_big_buyer_confirmed(code)
+        if not big_ok:
+            return {"status": "wait", "stage": 2, "reason": "SAFE 2차 {}".format(big_reason), "reason_code": "SAFE_SECOND_BIG_BUY_WAIT"}
+
+        paused, market_reason = self.market_filter_pauses_buy()
+        if paused:
+            return {"status": "wait", "stage": 2, "reason": market_reason, "reason_code": "SAFE_SECOND_MARKET_PAUSE"}
+
+        entry_limit_price = scoring.round_down_to_tick(current_price)
+        stop_price = scoring.round_down_to_tick(entry_limit_price * (1 - SAFE_PULLBACK_STOP_LOSS_PCT))
+        take_profit_price = scoring.round_up_to_tick(entry_limit_price * (1 + SAFE_PULLBACK_TAKE_PROFIT_PCT))
+        return {
+            "status": "ready",
+            "code": code,
+            "name": getattr(position, "name", "") or self.get_code_name(code),
+            "current_price": current_price,
+            "ratio": 1.0,
+            "stage": 2,
+            "score": 1.0,
+            "grade": "SAFE",
+            "reason": "SAFE 2차: {} + {} + {}, rebound {:.2%}".format(
+                support_reason, orderbook_reason, big_reason, rebound_pct
+            ),
+            "reason_code": "SAFE_SECOND_READY",
+            "entry_limit_price": entry_limit_price,
+            "stop_price": stop_price,
+            "take_profit_price": take_profit_price,
+            "order_gubun": "00",
+            "plan_source": "safe_pullback",
+            "entry_plan_reason": "SAFE 2차 지지/흡수 확인 지정가 매수",
+            "chejan_strength": self.parse_float(ticks[-1].get("chejan_strength", 0.0), 0.0),
+            "volume_speed": 0.0,
+            "spread_rate": 0.0,
+            "daily_turnover": time_filter.get("daily_turnover", 0),
+            "turnover_rank": time_filter.get("turnover_rank", 0),
+            "ranked_count": time_filter.get("ranked_count", 0),
+            "time_filter_phase": time_filter.get("phase", ""),
+            "time_filter_weight": time_filter.get("weight", 1.0),
+        }
+
     def should_print_wait_log(self, code):
         now = time.time()
         last_at = self.last_wait_log_at.get(code, 0)
@@ -1784,6 +2440,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             is_breakout_prev_bar=ctx.is_breakout_prev_bar,
             upper_wick_ratio=ctx.upper_wick_ratio_zero_bar,
             open_return=ctx.open_return,
+            atr_5m_pct=ctx.atr_5m_pct,
+            intraday_vwap=ctx.intraday_vwap,
+            pullback_low_after_high=ctx.pullback_low_after_high,
         )
         payload = {
             "code": code,
@@ -2020,9 +2679,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 capped_stop = max(stop_price, max_risk_stop)
                 capped_stop = min(capped_stop, min_risk_stop)
                 if capped_stop != stop_price and 0 < capped_stop < entry_limit:
-                    model_score = self.parse_float(plan.get("model_score", 0.0), 0.0)
-                    model_threshold = self.parse_float(plan.get("model_threshold", 0.0), 0.0)
-                    target_r = 2.3 if model_score >= max(model_threshold, 0.65) else ENTRY_PLAN_TARGET_R
+                    target_r = ENTRY_PLAN_TARGET_R
                     risk_per_share = max(entry_limit - capped_stop, unit)
                     plan["stop_price"] = capped_stop
                     plan["take_profit_price"] = scoring.round_up_to_tick(entry_limit + risk_per_share * target_r)
@@ -2087,7 +2744,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if prediction.get("market_gate_action", "") == entry_strategy.MARKET_ACTION_BLOCK_ALL:
             return False
         model_score = self.parse_float(plan.get("model_score", prediction.get("model_score", 0.0)), 0.0)
-        if model_score >= RISK_TOO_WIDE_MIN_MODEL_SCORE:
+        if not MODEL_ASSIST_ONLY and model_score >= RISK_TOO_WIDE_MIN_MODEL_SCORE:
             return True
         reason_code = str(prediction.get("reason_code", "") or "")
         ready_codes = {
@@ -2311,6 +2968,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return True, reason_code
         return False, ""
 
+    def should_watch_pullback_recovery(self, prediction):
+        status = str(prediction.get("status", "") or "")
+        if status not in ("wait", "blocked"):
+            return False
+        if prediction.get("market_gate_action", "") == entry_strategy.MARKET_ACTION_BLOCK_ALL:
+            return False
+        reason_code = str(prediction.get("reason_code", "") or "")
+        return reason_code in PULLBACK_RECOVERY_WATCH_REASON_CODES
+
     def dante_allows_ai_candidate_watch(self, prediction):
         """AI가 바로 매수하지 않고 재평가 감시로만 올릴 수 있는 회복형 게이트."""
         if not AI_CANDIDATE_WATCH_ENABLED:
@@ -2329,7 +2995,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             entry_strategy.GATE_STAGE2_CHEJAN,
             entry_strategy.GATE_STAGE2_VOLUME,
             entry_strategy.GATE_STAGE2_PULLBACK_SHALLOW,
+            entry_strategy.GATE_STAGE2_PULLBACK_DEEP,
+            entry_strategy.GATE_STAGE2_VWAP_LOST,
             entry_strategy.GATE_BGRADE_PULLBACK_SHALLOW,
+            entry_strategy.GATE_BGRADE_PULLBACK_DEEP,
+            entry_strategy.GATE_BGRADE_VWAP_LOST,
             entry_strategy.GATE_BGRADE_NO_REVERSAL,
             entry_strategy.GATE_STAGE2_NO_REVERSAL,
             entry_strategy.GATE_NO_BREAKOUT,
@@ -2419,7 +3089,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         return True
 
     def maybe_promote_ai_candidate(self, prediction):
-        if not AI_CANDIDATE_PROMOTION_ENABLED:
+        if MODEL_ASSIST_ONLY or not AI_CANDIDATE_PROMOTION_ENABLED:
             return prediction
         code = self.normalize_code(prediction.get("code", ""))
         if prediction.get("status") == "ready":
@@ -2505,6 +3175,31 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         volume_delta = max(last["accum_volume"] - first["accum_volume"], 0)
         volume_speed = volume_delta / elapsed_secs
         turnover_speed_per_min = volume_speed * current_price * 60
+        time_filter = self.evaluate_time_filter(
+            code,
+            current_price=current_price,
+            accum_volume=last.get("accum_volume", 0),
+        )
+        if not time_filter.get("ok"):
+            return {
+                "status": time_filter.get("status", "blocked"),
+                "code": code,
+                "name": self.get_code_name(code),
+                "current_price": current_price,
+                "ratio": 0.0,
+                "stage": 1,
+                "score": 0.0,
+                "reason": time_filter.get("reason", "TimeFilter block"),
+                "reason_code": "TIME_FILTER",
+                "time_filter_phase": time_filter.get("phase", ""),
+                "time_filter_weight": time_filter.get("weight", 0.0),
+                "daily_turnover": time_filter.get("daily_turnover", 0),
+                "turnover_rank": time_filter.get("turnover_rank", 0),
+                "ranked_count": time_filter.get("ranked_count", 0),
+                "volume_speed": volume_speed,
+                "turnover_speed_per_min": turnover_speed_per_min,
+                "chejan_strength": chejan_strength,
+            }
 
         highs = [tick["high"] for tick in ticks if tick["high"] > 0]
         lows = [tick["low"] for tick in ticks if tick["low"] > 0]
@@ -2531,6 +3226,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         else:
             px_over_bb55 = 0.0
         open_return = (current_price / open_price - 1) if open_price > 0 else 0.0
+
+        # === ATR / VWAP 보강 (W1: 동적 풀백 밴드 + 고점추매 차단) ===
+        # atr_pct 가 None 이면 0.0 으로 떨어뜨려 entry_strategy 가 정적 fallback 사용.
+        atr_5m_pct = float(getattr(five_min_ind, "atr_pct", None) or 0.0) if five_min_ind else 0.0
+        intraday_vwap = float(self.minute_aggregator.intraday_vwap(code) or 0.0)
+        # 풀백 저점은 minute_aggregator 의 1분봉 lookback 에서 직접 추출(고점→저점 시퀀스 보장).
+        pullback_low_after_high = int(self.minute_aggregator.pullback_low_after_high(code) or 0)
 
         # 매크로 dry-run 게이트 — 이번 PR 은 status/ratio 변경 없이 메타만 부여.
         market_snapshot = self.market_state.snapshot()
@@ -2560,6 +3262,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             px_over_bb55_pct=px_over_bb55,
             open_return=open_return,
             market_state=market_snapshot,
+            atr_5m_pct=atr_5m_pct,
+            intraday_vwap=intraday_vwap,
+            pullback_low_after_high=pullback_low_after_high,
         )
 
         reentry_watch = self.dante_reentry_watchlist.get(code)
@@ -2611,7 +3316,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             else:
                 watch["breakout_high"] = max(self.parse_int(watch.get("breakout_high", 0)), current_price)
             self.requeue_condition_stock(code)
-        elif decision.status == "blocked" and code in self.dante_a_watchlist:
+        elif (
+            decision.status == "blocked"
+            and code in self.dante_a_watchlist
+            and decision.reason_code not in PULLBACK_RECOVERY_WATCH_REASON_CODES
+        ):
             self.dante_a_watchlist.pop(code, None)
 
         if reentry_watch is not None:
@@ -2674,6 +3383,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "chejan_strength": chejan_strength,
             "volume_speed": volume_speed,
             "turnover_speed_per_min": turnover_speed_per_min,
+            "daily_turnover": time_filter.get("daily_turnover", 0),
+            "turnover_rank": time_filter.get("turnover_rank", 0),
+            "ranked_count": time_filter.get("ranked_count", 0),
+            "time_filter_phase": time_filter.get("phase", ""),
+            "time_filter_weight": time_filter.get("weight", 1.0),
             "reason": decision.reason,
             "reason_code": getattr(decision, "reason_code", "") or "",
             "grade": getattr(decision, "grade", "") or "",
@@ -2714,11 +3428,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         code = self.normalize_code(code)
         if code in self.no_tick_codes:
             return
+        if hasattr(self, "ensure_monitoring_stock"):
+            self.ensure_monitoring_stock(code)
         if code not in self.realtime_registered_codes:
             self.register_realtime_stock(code)
             self.condition_registered_at[code] = time.time()
             self.requeue_condition_stock(code)
-            logger.info("[조건편입 관찰] {} 실시간 등록 - 단테 1차 게이트 대기".format(code))
+            logger.info("[조건편입 관찰] {} 실시간 등록 - 퀀트조건식 눌림/체결강도 대기".format(code))
             return
         if not self.should_continue_risk_too_wide_watch(code):
             return
@@ -2744,6 +3460,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 logger.info("[{}차 매수 대기] {} {}".format(stage, code, prediction.get("reason", "")))
             return
         if status == "blocked":
+            if hasattr(self, "should_watch_pullback_recovery") and self.should_watch_pullback_recovery(prediction):
+                self.requeue_condition_stock(code)
+                if self.should_print_wait_log(code):
+                    logger.info("[{}차 매수 대기] {} 회복 감시: {}".format(stage, code, prediction.get("reason", "")))
+                return
             if hasattr(self, "ai_candidate_watchlist"):
                 self.ai_candidate_watchlist.pop(code, None)
             self.risk_too_wide_watchlist.pop(code, None)
@@ -2771,8 +3492,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if ratio <= 0:
             return
 
-        plan = self.request_dante_entry_plan(code, prediction)
-        plan_ok, plan_reason = self.validate_entry_plan(prediction, plan)
+        if prediction.get("plan_source") in ("safe_pullback", QUANT_PLAN_SOURCE):
+            plan = {
+                "entry_limit_price": prediction.get("entry_limit_price", 0),
+                "stop_price": prediction.get("stop_price", 0),
+                "take_profit_price": prediction.get("take_profit_price", 0),
+                "plan_source": prediction.get("plan_source", ""),
+                "order_gubun": prediction.get("order_gubun", "00"),
+            }
+            plan_ok = True
+            plan_reason = prediction.get("entry_plan_reason", "퀀트조건식 눌림 지정가 매수")
+        else:
+            plan = self.request_dante_entry_plan(code, prediction)
+            plan_ok, plan_reason = self.validate_entry_plan(prediction, plan)
         if not plan_ok:
             watch_started = self.start_risk_too_wide_watch(code, prediction, plan, plan_reason)
             if code in self.risk_too_wide_watchlist and not watch_started and not self.is_risk_too_wide_plan_rejection(plan_reason):
@@ -2827,6 +3559,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         entry_limit_price = self.parse_int(prediction.get("entry_limit_price", 0))
         stop_price = self.parse_int(prediction.get("stop_price", 0))
         take_profit_price = self.parse_int(prediction.get("take_profit_price", 0))
+        order_gubun = str(prediction.get("order_gubun", "00") or "00")
         if entry_limit_price <= 0 or stop_price <= 0 or take_profit_price <= 0:
             logger.info("[매수 보류] {} 지정가/손절/익절 계획 부족".format(code))
             return
@@ -2834,13 +3567,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         deposit = self.get_deposit(force=True)
         position = self.portfolio.get(code)
 
-        unit_cost = max(entry_limit_price, 1)
+        unit_cost = max(current_price if order_gubun == "03" else entry_limit_price, 1)
 
         grade = str(prediction.get("grade", "") or "")
+        safe_pullback_entry = prediction.get("plan_source") in ("safe_pullback", QUANT_PLAN_SOURCE) or grade in ("SAFE", QUANT_GRADE)
         pullback_lump_sum = (
             stage == 2
             and (position is None or position.entry_stage == 0)
-            and grade in ("A", "B", "AI")
+            and grade in ("A", "B", "AI", "SAFE", QUANT_GRADE)
         )
         sizing_plan = {}
 
@@ -2852,6 +3586,23 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 stop_price=stop_price,
             )
             planned_quantity = self.parse_int(sizing_plan.get("planned_quantity", 0))
+            if safe_pullback_entry:
+                cash_budget = int(deposit * SAFE_PULLBACK_CASH_RATE * BUY_CASH_BUFFER_RATE)
+                planned_quantity = int(cash_budget // unit_cost) if unit_cost > 0 else 0
+                sizing_plan = {
+                    "planned_quantity": planned_quantity,
+                    "reason": "safe_pullback_10pct_cash",
+                    "risk_per_share": max(entry_limit_price - stop_price, 0),
+                    "risk_budget": cash_budget,
+                    "per_trade_risk_budget": cash_budget,
+                    "portfolio_risk_budget": cash_budget,
+                    "used_portfolio_risk": self.current_open_position_risk(exclude_code=code),
+                    "remaining_portfolio_risk": cash_budget,
+                    "risk_quantity": planned_quantity,
+                    "cash_quantity": planned_quantity,
+                    "cash_budget": cash_budget,
+                    "order_cash": planned_quantity * unit_cost,
+                }
             if planned_quantity <= 0:
                 sizing_message = self.format_position_size_plan(sizing_plan)
                 logger.info(
@@ -2891,6 +3642,23 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 stop_price=stop_price,
             )
             planned_quantity = self.parse_int(sizing_plan.get("planned_quantity", 0))
+            if safe_pullback_entry:
+                cash_budget = int(deposit * SAFE_PULLBACK_CASH_RATE * BUY_CASH_BUFFER_RATE)
+                planned_quantity = int(cash_budget // unit_cost) if unit_cost > 0 else 0
+                sizing_plan = {
+                    "planned_quantity": planned_quantity,
+                    "reason": "safe_pullback_10pct_cash",
+                    "risk_per_share": max(entry_limit_price - stop_price, 0),
+                    "risk_budget": cash_budget,
+                    "per_trade_risk_budget": cash_budget,
+                    "portfolio_risk_budget": cash_budget,
+                    "used_portfolio_risk": self.current_open_position_risk(exclude_code=code),
+                    "remaining_portfolio_risk": cash_budget,
+                    "risk_quantity": planned_quantity,
+                    "cash_quantity": planned_quantity,
+                    "cash_budget": cash_budget,
+                    "order_cash": planned_quantity * unit_cost,
+                }
             if planned_quantity <= 0:
                 sizing_message = self.format_position_size_plan(sizing_plan)
                 logger.info(
@@ -2919,6 +3687,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 )
                 return
             order_quantity = planned_quantity  # ratio==1.0 이므로 전량
+            if safe_pullback_entry:
+                order_quantity = max(int(planned_quantity * ratio), 1)
+                order_quantity = min(order_quantity, planned_quantity)
             if prediction.get("reason_code") == entry_strategy.READY_REENTRY_PULLBACK:
                 order_quantity = max(int(planned_quantity * ratio), 1)
                 order_quantity = min(order_quantity, planned_quantity)
@@ -2987,9 +3758,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 )
                 return
 
-        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, entry_limit_price, "00")
-        if pullback_lump_sum and grade == "A":
+        send_order_price = 0 if order_gubun == "03" else entry_limit_price
+        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, send_order_price, order_gubun)
+        if prediction.get("plan_source") == QUANT_PLAN_SOURCE or grade == QUANT_GRADE:
+            reason_label = "퀀트조건식 눌림 매수"
+        elif pullback_lump_sum and grade == "A":
             reason_label = "Dante A-watch pullback entry"
+        elif safe_pullback_entry:
+            reason_label = "Safe pullback limit entry"
         elif grade == "AI":
             reason_label = "AI 후보 지정가 매수"
         elif grade == "B":
@@ -3012,7 +3788,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "model_action": prediction.get("model_action", ""),
             "model_target": prediction.get("model_target", ""),
             "model_threshold": prediction.get("model_threshold", ""),
+            "capture_price": prediction.get("capture_price", ""),
+            "safe_target_price": prediction.get("safe_target_price", ""),
             "entry_limit_price": entry_limit_price,
+            "order_gubun": order_gubun,
             "stop_price": stop_price,
             "take_profit_price": take_profit_price,
             "risk_reward": prediction.get("risk_reward", ""),
@@ -3035,10 +3814,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             code=code,
             name=prediction.get("name", ""),
             side="buy",
-            order_type="지정가",
+            order_type="시장가" if order_gubun == "03" else "지정가",
             order_result=result,
             quantity=order_quantity,
-            order_price=entry_limit_price,
+            order_price=send_order_price,
             current_price=current_price,
             entry_price=entry_limit_price,
             target_price=take_profit_price,
@@ -3048,7 +3827,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             model_action=prediction.get("model_action", ""),
             model_target=prediction.get("model_target", ""),
             model_threshold=prediction.get("model_threshold", ""),
+            reason_code=prediction.get("reason_code", ""),
             reason=reason_label,
+            plan_source=prediction.get("plan_source", ""),
+            capture_price=prediction.get("capture_price", ""),
+            pullback_pct=prediction.get("pullback_pct", ""),
+            chejan_strength=prediction.get("chejan_strength", ""),
             message="{}, planned {}, ratio {:.2f}, limit {}, stop {}, target {}, {}, {}".format(
                 reason_label,
                 planned_quantity,
@@ -3074,6 +3858,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.save_best()
             if prediction.get("reason_code") == entry_strategy.READY_REENTRY_PULLBACK:
                 self.dante_reentry_watchlist.pop(code, None)
+            if safe_pullback_entry:
+                self.clear_monitoring_stock(code, "매수 주문 접수")
             if pullback_lump_sum and grade == "A":
                 self.dante_a_watchlist.pop(code, None)
 
@@ -3215,12 +4001,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             get_fid("(최우선)매도호가"),
             get_fid("(최우선)매수호가"),
             get_fid("누적거래량"),
-            get_fid("체결강도"),  # 단테 1차/2차 게이트와 청산 약화 판정에 사용
+            get_fid("체결강도"),  # 퀀트조건식 눌림 매수 게이트와 청산 약화 판정에 사용
+            "121",  # 매도호가 총잔량
+            "125",  # 매수호가 총잔량
         ])
         opt_type = "0" if screen_no not in self.realtime_code_screens.values() else "1"
         self.set_real_reg(screen_no, code, fids, opt_type)
         self.realtime_registered_codes.add(code)
         self.realtime_code_screens[code] = screen_no
+        logger.info("[실시간 등록] %s screen=%s fids=%s", code, screen_no, fids)
 
     def register_realtime_indices(self):
         """KOSPI(001)/KOSDAQ(101) 업종지수 실시간 등록 — 1회만 호출.
@@ -3641,55 +4430,51 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.queue_sell_intent(code, reason, order_price, order_gubun)
 
     def predict_stock(self, code):
+        code = self.normalize_code(code)
+        position = self.portfolio.get(code)
+        if (
+            position is not None
+            and getattr(position, "breakout_grade", "") == "SAFE"
+            and getattr(position, "entry_stage", 0) == 1
+        ):
+            return self.score_safe_pullback_second_entry(code, position)
+        if code in self.monitoring_dict:
+            return self.score_safe_pullback_trade(code)
         return self.score_opening_trade(code)
 
 
-def _log_dante_startup_banner():
-    """단테 전략 핵심 파라미터를 시작 시 로그에 한 번 출력한다.
-
-    소프트 롤아웃 1일차에 운영자가 게이트/청산 임계값을 즉시 확인할 수 있도록 한다.
-    """
+def _log_quant_condition_startup_banner():
+    """퀀트조건식 운용 파라미터를 시작 시 로그에 한 번 출력한다."""
     logger.info("=" * 78)
-    logger.info("[단테 추세전략] A급(0봉 돌파) 감시→첫 눌림 본진입(100%%) | B급(1봉 돌파) 첫 눌림 일괄(%.0f%%)",
-                entry_strategy.DANTE_GRADE_B_RATIO * 100)
-    logger.info("[게이트] 체결강도 Hard≥%.0f / Soft%.0f~%.0f(추세상승필요) / 거래대금속도≥%.1f백만원/분 / 스프레드≤%.2f%% / 관찰%.0f초 / 최소틱%d",
-                entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
-                entry_strategy.MIN_CHEJAN_STRENGTH_SOFT,
-                entry_strategy.MIN_CHEJAN_STRENGTH_HARD,
-                entry_strategy.MIN_TURNOVER_SPEED_PER_MIN / 1_000_000,
-                entry_strategy.MAX_SPREAD_RATE * 100,
-                entry_strategy.DANTE_MIN_OBSERVATION_SECONDS,
-                entry_strategy.DANTE_MIN_TICKS)
-    logger.info("[가짜돌파/과열] 5분봉 윗꼬리≤%.0f%% / 시가대비≤+%.0f%%(09:30~ %.0f%%, 11:00~ %.0f%%, 14:00~ %.0f%%; 눌림구조 필요) / BB55 거리≤+%.1f%%",
-                entry_strategy.MAX_UPPER_WICK_RATIO * 100,
-                entry_strategy.OVERHEATED_OPEN_RETURN * 100,
-                entry_strategy.OVERHEATED_OPEN_RETURN_MORNING * 100,
-                entry_strategy.OVERHEATED_OPEN_RETURN_MIDDAY * 100,
-                entry_strategy.OVERHEATED_OPEN_RETURN_LATE * 100,
-                entry_strategy.OVERHEATED_BB55_DISTANCE * 100)
-    logger.info("[눌림] %.2f%% ~ %.2f%% (고점대비 -%.2f%% 초과 시 차단), 음봉%d~%d 후 양봉반전, 윈도우 %d초",
-                entry_strategy.PULLBACK_MIN_PCT * 100,
-                entry_strategy.PULLBACK_MAX_PCT * 100,
-                entry_strategy.MAX_DRAWDOWN_FROM_HIGH * 100,
-                entry_strategy.PULLBACK_NEG_BARS_MIN,
-                entry_strategy.PULLBACK_NEG_BARS_MAX,
-                entry_strategy.PULLBACK_WINDOW_MAX_SECONDS)
-    logger.info("[청산] -1R(%.2f%%) 손절 → +1R BE → +2R %.0f%% 부분익절 → 잔량 추세이탈, 시간손절 %d초",
-                exit_strategy.R_UNIT_PCT * 100,
-                exit_strategy.EXIT_PARTIAL_RATIO * 100,
-                exit_strategy.EXIT_TIME_LIMIT_SECONDS)
-    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, AI서버=%s, 구학습=%s, 단테학습=%s(%s), shadow=%s(%s)",
+    logger.info(
+        "[%s] rule=%s | 조건식='%s' | 수식=%s",
+        TRADE_LOG_STRATEGY_NAME,
+        TRADE_LOG_RULE_VERSION,
+        CONDITION_NAME,
+        TRADE_LOG_CONDITION_FORMULA,
+    )
+    logger.info("[조건식 상세] %s", TRADE_LOG_CONDITION_RULES)
+    logger.info(
+        "[매수룰] 조건편입 즉시 SetRealReg -> 첫 실시간 체결가를 포착가로 저장 -> 현재가가 포착가 대비 -%.2f%% 이상 눌리고 체결강도 %.0f 이상이면 지정가 매수",
+        QUANT_ENTRY_PULLBACK_PCT * 100,
+        QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+    )
+    logger.info(
+        "[매도룰] 매수가 대비 +%.2f%% 전량 익절 / -%.2f%% 전량 손절",
+        QUANT_TAKE_PROFIT_PCT * 100,
+        QUANT_STOP_LOSS_PCT * 100,
+    )
+    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, 주문간격 %.2fs(초당 5회 이하), AI서버=%s, 구학습=%s, 조건식학습=%s(%s), shadow=%s(%s)",
                 MAX_CONCURRENT_POSITIONS,
                 MAX_DAILY_BUY_COUNT,
                 OPENING_FORCE_EXIT,
+                ORDER_REQUEST_INTERVAL_SECONDS,
                 "ON" if AI_SERVER_ENABLED else "OFF",
                 "ON" if TRAINING_DATA_ENABLED else "OFF",
                 "ON" if DANTE_TRAINING_DATA_ENABLED else "OFF",
                 DANTE_TRAINING_CSV,
                 "ON" if DANTE_SHADOW_TRAINING_DATA_ENABLED else "OFF",
                 DANTE_SHADOW_TRAINING_CSV)
-    logger.info("[조건식] 영웅문 등록명='%s' (단테조건식.xls 의 다중 BB/Envelope 상향돌파 + 거래량 + 체결강도)",
-                CONDITION_NAME)
     logger.info("=" * 78)
 
 
@@ -3697,7 +4482,7 @@ def main():
     app = QApplication(sys.argv)
     kiwoom = Kiwoom()
 
-    _log_dante_startup_banner()
+    _log_quant_condition_startup_banner()
 
     my_deposit = kiwoom.get_deposit()
     logger.info("남은 예수금 : %s", my_deposit)

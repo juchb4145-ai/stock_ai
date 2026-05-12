@@ -248,26 +248,55 @@ def _profit_factor(returns: List[float]) -> Optional[float]:
     return wins / losses
 
 
+def _payoff_ratio(rs: List[float]) -> Optional[float]:
+    wins = [r for r in rs if r is not None and r == r and r > 0]
+    losses = [-r for r in rs if r is not None and r == r and r < 0]
+    if not wins or not losses:
+        return None
+    avg_loss = mean(losses)
+    if avg_loss <= 0:
+        return None
+    return mean(wins) / avg_loss
+
+
+def _ratio(rows: List[Dict[str, object]], field: str) -> Optional[float]:
+    values = [r.get(field) for r in rows if r.get(field) is not None]
+    if not values:
+        return None
+    return sum(1 for value in values if value) / len(values)
+
+
 def _aggregate_group(rows: List[Dict[str, object]]) -> Dict[str, object]:
     if not rows:
         return {"n": 0, "win_rate": None, "avg_r": None,
                 "avg_mfe_r": None, "avg_mae_r": None,
-                "avg_realized": None, "profit_factor": None}
+                "avg_give_back_r": None, "avg_realized": None,
+                "profit_factor": None, "payoff_ratio": None,
+                "reached_1r_rate": None, "reached_2r_rate": None,
+                "hit_stop_rate": None, "expectancy_ok": False}
     rs = [r.get("r_multiple") for r in rows]
     realized = [r.get("realized_return") for r in rows]
     mfe = [r.get("mfe_r") for r in rows]
     mae = [r.get("mae_r") for r in rows]
+    give_back = [r.get("give_back_r") for r in rows]
     valid_realized = [r for r in realized if r is not None and r == r]
     wins = sum(1 for r in valid_realized if r > 0)
     win_rate = wins / len(valid_realized) if valid_realized else None
+    avg_r = _safe_mean(rs)
     return {
         "n": len(rows),
         "win_rate": win_rate,
-        "avg_r": _safe_mean(rs),
+        "avg_r": avg_r,
         "avg_realized": _safe_mean(valid_realized),
         "avg_mfe_r": _safe_mean(mfe),
         "avg_mae_r": _safe_mean(mae),
+        "avg_give_back_r": _safe_mean(give_back),
         "profit_factor": _profit_factor(valid_realized),
+        "payoff_ratio": _payoff_ratio(rs),
+        "reached_1r_rate": _ratio(rows, "reached_1r"),
+        "reached_2r_rate": _ratio(rows, "reached_2r"),
+        "hit_stop_rate": _ratio(rows, "hit_stop"),
+        "expectancy_ok": bool(avg_r is not None and avg_r > 0),
     }
 
 
@@ -747,6 +776,8 @@ def _print_summary(result: RollingResult) -> None:
         avg_r = ovr.get("avg_r")
         win_rate = ovr.get("win_rate")
         pf = ovr.get("profit_factor")
+        hit_stop = ovr.get("hit_stop_rate")
+        payoff = ovr.get("payoff_ratio")
         print(
             "  [{w}d] dates={d}건 trades={n} avg_r={ar} win={wr} pf={pf} confidence={c}".format(
                 w=s.window,

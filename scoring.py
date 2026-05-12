@@ -279,7 +279,43 @@ DANTE_ENTRY_FEATURE_NAMES = (
     "chejan_strength_trend",   # 체결강도 history 의 (후반 평균 - 전반 평균). 양수면 우상향
     "upper_wick_ratio",        # 5분봉 진행봉 윗꼬리 비율 (0~1). 가짜 돌파 지표
     "open_return",             # (현재가 / 시가) - 1. 과열 지표
+    # === W1 보강: 종목 변동성/매수자 평균 ===
+    "atr_5m_pct",              # 5분봉 ATR(14) / last_close. 0 이면 데이터 부족.
+    "px_over_vwap_pct",        # (현재가 / 일중 VWAP) - 1. 0 이면 VWAP 데이터 부족.
+    "pullback_below_vwap_pct", # (VWAP - 풀백 저점) / VWAP. 양수면 저점이 VWAP 아래(고점추매 위험).
+    # === RSI 보조 피처: 매수 버튼이 아니라 과열/눌림 품질을 모델이 보게 하는 입력 ===
+    "rsi_7",                   # 1분봉 RSI(7). 0 이면 데이터 부족.
+    "rsi_14",                  # 1분봉 RSI(14). 0 이면 데이터 부족.
+    "rsi_14_prev",             # 직전 1분봉까지 계산한 RSI(14).
+    "rsi_14_slope",            # rsi_14 - rsi_14_prev. 양수면 단기 회복.
+    "rsi_overbought_80",       # rsi_14 >= 80 이면 1. 추격 과열 후보.
+    "rsi_oversold_30",         # rsi_14 <= 30 이면 1. 낙폭 과대 후보.
+    "rsi_rebound_from_50",     # rsi_14 가 50선을 회복하면 1.
 )
+
+
+def _rsi_from_closes(closes: Sequence[float], period: int) -> float:
+    if period <= 0 or len(closes) < period + 1:
+        return 0.0
+    window = [float(v) for v in closes[-(period + 1):] if v and v > 0]
+    if len(window) < period + 1:
+        return 0.0
+
+    gains = 0.0
+    losses = 0.0
+    for prev, cur in zip(window, window[1:]):
+        change = cur - prev
+        if change > 0:
+            gains += change
+        elif change < 0:
+            losses -= change
+
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0.0:
+        return 100.0 if avg_gain > 0.0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def build_dante_entry_features(
@@ -299,6 +335,9 @@ def build_dante_entry_features(
     is_breakout_prev_bar: bool = False,
     upper_wick_ratio: float = 0.0,
     open_return: float = 0.0,
+    atr_5m_pct: float = 0.0,
+    intraday_vwap: float = 0.0,
+    pullback_low_after_high: int = 0,
 ) -> Dict[str, float]:
     """단테 학습 트랙용 단일 샘플 피처를 만든다.
 
@@ -337,6 +376,16 @@ def build_dante_entry_features(
                 neg_streak += 1
             else:
                 break
+    closes = [
+        float(getattr(bar, "close", 0) or 0.0)
+        for bar in minute_bars
+        if getattr(bar, "close", 0)
+    ]
+    rsi_7 = _rsi_from_closes(closes, 7)
+    rsi_14 = _rsi_from_closes(closes, 14)
+    rsi_14_prev = _rsi_from_closes(closes[:-1], 14) if len(closes) > 14 else 0.0
+    rsi_14_slope = rsi_14 - rsi_14_prev if rsi_14 > 0.0 and rsi_14_prev > 0.0 else 0.0
+    rsi_rebound_from_50 = 1.0 if rsi_14 >= 50.0 and 0.0 < rsi_14_prev < 50.0 else 0.0
 
     chejan_trend = 0.0
     if chejan_strength_history:
@@ -349,6 +398,26 @@ def build_dante_entry_features(
 
     grade_a_flag = 1.0 if is_breakout_zero_bar else 0.0
     grade_b_flag = 1.0 if (is_breakout_prev_bar and not is_breakout_zero_bar) else 0.0
+
+    # === W1 보강: VWAP 위치 / 풀백 저점 vs VWAP ===
+    if intraday_vwap and intraday_vwap > 0 and current_price and current_price > 0:
+        px_over_vwap = current_price / float(intraday_vwap) - 1.0
+    else:
+        px_over_vwap = 0.0
+    if (
+        intraday_vwap
+        and intraday_vwap > 0
+        and pullback_low_after_high
+        and pullback_low_after_high > 0
+    ):
+        pullback_below_vwap = (float(intraday_vwap) - float(pullback_low_after_high)) / float(
+            intraday_vwap
+        )
+        # 음수(저점이 VWAP 위)는 0 으로 클램프 — "위반량" 만 학습 신호로 활용.
+        if pullback_below_vwap < 0.0:
+            pullback_below_vwap = 0.0
+    else:
+        pullback_below_vwap = 0.0
 
     return {
         "chejan_strength": float(chejan_strength or 0.0),
@@ -366,6 +435,16 @@ def build_dante_entry_features(
         "chejan_strength_trend": float(chejan_trend),
         "upper_wick_ratio": float(max(0.0, min(1.0, upper_wick_ratio or 0.0))),
         "open_return": float(open_return or 0.0),
+        "atr_5m_pct": float(max(0.0, atr_5m_pct or 0.0)),
+        "px_over_vwap_pct": float(px_over_vwap),
+        "pullback_below_vwap_pct": float(pullback_below_vwap),
+        "rsi_7": float(rsi_7),
+        "rsi_14": float(rsi_14),
+        "rsi_14_prev": float(rsi_14_prev),
+        "rsi_14_slope": float(rsi_14_slope),
+        "rsi_overbought_80": 1.0 if rsi_14 >= 80.0 else 0.0,
+        "rsi_oversold_30": 1.0 if 0.0 < rsi_14 <= 30.0 else 0.0,
+        "rsi_rebound_from_50": rsi_rebound_from_50,
     }
 
 

@@ -259,7 +259,7 @@ def _build_entry_plan(
     risk_per_share = max(entry_limit - stop_price, unit)
     risk_pct = risk_per_share / entry_limit if entry_limit > 0 else 0.0
     target_r = 2.0
-    if response.model_score and response.model_score >= max(response.model_threshold, 0.65):
+    if req.enforce_model and response.model_score and response.model_score >= max(response.model_threshold, 0.65):
         target_r = 2.3
     take_profit = scoring.round_up_to_tick(entry_limit + risk_per_share * target_r)
     rr = (take_profit - entry_limit) / risk_per_share if risk_per_share > 0 else 0.0

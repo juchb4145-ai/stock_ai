@@ -233,18 +233,43 @@ def _fmt_dt(value):
     return value.strftime("%H:%M:%S")
 
 
+def _valid_numbers(values):
+    return [value for value in values if value is not None and value == value]
+
+
+def _profit_factor_from_r(rs: List[float]):
+    wins = sum(r for r in rs if r > 0)
+    losses = -sum(r for r in rs if r < 0)
+    if losses <= 0:
+        return None
+    return wins / losses
+
+
 def _summary_lines(trades: List[Trade]) -> List[str]:
     closed = [t for t in trades if t.is_closed]
     if not closed:
         return ["- 청산 완료된 거래 없음"]
     rs = [t.metrics.get("r_multiple", float("nan")) for t in closed]
-    rs = [r for r in rs if r == r]
+    rs = _valid_numbers(rs)
     win_rate = sum(1 for r in rs if r > 0) / len(rs) if rs else 0
     avg_r = mean(rs) if rs else float("nan")
+    pf_r = _profit_factor_from_r(rs)
+    avg_win_r = mean([r for r in rs if r > 0]) if any(r > 0 for r in rs) else float("nan")
+    avg_loss_r = mean([r for r in rs if r < 0]) if any(r < 0 for r in rs) else float("nan")
+    mfe_rs = _valid_numbers([t.metrics.get("mfe_r", float("nan")) for t in closed])
+    mae_rs = _valid_numbers([t.metrics.get("mae_r", float("nan")) for t in closed])
+    giveback_rs = _valid_numbers([t.metrics.get("give_back_r", float("nan")) for t in closed])
+    reached_1r = [t for t in closed if t.reached_1r is not None]
+    reached_2r = [t for t in closed if t.reached_2r is not None]
+    hit_stop = [t for t in closed if t.hit_stop is not None]
 
     entry_counter = Counter(t.entry_class for t in closed)
     exit_counter = Counter(t.exit_class for t in closed)
     return [
+        f"- expectancy: **{avg_r:+.2f}R/trade** / win: **{win_rate:.0%}** / PF: **{'n/a' if pf_r is None else f'{pf_r:.2f}'}**",
+        f"- payoff: avg_win **{_fmt_r(avg_win_r)}** / avg_loss **{_fmt_r(avg_loss_r)}**",
+        f"- excursion: MFE **{_fmt_r(mean(mfe_rs) if mfe_rs else float('nan'))}** / MAE **{_fmt_r(mean(mae_rs) if mae_rs else float('nan'))}** / give-back **{_fmt_r(mean(giveback_rs) if giveback_rs else float('nan'))}**",
+        f"- path: 1R **{'n/a' if not reached_1r else f'{sum(1 for t in reached_1r if t.reached_1r >= 1) / len(reached_1r):.0%}'}** / 2R **{'n/a' if not reached_2r else f'{sum(1 for t in reached_2r if t.reached_2r >= 1) / len(reached_2r):.0%}'}** / stop **{'n/a' if not hit_stop else f'{sum(1 for t in hit_stop if t.hit_stop >= 1) / len(hit_stop):.0%}'}**",
         f"- 청산 완료 거래: **{len(closed)}건**",
         f"- 평균 R: **{avg_r:+.2f}R** / 승률: **{win_rate:.0%}**",
         f"- 진입 분류: " + ", ".join(f"{k} {v}" for k, v in entry_counter.most_common()),

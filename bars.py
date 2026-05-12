@@ -1,12 +1,14 @@
-"""1분봉 집계 + 5분봉 BB/Envelope 캐시.
+"""1분봉 집계 + 5분봉 BB/Envelope/ATR 캐시 + 일중 VWAP.
 
 - MinuteBarAggregator: main.py 의 실시간 틱 수신 콜백에서 push 를 호출해
   종목별 1분봉 OHLCV 시퀀스를 누적한다. 분(minute)이 바뀌면 직전 봉이
-  자동으로 finalize 되고 새 봉이 시작된다.
+  자동으로 finalize 되고 새 봉이 시작된다. 동시에 일중 VWAP(price×volume
+  누적)도 종목별로 갱신해 ``intraday_vwap(code)`` 로 즉시 조회 가능하다.
 
-- FiveMinIndicatorCache: opt10080(분봉, 시간단위=5) TR 응답으로 종가 시퀀스를
-  push 받아 BB(45,2)/BB(55,2)/Envelope(13,2.5)/Envelope(22,2.5) 의 상한선만
-  계산해 캐시한다. 단테조건식과 동일한 (period, std_mult/pct) 설정.
+- FiveMinIndicatorCache: opt10080(분봉, 시간단위=5) TR 응답으로 종가/OHLC
+  시퀀스를 push 받아 BB(45,2)/BB(55,2)/Envelope(13,2.5)/Envelope(22,2.5)
+  의 상한선과 ATR(14) 비율(% 기준)을 계산해 캐시한다. ATR 비율은
+  entry_strategy 의 동적 풀백 임계 산출에 사용된다.
 
 설계 의도:
   - 순수 stdlib(statistics/math)만 사용 → 32비트 venv 에서도 그대로 동작.
@@ -26,6 +28,10 @@ from typing import Deque, Dict, List, Optional
 # 기본 파라미터(단테조건식과 동일)
 BB_SETUPS = ((45, 2.0), (55, 2.0))
 ENVELOPE_SETUPS = ((13, 2.5), (22, 2.5))
+
+# ATR(평균 True Range) 기간. 5분봉 14개 = 약 70분치 변동성.
+# 단테 진입 정밀도 향상용 동적 풀백 임계(entry_strategy)에 사용한다.
+ATR_PERIOD_DEFAULT = 14
 
 
 @dataclass
@@ -49,6 +55,11 @@ class MinuteBarAggregator:
 
     틱 수신 콜백에서 push 호출 → 분 경계가 바뀌면 직전 봉이 finalize 되고
     새 봉이 시작된다. all_bars(code) 는 [완성봉..., 진행봉] 순서로 반환한다.
+
+    동일 push 호출 안에서 일중 VWAP(price × delta_volume 누적) 도 갱신해
+    ``intraday_vwap(code)`` 로 즉시 조회할 수 있다. VWAP 은 거래량 가중
+    평균이라 진입 풀백 저점이 매수자 평균 손익분기 위에 있는지 판단하는
+    "고점추매 차단 게이트" 의 근거가 된다.
     """
 
     def __init__(self, max_bars: int = 60) -> None:
@@ -58,6 +69,9 @@ class MinuteBarAggregator:
         )
         # accum_volume 은 일중 누적이므로 1분 단위 거래량은 차분으로 계산.
         self._prev_accum_volume: Dict[str, int] = {}
+        # 일중 VWAP 누적: price * delta_volume 합 / delta_volume 합
+        self._vwap_pv: Dict[str, float] = {}
+        self._vwap_v: Dict[str, int] = {}
 
     def push(
         self,
@@ -79,6 +93,11 @@ class MinuteBarAggregator:
             prev_accum = accum_volume
         delta_volume = max(int(accum_volume) - int(prev_accum), 0)
         self._prev_accum_volume[code] = int(accum_volume)
+
+        # 일중 VWAP 누적. delta_volume == 0 이면 가격대비 거래 미발생이므로 skip.
+        if delta_volume > 0 and close > 0:
+            self._vwap_pv[code] = self._vwap_pv.get(code, 0.0) + float(close) * float(delta_volume)
+            self._vwap_v[code] = self._vwap_v.get(code, 0) + int(delta_volume)
 
         if not bars or bars[-1].minute_start != minute_start:
             new_bar = MinuteBar(
@@ -120,6 +139,8 @@ class MinuteBarAggregator:
     def discard(self, code: str) -> None:
         self._bars.pop(code, None)
         self._prev_accum_volume.pop(code, None)
+        self._vwap_pv.pop(code, None)
+        self._vwap_v.pop(code, None)
 
     # --- 도메인 view ---
 
@@ -136,6 +157,41 @@ class MinuteBarAggregator:
             return None
         closes = [b.close for b in bars[-period:]]
         return sum(closes) / period
+
+    def intraday_vwap(self, code: str) -> float:
+        """일중 거래량 가중 평균가. 데이터 없으면 0.0.
+
+        delta_volume 이 한 번이라도 양수로 들어왔어야 의미를 갖는다. 신규
+        편입 직후 누적 거래량 차분이 0이거나 첫 push 직후엔 0.0 을 반환해
+        호출측이 "VWAP 데이터 미수신" 으로 안전하게 처리할 수 있게 한다.
+        """
+        v = self._vwap_v.get(code, 0)
+        if v <= 0:
+            return 0.0
+        return self._vwap_pv.get(code, 0.0) / float(v)
+
+    def pullback_low_after_high(
+        self, code: str, *, lookback: int = 15
+    ) -> int:
+        """최근 lookback 봉 중 최고가 형성 이후의 최저가.
+
+        compute_pullback_anchor 와 동일한 의미(고점→풀백 시퀀스만 인정)지만
+        bars push 시점의 최신 데이터를 그대로 본다. 호출측은 0 이면 데이터
+        부족으로 보고 정적 fallback 을 사용해야 한다.
+        """
+        bars = self.all_bars(code)
+        if not bars:
+            return 0
+        recent = bars[-lookback:]
+        highs = [(idx, b.high) for idx, b in enumerate(recent) if b.high > 0]
+        if not highs:
+            return 0
+        i_high, _ = max(highs, key=lambda item: item[1])
+        after = recent[i_high + 1:]
+        lows = [b.low for b in after if b.low > 0]
+        if not lows:
+            return 0
+        return int(min(lows))
 
 
 # === 5분봉 지표 ===
@@ -160,6 +216,53 @@ def _envelope_upper(closes: List[float], period: int, pct: float) -> Optional[fl
     window = closes[-period:]
     mean = sum(window) / period
     return mean * (1 + pct / 100.0)
+
+
+def _sma(closes: List[float], period: int) -> Optional[float]:
+    if len(closes) < period:
+        return None
+    window = closes[-period:]
+    return sum(window) / period
+
+
+def _atr_pct(bars, period: int = ATR_PERIOD_DEFAULT) -> Optional[float]:
+    """5분봉 ATR(period) / last_close. 봉이 period+1 개 미만이면 None.
+
+    True Range = max(high-low, |high - prev_close|, |prev_close - low|).
+    단순 평균(SMA) 으로 계산. % 단위로 환산해 종목별 가격대 영향 제거.
+
+    ``bars`` 의 각 항목은 (open, high, low, close[, volume]) 튜플 또는 동일
+    인덱싱 객체. 데이터가 더러우면(0/None) None 반환.
+    """
+    if not bars or len(bars) < period + 1:
+        return None
+    trs: List[float] = []
+    prev_close: Optional[float] = None
+    # 가장 오래된 봉부터 prev_close 를 갱신해가며 TR 시퀀스를 만든다.
+    for bar in bars:
+        try:
+            high = float(bar[1]) if bar[1] else 0.0
+            low = float(bar[2]) if bar[2] else 0.0
+            close = float(bar[3]) if bar[3] else 0.0
+        except (TypeError, IndexError):
+            return None
+        if high <= 0 or low <= 0 or close <= 0 or high < low:
+            prev_close = close if close > 0 else prev_close
+            continue
+        if prev_close is None or prev_close <= 0:
+            tr = high - low
+        else:
+            tr = max(high - low, abs(high - prev_close), abs(prev_close - low))
+        trs.append(tr)
+        prev_close = close
+    if len(trs) < period:
+        return None
+    window = trs[-period:]
+    atr = sum(window) / period
+    last_close = prev_close or 0.0
+    if last_close <= 0:
+        return None
+    return atr / last_close
 
 
 @dataclass
@@ -191,6 +294,11 @@ class FiveMinIndicators:
     prev_low: Optional[float] = None
     prev_close: Optional[float] = None
     pre_prev_close: Optional[float] = None
+    sma20: Optional[float] = None
+    sma20_prev: Optional[float] = None
+    # 5분봉 ATR(14) / last_close. 봉 부족 시 None.
+    # entry_strategy 의 동적 풀백 임계 산출에 사용. None 이면 정적 임계로 fallback.
+    atr_pct: Optional[float] = None
 
     def trend_up(self, current_price: float) -> bool:
         """현재가가 5분봉 추세 위에 있는지(Envelope(13) 상단 또는 BB(55) 상단 위)."""
@@ -304,6 +412,8 @@ class FiveMinIndicatorCache:
             bb_upper_55_2=_bb_upper(cleaned, 55, 2.0),
             env_upper_13_25=_envelope_upper(cleaned, 13, 2.5),
             env_upper_22_25=_envelope_upper(cleaned, 22, 2.5),
+            sma20=_sma(cleaned, 20),
+            sma20_prev=_sma(cleaned[:-1], 20),
             last_close=cleaned[-1] if cleaned else None,
             closes_count=len(cleaned),
             updated_at=time.time(),
@@ -360,6 +470,8 @@ class FiveMinIndicatorCache:
             bb_upper_55_2_prev=_bb_upper(closes_excluding_cur, 55, 2.0),
             env_upper_13_25_prev=_envelope_upper(closes_excluding_cur, 13, 2.5),
             env_upper_22_25_prev=_envelope_upper(closes_excluding_cur, 22, 2.5),
+            sma20=_sma(closes, 20),
+            sma20_prev=_sma(closes_excluding_cur, 20),
             last_close=closes[-1],
             closes_count=len(closes),
             updated_at=time.time(),
@@ -371,6 +483,7 @@ class FiveMinIndicatorCache:
             prev_low=prev_l,
             prev_close=prev_c,
             pre_prev_close=pre_prev_c,
+            atr_pct=_atr_pct(bars, ATR_PERIOD_DEFAULT),
         )
         self._indicators[code] = ind
         return ind

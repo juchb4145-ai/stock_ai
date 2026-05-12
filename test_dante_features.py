@@ -296,7 +296,7 @@ class BuildDanteFeaturesTests(unittest.TestCase):
         )
         self.assertAlmostEqual(f["open_return"], 0.085)
 
-    def test_all_15_features_present(self):
+    def test_all_features_present(self):
         f = scoring.build_dante_entry_features(
             current_price=10_000, chejan_strength=130.0, volume_speed=900.0,
             spread_rate=0.001, obs_elapsed_sec=20.0,
@@ -306,7 +306,115 @@ class BuildDanteFeaturesTests(unittest.TestCase):
         )
         # 학습 헤더와 1:1 일치 — 추가/삭제 시 train 코드도 깨져야 한다.
         self.assertEqual(set(f.keys()), set(scoring.DANTE_ENTRY_FEATURE_NAMES))
-        self.assertEqual(len(f), 15)
+        self.assertEqual(len(f), len(scoring.DANTE_ENTRY_FEATURE_NAMES))
+
+    def test_rsi_features_from_minute_bars(self):
+        closes = [
+            10_000, 9_980, 9_960, 9_940, 9_920,
+            9_900, 9_880, 9_860, 9_840, 9_820,
+            9_800, 9_810, 9_820, 9_830, 9_840,
+            10_040,
+        ]
+        bars = [
+            make_bar(open_=close - 10, close=close, ts=1_000 + idx * 60)
+            for idx, close in enumerate(closes)
+        ]
+        f = scoring.build_dante_entry_features(
+            current_price=10_080, chejan_strength=130.0, volume_speed=900.0,
+            spread_rate=0.001, obs_elapsed_sec=20.0,
+            env_upper_13=9_900, bb_upper_55=9_900,
+            five_min_closes_count=60, breakout_high=10_100,
+            minute_bars=bars,
+        )
+        self.assertGreater(f["rsi_7"], f["rsi_14"])
+        self.assertGreater(f["rsi_14_slope"], 0.0)
+        self.assertEqual(f["rsi_rebound_from_50"], 1.0)
+        self.assertEqual(f["rsi_overbought_80"], 0.0)
+        self.assertEqual(f["rsi_oversold_30"], 0.0)
+
+    def test_rsi_features_zero_when_bars_insufficient(self):
+        bars = [make_bar(open_=10_000, close=10_010, ts=1_000)]
+        f = scoring.build_dante_entry_features(
+            current_price=10_010, chejan_strength=130.0, volume_speed=900.0,
+            spread_rate=0.001, obs_elapsed_sec=20.0,
+            env_upper_13=9_900, bb_upper_55=9_900,
+            five_min_closes_count=60, breakout_high=10_050,
+            minute_bars=bars,
+        )
+        self.assertEqual(f["rsi_7"], 0.0)
+        self.assertEqual(f["rsi_14"], 0.0)
+        self.assertEqual(f["rsi_14_slope"], 0.0)
+
+
+class W1AtrVwapFeatureTests(unittest.TestCase):
+    """W1 보강: atr_5m_pct / px_over_vwap_pct / pullback_below_vwap_pct."""
+
+    def _base_kwargs(self) -> dict:
+        return dict(
+            current_price=10_000,
+            chejan_strength=130.0,
+            volume_speed=900.0,
+            spread_rate=0.001,
+            obs_elapsed_sec=20.0,
+            env_upper_13=9_900,
+            bb_upper_55=9_900,
+            five_min_closes_count=60,
+            breakout_high=10_050,
+            minute_bars=[],
+        )
+
+    def test_atr_pct_pass_through_and_clamped(self):
+        f = scoring.build_dante_entry_features(**self._base_kwargs(), atr_5m_pct=0.035)
+        self.assertAlmostEqual(f["atr_5m_pct"], 0.035)
+
+        # 음수는 0으로 클램프 (LightGBM NaN 방지)
+        f2 = scoring.build_dante_entry_features(**self._base_kwargs(), atr_5m_pct=-0.01)
+        self.assertEqual(f2["atr_5m_pct"], 0.0)
+
+    def test_px_over_vwap_pct_positive_when_above(self):
+        f = scoring.build_dante_entry_features(
+            **{**self._base_kwargs(), "current_price": 10_200}, intraday_vwap=10_000.0
+        )
+        self.assertAlmostEqual(f["px_over_vwap_pct"], 0.02)
+
+    def test_px_over_vwap_pct_negative_when_below(self):
+        f = scoring.build_dante_entry_features(
+            **{**self._base_kwargs(), "current_price": 9_800}, intraday_vwap=10_000.0
+        )
+        self.assertAlmostEqual(f["px_over_vwap_pct"], -0.02)
+
+    def test_px_over_vwap_zero_when_no_vwap(self):
+        f = scoring.build_dante_entry_features(**self._base_kwargs(), intraday_vwap=0.0)
+        self.assertEqual(f["px_over_vwap_pct"], 0.0)
+
+    def test_pullback_below_vwap_pct_only_records_violation(self):
+        # 풀백 저점 9_900 < VWAP 10_000 → 위반 1%
+        f = scoring.build_dante_entry_features(
+            **self._base_kwargs(),
+            intraday_vwap=10_000.0,
+            pullback_low_after_high=9_900,
+        )
+        self.assertAlmostEqual(f["pullback_below_vwap_pct"], 0.01)
+
+    def test_pullback_below_vwap_zero_when_low_above_vwap(self):
+        # 풀백 저점이 VWAP 위면 violation 없음 → 0
+        f = scoring.build_dante_entry_features(
+            **self._base_kwargs(),
+            intraday_vwap=10_000.0,
+            pullback_low_after_high=10_100,
+        )
+        self.assertEqual(f["pullback_below_vwap_pct"], 0.0)
+
+    def test_pullback_below_vwap_zero_when_no_data(self):
+        # VWAP 또는 저점 데이터 미수신 → 0 (게이트 skip 과 정합)
+        f1 = scoring.build_dante_entry_features(
+            **self._base_kwargs(), intraday_vwap=0.0, pullback_low_after_high=9_900
+        )
+        f2 = scoring.build_dante_entry_features(
+            **self._base_kwargs(), intraday_vwap=10_000.0, pullback_low_after_high=0
+        )
+        self.assertEqual(f1["pullback_below_vwap_pct"], 0.0)
+        self.assertEqual(f2["pullback_below_vwap_pct"], 0.0)
 
 
 if __name__ == "__main__":

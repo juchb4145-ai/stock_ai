@@ -82,6 +82,9 @@ def build_ctx(
     px_over_bb55_pct: float | None = None,
     open_return: float | None = None,
     market_state: ms.MarketSnapshot | None = None,
+    atr_5m_pct: float = 0.0,
+    intraday_vwap: float = 0.0,
+    pullback_low_after_high: int = 0,
 ) -> es.EntryContext:
     now = now_ts or time.time()
     if five_min_ind == "default":
@@ -120,6 +123,9 @@ def build_ctx(
         px_over_bb55_pct=px_over_bb55_pct,
         open_return=open_return,
         market_state=market_state,
+        atr_5m_pct=atr_5m_pct,
+        intraday_vwap=intraday_vwap,
+        pullback_low_after_high=pullback_low_after_high,
     )
 
 
@@ -289,10 +295,10 @@ class GradeBPullbackTests(unittest.TestCase):
         ts = time.time() - 60 * 5
         # 직전 고점 10_300, 음봉 2개로 약 0.6% 눌림 후 양봉 반전
         return [
-            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280),  # 양봉(고점 형성)
-            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_230, close=10_240),  # 음봉
-            make_bar(ts=ts + 120, open_=10_240, high=10_250, low=10_200, close=10_220),  # 음봉
-            make_bar(ts=ts + 180, open_=10_220, high=10_260, low=10_215, close=10_240),  # 진행봉(양봉)
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_190, close=10_200, volume=220),
+            make_bar(ts=ts + 120, open_=10_200, high=10_195, low=10_170, close=10_180, volume=160),
+            make_bar(ts=ts + 180, open_=10_180, high=10_230, low=10_185, close=10_210, volume=260),
         ]
 
     def test_b_grade_ready_on_first_pullback(self):
@@ -309,6 +315,20 @@ class GradeBPullbackTests(unittest.TestCase):
         self.assertEqual(d.grade, "B")
         self.assertAlmostEqual(d.ratio, es.DANTE_GRADE_B_RATIO)
         self.assertEqual(d.stage, 2)
+        self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
+
+    def test_b_grade_pullback_ignores_current_upper_wick_gate(self):
+        bars = self._bars_with_b_grade_pullback()
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            upper_wick_ratio_zero_bar=0.55,
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready")
+        self.assertEqual(d.grade, "B")
         self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
 
     def test_b_grade_waits_when_no_pullback(self):
@@ -346,17 +366,29 @@ class SecondEntryTests(unittest.TestCase):
         ts = time.time() - 60 * (neg_count + 2)
         bars: List[MinuteBar] = []
         # 직전 양봉 (눌림 시작 전)
-        bars.append(make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280))
+        bars.append(make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320))
         ts += 60
         # 음봉 N개
         last_close = 10_280
-        for _ in range(neg_count):
-            cand_close = last_close - 30
-            bars.append(make_bar(ts=ts, open_=last_close, high=last_close + 5, low=cand_close - 10, close=cand_close))
+        for idx in range(neg_count):
+            cand_close = last_close - 55
+            high = last_close + 5
+            if idx == neg_count - 1:
+                high = cand_close + 15
+            bars.append(
+                make_bar(
+                    ts=ts,
+                    open_=last_close,
+                    high=high,
+                    low=cand_close - 10,
+                    close=cand_close,
+                    volume=220 - idx * 60,
+                )
+            )
             last_close = cand_close
             ts += 60
         # 현재 진행봉 (양봉 반전)
-        bars.append(make_bar(ts=ts, open_=last_close, high=last_close + 40, low=last_close - 5, close=last_close + 30))
+        bars.append(make_bar(ts=ts, open_=last_close, high=last_close + 60, low=last_close + 5, close=last_close + 40, volume=260))
         return bars
 
     def test_ready_on_classic_pullback_with_two_neg_bars(self):
@@ -368,7 +400,7 @@ class SecondEntryTests(unittest.TestCase):
         self.assertAlmostEqual(d.ratio, es.DANTE_SECOND_ENTRY_RATIO)
         self.assertEqual(d.reason_code, es.READY_AGRADE_SECOND)
 
-    def test_a_grade_watch_enters_full_size_on_first_pullback(self):
+    def test_a_grade_watch_enters_on_first_pullback(self):
         bars = self._bars_with_pullback(neg_count=2)
         ctx = build_ctx(position=None, current_price=bars[-1].close, minute_bars=bars)
         d = es.evaluate_a_grade_watch_entry(
@@ -466,7 +498,7 @@ class SecondEntryTests(unittest.TestCase):
             make_bar(ts=ts, open_=10_200, high=10_280, low=10_270, close=10_275),
             make_bar(ts=ts + 60, open_=10_275, high=10_300, low=10_270, close=10_290),
         ]
-        ctx = build_ctx(position=pos, current_price=10_220, minute_bars=bars)
+        ctx = build_ctx(position=pos, current_price=10_190, minute_bars=bars)
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "wait")
         self.assertIn("음봉", d.reason)
@@ -475,10 +507,10 @@ class SecondEntryTests(unittest.TestCase):
         pos = self._position_after_stage1(breakout_high=10_300)
         ts = time.time() - 60
         bars = [
-            make_bar(ts=ts, open_=10_220, high=10_285, low=10_205, close=10_270),
-            make_bar(ts=ts + 60, open_=10_210, high=10_290, low=10_180, close=10_260),
+            make_bar(ts=ts, open_=10_220, high=10_285, low=10_170, close=10_190),
+            make_bar(ts=ts + 60, open_=10_180, high=10_230, low=10_175, close=10_210),
         ]
-        ctx = build_ctx(position=pos, current_price=10_260, minute_bars=bars)
+        ctx = build_ctx(position=pos, current_price=10_210, minute_bars=bars)
         d = es.evaluate_second_entry(ctx)
         self.assertEqual(d.status, "ready")
         self.assertEqual(d.reason_code, es.READY_AGRADE_SECOND)
@@ -556,10 +588,10 @@ class MarketDryRunGateTests(unittest.TestCase):
         # weak 매크로 + B급 첫 눌림 ready → action=allow (chase 가 아니므로)
         ts = time.time() - 60 * 5
         bars = [
-            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280),
-            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_230, close=10_240),
-            make_bar(ts=ts + 120, open_=10_240, high=10_250, low=10_200, close=10_220),
-            make_bar(ts=ts + 180, open_=10_220, high=10_260, low=10_215, close=10_240),
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_190, close=10_200, volume=220),
+            make_bar(ts=ts + 120, open_=10_200, high=10_195, low=10_170, close=10_180, volume=160),
+            make_bar(ts=ts + 180, open_=10_180, high=10_230, low=10_185, close=10_210, volume=260),
         ]
         snap = make_market_snap(regime=ms.REGIME_WEAK, pct=-0.008)
         ctx = build_ctx(
@@ -628,6 +660,323 @@ class MarketDryRunGateTests(unittest.TestCase):
         self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
         self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
         self.assertEqual(d.market_gate_reason, es.MARKET_GATE_RISK_OFF)
+
+
+class DynamicPullbackBandTests(unittest.TestCase):
+    """ATR 기반 동적 풀백 밴드 헬퍼 단위 테스트."""
+
+    def test_zero_atr_falls_back_to_static_band(self):
+        lo, hi = es.dynamic_pullback_band(0.0)
+        self.assertAlmostEqual(lo, es.PULLBACK_MIN_PCT)
+        self.assertAlmostEqual(hi, es.PULLBACK_MAX_PCT)
+
+    def test_negative_atr_falls_back_to_static_band(self):
+        lo, hi = es.dynamic_pullback_band(-0.01)
+        self.assertAlmostEqual(lo, es.PULLBACK_MIN_PCT)
+        self.assertAlmostEqual(hi, es.PULLBACK_MAX_PCT)
+
+    def test_high_volatility_widens_band(self):
+        # ATR 5% 종목은 풀백 밴드가 넓어진다
+        lo, hi = es.dynamic_pullback_band(0.05)
+        self.assertGreater(lo, es.PULLBACK_MIN_PCT)
+        self.assertGreater(hi, es.PULLBACK_MAX_PCT)
+        # 단 절대 cap 안에
+        self.assertLessEqual(hi, es.ATR_PULLBACK_CAP_MAX + 1e-9)
+
+    def test_floor_min_protects_low_volatility(self):
+        # ATR 0.5% 종목이라도 floor 가 보장된다
+        lo, hi = es.dynamic_pullback_band(0.005)
+        self.assertGreaterEqual(lo, es.ATR_PULLBACK_FLOOR_MIN - 1e-9)
+        self.assertGreater(hi, lo)
+
+    def test_drawdown_cap_scales_with_atr(self):
+        cap_low = es.dynamic_drawdown_cap(0.015)
+        cap_high = es.dynamic_drawdown_cap(0.05)
+        self.assertGreater(cap_high, cap_low)
+        self.assertLessEqual(cap_high, es.ATR_PULLBACK_DRAWDOWN_CAP + 1e-9)
+        self.assertGreaterEqual(cap_low, es.ATR_PULLBACK_DRAWDOWN_FLOOR - 1e-9)
+
+
+class GradeBDynamicPullbackTests(unittest.TestCase):
+    """ATR 동적 밴드가 B급 풀백 게이트에 실제로 적용되는지 검증."""
+
+    def _bars_with_deep_pullback(self) -> List[MinuteBar]:
+        # 직전 고점 10_300, 음봉 2개로 약 2.5% 눌림 후 양봉 반전 — 정적 임계 1.5% 로는 막힘.
+        ts = time.time() - 60 * 5
+        return [
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_150, close=10_180, volume=220),
+            make_bar(ts=ts + 120, open_=10_180, high=10_060, low=10_040, close=10_050, volume=160),
+            make_bar(ts=ts + 180, open_=10_050, high=10_100, low=10_055, close=10_080, volume=260),
+        ]
+
+    def test_high_atr_allows_deep_pullback_that_static_blocks(self):
+        bars = self._bars_with_deep_pullback()
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            atr_5m_pct=0.04,  # ATR 4% → MAX = 4% × 1.2 = 4.8%, 2.5% 풀백 통과
+            intraday_vwap=0.0,  # VWAP 게이트 skip
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready", msg=f"reason={d.reason}")
+        self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
+
+    def test_low_atr_blocks_deep_pullback(self):
+        bars = self._bars_with_deep_pullback()
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            atr_5m_pct=0.012,  # ATR 1.2% → MAX 1.44%, 위태 cap 2.0% — 2.5% 풀백은 drawdown 위반
+            intraday_vwap=0.0,
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "blocked")
+        self.assertEqual(d.reason_code, es.GATE_BGRADE_DRAWDOWN)
+
+
+class VWAPSupportGateTests(unittest.TestCase):
+    """VWAP 지지 게이트가 고점추매를 차단하는지 검증."""
+
+    def _normal_pullback_bars(self) -> List[MinuteBar]:
+        ts = time.time() - 60 * 5
+        return [
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_190, close=10_200, volume=220),
+            make_bar(ts=ts + 120, open_=10_200, high=10_195, low=10_170, close=10_180, volume=160),
+            make_bar(ts=ts + 180, open_=10_180, high=10_230, low=10_185, close=10_210, volume=260),
+        ]
+
+    def test_b_grade_blocked_when_pullback_low_below_vwap(self):
+        bars = self._normal_pullback_bars()
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            intraday_vwap=10_350.0,  # VWAP 이 풀백 저점 10_200 보다 훨씬 위 → 위반
+            pullback_low_after_high=10_200,
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "blocked")
+        self.assertEqual(d.reason_code, es.GATE_BGRADE_VWAP_LOST)
+        self.assertIn("VWAP", d.reason)
+
+    def test_b_grade_passes_when_pullback_low_above_vwap(self):
+        bars = self._normal_pullback_bars()
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            intraday_vwap=10_100.0,  # VWAP 이 풀백 저점 아래 → 통과
+            pullback_low_after_high=10_200,
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready", msg=f"reason={d.reason}")
+        self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
+
+    def test_b_grade_blocked_when_reversal_close_below_vwap(self):
+        bars = self._normal_pullback_bars()
+        # 풀백 저점은 VWAP 위지만 양봉 reversal 종가는 VWAP 아래 — 고점추매 위험 패턴
+        ctx = build_ctx(
+            current_price=bars[-1].close,  # 10_240
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            intraday_vwap=10_280.0,
+            pullback_low_after_high=10_270,  # 저점은 VWAP 근처에서 방어됐음
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_BGRADE_VWAP_REVERSAL)
+
+    def test_zero_vwap_skips_gate_safely(self):
+        """VWAP 데이터 미수신(0.0) 이면 게이트가 skip 되어 기존 흐름 유지."""
+        bars = self._normal_pullback_bars()
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            intraday_vwap=0.0,
+            pullback_low_after_high=0,
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.status, "ready", msg=f"reason={d.reason}")
+        self.assertEqual(d.reason_code, es.READY_BGRADE_PULLBACK)
+
+
+class Stage2VWAPGateTests(unittest.TestCase):
+    """Stage2 본진입에도 VWAP 게이트가 동일하게 적용되는지."""
+
+    def _stage1_position(self) -> Position:
+        now = time.time()
+        return Position(
+            code="000001",
+            entry_stage=1,
+            entry_price=10_000,
+            quantity=10,
+            planned_quantity=40,
+            entry1_time=now - 120,
+            pullback_window_deadline=now + 600,
+            breakout_high=10_300,
+        )
+
+    def _bars_with_pullback(self) -> List[MinuteBar]:
+        ts = time.time() - 60 * 5
+        return [
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_190, close=10_200, volume=220),
+            make_bar(ts=ts + 120, open_=10_200, high=10_195, low=10_170, close=10_180, volume=160),
+            make_bar(ts=ts + 180, open_=10_180, high=10_230, low=10_185, close=10_210, volume=260),
+        ]
+
+    def test_stage2_blocked_when_pullback_low_below_vwap(self):
+        bars = self._bars_with_pullback()
+        ctx = build_ctx(
+            position=self._stage1_position(),
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            intraday_vwap=10_350.0,
+            pullback_low_after_high=10_200,
+        )
+        d = es.evaluate_second_entry(ctx)
+        self.assertEqual(d.status, "blocked")
+        self.assertEqual(d.reason_code, es.GATE_STAGE2_VWAP_LOST)
+
+
+class RSIPullbackGateTests(unittest.TestCase):
+    """RSI is used as a helper filter for pullback quality, not as a buy signal."""
+
+    def _bars_from_closes(self, closes: List[int]) -> List[MinuteBar]:
+        ts = time.time() - 60 * len(closes)
+        bars: List[MinuteBar] = []
+        prev = closes[0]
+        for idx, close in enumerate(closes):
+            high = max(prev, close) + 20
+            low = min(prev, close) - 20
+            bars.append(
+                make_bar(
+                    ts=ts + idx * 60,
+                    open_=prev,
+                    high=high,
+                    low=low,
+                    close=close,
+                    volume=100 + idx,
+                )
+            )
+            prev = close
+        return bars
+
+    def test_b_grade_waits_on_shallow_vwap_overheated_rsi(self):
+        closes = [
+            10_000, 10_080, 10_160, 10_240, 10_320, 10_400, 10_480, 10_560,
+            10_640, 10_720, 10_800, 10_880, 10_960, 11_000, 10_890, 10_910,
+        ]
+        bars = self._bars_from_closes(closes)
+        bars[-3].high = 11_000
+        bars[-2].high = 10_890
+        bars[-2].low = 10_870
+        bars[-1].open = 10_890
+        bars[-1].high = 10_930
+        bars[-1].low = 10_895
+        bars[-1].close = 10_910
+        ctx = build_ctx(
+            current_price=10_910,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+            px_over_bb55_pct=0.0,
+            intraday_vwap=10_680.0,
+            pullback_low_after_high=10_870,
+        )
+
+        d = es.evaluate_first_entry(ctx)
+
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_BGRADE_RSI_OVERHEAT)
+
+    def test_stage2_waits_until_rsi_recovers_after_cooling(self):
+        pos = Position(
+            code="000001",
+            entry_stage=1,
+            entry_price=10_000,
+            quantity=10,
+            planned_quantity=40,
+            entry1_time=time.time() - 120,
+            pullback_window_deadline=time.time() + 600,
+            breakout_high=10_300,
+        )
+        closes = [
+            10_300, 10_250, 10_200, 10_150, 10_100, 10_050, 10_000, 9_950,
+            9_900, 9_850, 9_800, 9_780, 9_760, 9_740, 10_190, 10_210,
+        ]
+        bars = self._bars_from_closes(closes)
+        bars[0].high = 10_300
+        bars[-2].low = 10_170
+        bars[-1].open = 10_190
+        bars[-1].high = 10_230
+        bars[-1].low = 10_185
+        bars[-1].close = 10_210
+        ctx = build_ctx(
+            position=pos,
+            current_price=10_210,
+            minute_bars=bars,
+            intraday_vwap=10_100.0,
+            pullback_low_after_high=10_170,
+        )
+
+        d = es.evaluate_second_entry(ctx)
+
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_STAGE2_RSI_NOT_RECOVERED)
+
+
+class PullbackConfirmationGateTests(unittest.TestCase):
+    def test_waits_until_previous_bar_high_is_recovered(self):
+        ts = time.time() - 60 * 5
+        bars = [
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_190, close=10_200, volume=220),
+            make_bar(ts=ts + 120, open_=10_200, high=10_220, low=10_170, close=10_180, volume=160),
+            make_bar(ts=ts + 180, open_=10_180, high=10_230, low=10_185, close=10_210, volume=260),
+        ]
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+        )
+
+        d = es.evaluate_first_entry(ctx)
+
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_BGRADE_PULLBACK_CONFIRM)
+
+    def test_waits_until_rebound_volume_expands(self):
+        ts = time.time() - 60 * 5
+        bars = [
+            make_bar(ts=ts, open_=10_000, high=10_300, low=9_980, close=10_280, volume=320),
+            make_bar(ts=ts + 60, open_=10_280, high=10_290, low=10_190, close=10_200, volume=220),
+            make_bar(ts=ts + 120, open_=10_200, high=10_195, low=10_170, close=10_180, volume=160),
+            make_bar(ts=ts + 180, open_=10_180, high=10_230, low=10_185, close=10_210, volume=120),
+        ]
+        ctx = build_ctx(
+            current_price=bars[-1].close,
+            minute_bars=bars,
+            is_breakout_zero_bar=False,
+            is_breakout_prev_bar=True,
+        )
+
+        d = es.evaluate_first_entry(ctx)
+
+        self.assertEqual(d.status, "wait")
+        self.assertEqual(d.reason_code, es.GATE_BGRADE_PULLBACK_CONFIRM)
 
 
 if __name__ == "__main__":

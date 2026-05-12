@@ -149,6 +149,14 @@ class AggregateWindowTest(unittest.TestCase):
         self.assertAlmostEqual(stats.overall["win_rate"], 0.4, places=4)
         self.assertEqual(stats.overall["n"], 25)
 
+    def test_aggregate_emphasizes_expectancy_and_path(self):
+        stats = rolling.aggregate_window(5, [], self.rows)
+        self.assertIn("payoff_ratio", stats.overall)
+        self.assertIn("avg_give_back_r", stats.overall)
+        self.assertIn("reached_1r_rate", stats.overall)
+        self.assertIn("hit_stop_rate", stats.overall)
+        self.assertIsInstance(stats.overall["expectancy_ok"], bool)
+
     def test_aggregate_by_entry_class(self):
         stats = rolling.aggregate_window(5, [], self.rows)
         self.assertIn("breakout_chase", stats.by_entry)

@@ -94,6 +94,16 @@ class _AiWatchStub:
 
 
 class AiCandidateWatchTests(unittest.TestCase):
+    def setUp(self):
+        patches = [
+            mock.patch.object(main, "MODEL_ASSIST_ONLY", False),
+            mock.patch.object(main, "AI_CANDIDATE_PROMOTION_ENABLED", True),
+            mock.patch.object(main, "AI_CANDIDATE_WATCH_ENABLED", True),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_high_score_wait_registers_watch_without_ready_promotion(self):
         kw = _AiWatchStub()
 
@@ -140,6 +150,41 @@ class AiCandidateWatchTests(unittest.TestCase):
         self.assertEqual(out["status"], "wait")
         self.assertNotIn("000001", kw.ai_candidate_watchlist)
         self.assertEqual(out["ai_candidate_block_reason"], entry_strategy.GATE_SPREAD)
+
+    def test_deep_pullback_registers_watch_without_buying_immediately(self):
+        kw = _AiWatchStub()
+
+        out = kw.maybe_promote_ai_candidate(
+            _prediction(reason_code=entry_strategy.GATE_BGRADE_PULLBACK_DEEP)
+        )
+
+        self.assertEqual(out["status"], "wait")
+        self.assertEqual(out["ratio"], 0.0)
+        self.assertIn("000001", kw.ai_candidate_watchlist)
+        self.assertIn("000001", kw.pending_condition_codes)
+
+    def test_vwap_lost_registers_watch_for_recovery(self):
+        kw = _AiWatchStub()
+
+        out = kw.maybe_promote_ai_candidate(
+            _prediction(status="blocked", reason_code=entry_strategy.GATE_STAGE2_VWAP_LOST)
+        )
+
+        self.assertEqual(out["status"], "wait")
+        self.assertEqual(out["ratio"], 0.0)
+        self.assertIn("000001", kw.ai_candidate_watchlist)
+        self.assertIn("000001", kw.pending_condition_codes)
+
+    def test_drawdown_cap_remains_hard_blocked(self):
+        kw = _AiWatchStub()
+
+        out = kw.maybe_promote_ai_candidate(
+            _prediction(status="blocked", reason_code=entry_strategy.GATE_BGRADE_DRAWDOWN)
+        )
+
+        self.assertEqual(out["status"], "blocked")
+        self.assertNotIn("000001", kw.ai_candidate_watchlist)
+        self.assertEqual(out["ai_candidate_block_reason"], entry_strategy.GATE_BGRADE_DRAWDOWN)
 
 
 if __name__ == "__main__":

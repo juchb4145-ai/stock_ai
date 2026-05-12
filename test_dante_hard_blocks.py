@@ -39,6 +39,7 @@ import main  # noqa: E402
 
 class _StubKiwoom:
     dante_hard_blocks_ai_candidate = main.Kiwoom.dante_hard_blocks_ai_candidate
+    should_watch_pullback_recovery = main.Kiwoom.should_watch_pullback_recovery
 
 
 class DanteHardBlocksTests(unittest.TestCase):
@@ -77,6 +78,22 @@ class DanteHardBlocksTests(unittest.TestCase):
             self._predict(es.GATE_NO_BREAKOUT)
         )
         self.assertFalse(blocked)
+
+    def test_pullback_deep_and_vwap_lost_are_recovery_watchable(self):
+        kw = _StubKiwoom()
+        for rc in (
+            es.GATE_BGRADE_PULLBACK_DEEP,
+            es.GATE_STAGE2_PULLBACK_DEEP,
+            es.GATE_BGRADE_VWAP_LOST,
+            es.GATE_STAGE2_VWAP_LOST,
+        ):
+            self.assertTrue(kw.should_watch_pullback_recovery(self._predict(rc)))
+
+    def test_drawdown_cap_is_not_recovery_watchable(self):
+        kw = _StubKiwoom()
+        self.assertFalse(
+            kw.should_watch_pullback_recovery(self._predict(es.GATE_BGRADE_DRAWDOWN))
+        )
 
 
 if __name__ == "__main__":

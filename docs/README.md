@@ -90,7 +90,7 @@
 
 | 파일                                        | 역할                                                                                                       | 핵심 상수                                                                                                           |
 | ----------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| [entry_strategy.py](../entry_strategy.py) | A급(0봉 돌파 추격) / B급(1봉 돌파+눌림) 분기, 게이트(체결강도/거래속도/스프레드/관찰시간/추세 필터/과열 차단).                                    | `DANTE_FIRST_ENTRY_RATIO=0.25` `DANTE_GRADE_B_RATIO=1.0` `MIN_CHEJAN_STRENGTH_HARD=120` `MAX_SPREAD_RATE=0.006` |
+| [entry_strategy.py](../entry_strategy.py) | A급(0봉 돌파 추격) / B급(1봉 돌파+눌림) 분기, 게이트(체결강도/거래속도/스프레드/관찰시간/추세 필터/과열 차단/ATR 동적 풀백/VWAP 지지). | `DANTE_FIRST_ENTRY_RATIO=0.25` `DANTE_GRADE_B_RATIO=1.0` `MIN_CHEJAN_STRENGTH_HARD=120` `MAX_SPREAD_RATE=0.006` `ATR_PULLBACK_*_MULT` `VWAP_SUPPORT_BUFFER_PCT=0.003` |
 | [exit_strategy.py](../exit_strategy.py)   | -1R 손절 → +1R BE 이동 → +2R 50% 부분익절 → 잔량 추세이탈 → 25분 시간손절.                                                  | `R_UNIT_PCT=0.015` (1R) `EXIT_BE_R=1.0` `EXIT_PARTIAL_R=2.0` `EXIT_TIME_LIMIT_SECONDS=1500`                     |
 | [scoring.py](../scoring.py)               | 진입 피처/점수, 호가단위 round_up, calibration, 단테 학습용 피처(`build_dante_entry_features`). main 과 ai_server 의 단일 출처. | `ENTRY_WEIGHT_*` `EXIT_WEIGHT_*` `_TICK_SIZE_TABLE`                                                             |
 
@@ -101,7 +101,7 @@
 | 파일                                              | 역할                                                                                                                                       |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | [portfolio.py](../portfolio.py)                 | `Position` dataclass (`entry_stage`, `stop_price`, `breakout_grade`, `pending_sell_intent`...) + 디스크 영속화 (`save`/`load`). type-cast 강건성. |
-| [bars.py](../bars.py)                           | `MinuteBarAggregator` (실시간 틱 → 1분봉) + `FiveMinIndicatorCache` (opt10080 → BB(45,2)/BB(55,2)/Envelope(13,2.5)/Envelope(22,2.5)).          |
+| [bars.py](../bars.py)                           | `MinuteBarAggregator` (실시간 틱 → 1분봉, 일중 VWAP, 풀백 저점) + `FiveMinIndicatorCache` (opt10080 → BB(45,2)/BB(55,2)/Envelope(13,2.5)/Envelope(22,2.5)/ATR(14)).        |
 | [training_recorder.py](../training_recorder.py) | `TrainingRecorderMixin` — Kiwoom 에 합쳐지는 mixin. 4개 트랙(구학습/dante/dante_shadow/trade_log) CSV 기록 분리. 같은 모듈 상수가 `main.X` 로도 re-export 됨.     |
 
 
@@ -198,17 +198,19 @@ flowchart TB
   관찰 ≥ 30s, 실시간 틱 ≥ 5, 스프레드 ≤ 0.6%
   거래속도 ≥ 500주/s
   체결강도: Hard ≥ 120 통과 / Soft 100~120 + 추세 상승 시만 통과
-  5분봉 추세 OK + 진행봉 윗꼬리 ≤ 40%
-  과열: 시가 대비 ≤ +10% 그리고 BB55 대비 ≤ +4%
+  5분봉 추세 OK + 진행봉 윗꼬리 ≤ 30%
+  과열: 시가 대비 ≤ +8% 그리고 BB55 대비 ≤ +4%
 
 [A급 / B급 분기]
-  A급 (0봉 돌파)        → 1차 추격 25%        → 본진입 75% (눌림)
+  A급 (0봉 돌파)        → 1차 추격 25%        → 본진입 75% (눌림, 현재 watch-only)
   B급 (1봉 돌파만)      → 1차 추격 없음       → 첫 눌림에서 100% 일괄
   둘 다 아님            → wait
 
 [2차 본진입 윈도우]  1차 체결 후 10분 안에 첫 눌림 발생
-  눌림: 직전 고점 대비 -0.4% ~ -1.5% (-2% 초과 시 차단)
-  음봉 1~2개 후 양봉 반전 + 체결강도 유지
+  눌림 임계: ATR 동적 = ATR×0.20 ~ ATR×1.20 (정적 fallback 0.3% ~ 1.5%)
+  위태 차단: ATR×1.50 (정적 2.0%, floor 2.0% / cap 6.0%)
+  음봉 0~2개 후 양봉 반전 + 체결강도 유지
+  VWAP 지지: 풀백 저점 ≥ VWAP × (1 - 0.3%), 양봉 reversal 종가 ≥ VWAP
 
 [청산 (R-multiple, 1R = 1.5%)]
   1) -1R 손절 (전량)

@@ -3,10 +3,18 @@
 전략:
   - A급: 조건식 편입 후 추세 필터/체결강도/거래속도/스프레드 게이트
     통과 시 즉시 매수하지 않고 감시 상태로 둔다.
-  - A급 본진입: 감시 시작 후 1분봉 첫 눌림(직전 고점 대비 -0.4~-1.5%) +
+  - A급 본진입: 감시 시작 후 1분봉 첫 눌림(ATR 기반 동적 -X~-Y%) +
     1~2개 음봉 이후 양봉 반전 + 체결강도 유지가 모두 충족될 때 100% 본진입.
   - 1차 체결 후 PULLBACK_WINDOW_MAX_SECONDS 안에 눌림이 발생하지 않으면
     단일 포지션으로 락(should_lock_single_position == True) → 추가매수 금지.
+
+W1 보강(ATR + VWAP):
+  - 풀백 임계는 종목별 ATR 비율(``ctx.atr_5m_pct``) 로 동적 산출(고정 ±1.5%
+    의 종목 무관 한계를 제거). atr 데이터가 없으면 정적 PULLBACK_*_PCT 로 fallback.
+  - VWAP(``ctx.intraday_vwap``) 지지 게이트로 고점추매를 차단:
+      * 풀백 저점이 VWAP × (1 - VWAP_SUPPORT_BUFFER_PCT) 미만 → blocked
+      * 양봉 reversal 종가가 VWAP 미만 → wait
+    VWAP 데이터가 0(미수신) 이면 게이트 자체를 skip — 안전 fallback.
 
 이 모듈은 순수 함수만 노출한다. IO/주문은 main.py 가 결정/실행한다.
 """
@@ -69,7 +77,8 @@ OVERHEATED_OPEN_RETURN_LATE = 0.10
 OVERHEATED_BB55_DISTANCE = 0.04
 
 # === 2차(본진입) 눌림 정의 ===
-PULLBACK_MIN_PCT = 0.003  # 직전 고점 대비 -0.3% 이상
+# 정적 fallback 임계 — ATR 데이터가 없을 때만 사용. 평소엔 ATR 기반 동적 밴드를 쓴다.
+PULLBACK_MIN_PCT = 0.008  # 직전 고점 대비 -0.8% 이상
 PULLBACK_MAX_PCT = 0.015  # 직전 고점 대비 -1.5% 이내
 # 직전 고점 대비 -2% 초과로 밀린 종목은 위태로 보고 본진입 차단
 MAX_DRAWDOWN_FROM_HIGH = 0.020
@@ -78,6 +87,37 @@ PULLBACK_NEG_BARS_MIN = 0
 PULLBACK_NEG_BARS_MAX = 2
 # 본진입 윈도우 (1차 체결 후)
 PULLBACK_WINDOW_MAX_SECONDS = 10 * 60
+
+# === ATR 기반 동적 풀백 밴드 ===
+# 단테 종목은 일중 변동성(ATR)이 1.5%~8% 사이로 분산이 매우 크다. 같은 ±1.5%
+# 임계는 변동성 큰 종목엔 무조건 wait, 변동성 작은 종목엔 노이즈에 쉽게 통과.
+# ATR % 기반으로 풀백 임계를 동적으로 좁히고/넓혀 종목별 정합성을 맞춘다.
+ATR_PULLBACK_MIN_MULT = 0.20      # 동적 MIN  = ATR × 0.20  (얕은 풀백 cutoff)
+ATR_PULLBACK_MAX_MULT = 1.20      # 동적 MAX  = ATR × 1.20  (정상 풀백 상한)
+ATR_PULLBACK_DRAWDOWN_MULT = 1.50 # 동적 위태 = ATR × 1.50  (-X% 초과 시 차단)
+ATR_PULLBACK_FLOOR_MIN = 0.008    # 동적 MIN 의 절대 하한(얕은 고점 추격 보호)
+ATR_PULLBACK_CAP_MAX = 0.030      # 동적 MAX 의 절대 상한(과도한 추격 차단)
+ATR_PULLBACK_DRAWDOWN_FLOOR = 0.020  # 위태 차단의 최소 보장(MAX_DRAWDOWN_FROM_HIGH 와 동일)
+ATR_PULLBACK_DRAWDOWN_CAP = 0.060    # 위태 차단의 절대 상한
+
+# === VWAP 지지 게이트 (고점추매 차단) ===
+# 일중 VWAP 은 그날 그 종목을 산 모든 사람의 평균 매수가. 풀백 저점이 VWAP
+# 위에서 멈추면 → 매수자가 손익분기 부근에서 방어한다는 통계적 증거.
+# 풀백 저점이 VWAP × (1 - VWAP_SUPPORT_BUFFER_PCT) 미만이면 "고점 추매"
+# 위험으로 보고 차단한다. VWAP == 0 (데이터 미수신) 이면 게이트 자체를 skip.
+VWAP_SUPPORT_BUFFER_PCT = 0.003  # VWAP 의 -0.3% 까지는 노이즈로 허용
+# 양봉 reversal 의 종가는 VWAP 위에서 형성되어야 ready (고점추매 vs 정상 풀백 구분).
+VWAP_REVERSAL_REQUIRE_ABOVE = True
+
+# === RSI helper gate ===
+# RSI is not a buy signal here. It only blocks shallow overheated pullbacks and
+# waits for momentum to turn back up after the pullback has cooled.
+RSI_FAST_PERIOD = 7
+RSI_SLOW_PERIOD = 14
+RSI_OVERBOUGHT_FAST = 75.0
+RSI_RECOVERY_MIN = 50.0
+RSI_SHALLOW_PULLBACK_MAX = 0.010
+RSI_VWAP_OVERHEAT_PCT = 0.020
 
 # === Re-entry after profitable exit ===
 # A leader often shakes out after the first profit-taking leg.  This setup is
@@ -123,6 +163,11 @@ GATE_BGRADE_DRAWDOWN = "GATE_BGRADE_DRAWDOWN"
 GATE_BGRADE_PULLBACK_SHALLOW = "GATE_BGRADE_PULLBACK_SHALLOW"
 GATE_BGRADE_PULLBACK_DEEP = "GATE_BGRADE_PULLBACK_DEEP"
 GATE_BGRADE_NO_REVERSAL = "GATE_BGRADE_NO_REVERSAL"
+GATE_BGRADE_VWAP_LOST = "GATE_BGRADE_VWAP_LOST"
+GATE_BGRADE_VWAP_REVERSAL = "GATE_BGRADE_VWAP_REVERSAL"
+GATE_BGRADE_RSI_OVERHEAT = "GATE_BGRADE_RSI_OVERHEAT"
+GATE_BGRADE_RSI_NOT_RECOVERED = "GATE_BGRADE_RSI_NOT_RECOVERED"
+GATE_BGRADE_PULLBACK_CONFIRM = "GATE_BGRADE_PULLBACK_CONFIRM"
 
 # Stage2 본진입
 GATE_STAGE2_NO_FIRST = "GATE_STAGE2_NO_FIRST"
@@ -136,6 +181,12 @@ GATE_STAGE2_DRAWDOWN = "GATE_STAGE2_DRAWDOWN"
 GATE_STAGE2_PULLBACK_SHALLOW = "GATE_STAGE2_PULLBACK_SHALLOW"
 GATE_STAGE2_PULLBACK_DEEP = "GATE_STAGE2_PULLBACK_DEEP"
 GATE_STAGE2_NO_REVERSAL = "GATE_STAGE2_NO_REVERSAL"
+GATE_STAGE2_VWAP_LOST = "GATE_STAGE2_VWAP_LOST"
+GATE_STAGE2_VWAP_REVERSAL = "GATE_STAGE2_VWAP_REVERSAL"
+GATE_STAGE2_RSI_OVERHEAT = "GATE_STAGE2_RSI_OVERHEAT"
+GATE_STAGE2_RSI_NOT_RECOVERED = "GATE_STAGE2_RSI_NOT_RECOVERED"
+GATE_STAGE2_PULLBACK_CONFIRM = "GATE_STAGE2_PULLBACK_CONFIRM"
+GATE_AGRADE_WATCH_ONLY = "GATE_AGRADE_WATCH_ONLY"
 
 # 합격 분기
 READY_AGRADE_FIRST = "READY_AGRADE_FIRST"
@@ -204,6 +255,14 @@ class EntryContext:
     open_return: float = 0.0       # (현재가 / 시가) - 1
     # === Market regime snapshot (None 가능 — 미수신 시 _apply_market_gate 가 neutral fallback) ===
     market_state: Optional[MarketSnapshot] = None
+    # === ATR / VWAP 기반 풀백 정밀도 보강 (W1) ===
+    # 5분봉 ATR(14) / last_close. 0.0 이면 동적 임계 비활성 → 정적 PULLBACK_*_PCT 사용.
+    atr_5m_pct: float = 0.0
+    # 일중 VWAP. 0.0 이면 VWAP 게이트 자체를 skip(데이터 미수신 안전 fallback).
+    intraday_vwap: float = 0.0
+    # 직전 고점 형성 후 1분봉 최저가. 0 이면 minute_bars 에서 자동 추출.
+    # B급 / Stage2 풀백의 "저점 vs VWAP" 비교 anchor.
+    pullback_low_after_high: int = 0
 
 
 def turnover_speed_per_min(ctx: EntryContext) -> float:
@@ -211,6 +270,272 @@ def turnover_speed_per_min(ctx: EntryContext) -> float:
     if ctx.current_price <= 0 or ctx.volume_speed <= 0:
         return 0.0
     return float(ctx.volume_speed) * float(ctx.current_price) * 60.0
+
+
+def dynamic_pullback_band(atr_pct: float) -> Tuple[float, float]:
+    """ATR 기반 (MIN, MAX) 풀백 임계.
+
+    atr_pct ≤ 0 이면 정적 임계(PULLBACK_MIN_PCT, PULLBACK_MAX_PCT) 그대로.
+    동적 모드에선 종목 변동성에 비례한 밴드를 산출하되, 절대 floor/cap 으로
+    노이즈/과추격을 모두 막는다.
+    """
+    if atr_pct <= 0:
+        return PULLBACK_MIN_PCT, PULLBACK_MAX_PCT
+    lo = max(ATR_PULLBACK_FLOOR_MIN, atr_pct * ATR_PULLBACK_MIN_MULT)
+    hi = min(ATR_PULLBACK_CAP_MAX, atr_pct * ATR_PULLBACK_MAX_MULT)
+    if hi <= lo:
+        # 극단적 ATR 입력에 대비해 항상 lo < hi 보장
+        hi = min(ATR_PULLBACK_CAP_MAX, lo + ATR_PULLBACK_FLOOR_MIN)
+    return lo, hi
+
+
+def dynamic_drawdown_cap(atr_pct: float) -> float:
+    """ATR 기반 위태 차단 임계.
+
+    풀백 깊이가 이 값을 넘으면 본진입 자체를 blocked. atr_pct ≤ 0 이면
+    정적 MAX_DRAWDOWN_FROM_HIGH 사용. 동적 모드에선 floor/cap 사이로 클램프.
+    """
+    if atr_pct <= 0:
+        return MAX_DRAWDOWN_FROM_HIGH
+    return max(
+        ATR_PULLBACK_DRAWDOWN_FLOOR,
+        min(ATR_PULLBACK_DRAWDOWN_CAP, atr_pct * ATR_PULLBACK_DRAWDOWN_MULT),
+    )
+
+
+def _resolve_pullback_low(
+    ctx: EntryContext, *, breakout_high: int, lookback: int = 15
+) -> int:
+    """풀백 저점을 ctx.pullback_low_after_high 또는 minute_bars 에서 추출.
+
+    호출측이 명시적으로 채우지 않은 경우(=0) 1분봉의 직전 고점 이후 저점을
+    찾아 반환. 데이터가 비면 0(=VWAP 게이트 skip 신호).
+    """
+    if ctx.pullback_low_after_high and ctx.pullback_low_after_high > 0:
+        return int(ctx.pullback_low_after_high)
+    bars = ctx.minute_bars
+    if not bars:
+        return 0
+    recent = bars[-lookback:]
+    valid_highs = [(idx, b.high) for idx, b in enumerate(recent) if b.high > 0]
+    if not valid_highs:
+        return 0
+    i_high, bar_high = max(valid_highs, key=lambda item: item[1])
+    if breakout_high > bar_high:
+        # breakout_high 가 lookback 바깥 — recent 전체가 풀백 구간
+        after = recent
+    else:
+        after = recent[i_high + 1:]
+    lows = [b.low for b in after if b.low > 0]
+    if not lows:
+        return 0
+    return int(min(lows))
+
+
+def _vwap_support_violation(
+    ctx: EntryContext, *, ref_low: int
+) -> Optional[Tuple[float, float]]:
+    """풀백 저점이 VWAP 지지선을 깨뜨렸는지 확인.
+
+    위반 시 (ref_low, support_threshold) 반환, 통과 시 None.
+    VWAP == 0 (데이터 미수신) 또는 ref_low == 0 (계산 불가) 이면 None
+    (게이트 skip — 안전 fallback).
+    """
+    vwap = ctx.intraday_vwap
+    if vwap is None or vwap <= 0 or ref_low <= 0:
+        return None
+    threshold = vwap * (1.0 - VWAP_SUPPORT_BUFFER_PCT)
+    if ref_low < threshold:
+        return float(ref_low), float(threshold)
+    return None
+
+
+def _vwap_reversal_violation(ctx: EntryContext) -> Optional[Tuple[float, float]]:
+    """양봉 reversal 종가가 VWAP 위에 형성됐는지 확인.
+
+    VWAP_REVERSAL_REQUIRE_ABOVE == True 일 때만 적용. 위반 시
+    (current_price, vwap) 반환, 통과 시 None.
+    """
+    if not VWAP_REVERSAL_REQUIRE_ABOVE:
+        return None
+    vwap = ctx.intraday_vwap
+    if vwap is None or vwap <= 0 or ctx.current_price <= 0:
+        return None
+    if float(ctx.current_price) < float(vwap):
+        return float(ctx.current_price), float(vwap)
+    return None
+
+
+def _rsi_from_closes(closes: Sequence[float], period: int) -> float:
+    if period <= 0 or len(closes) < period + 1:
+        return 0.0
+    window = [float(v) for v in closes[-(period + 1):] if v and v > 0]
+    if len(window) < period + 1:
+        return 0.0
+
+    gains = 0.0
+    losses = 0.0
+    for prev, cur in zip(window, window[1:]):
+        delta = cur - prev
+        if delta > 0:
+            gains += delta
+        elif delta < 0:
+            losses += -delta
+
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_gain <= 0 and avg_loss <= 0:
+        return 50.0
+    if avg_loss <= 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _rsi_pullback_violation(
+    ctx: EntryContext,
+    *,
+    pullback_pct: float,
+    overheat_code: str,
+    recovery_code: str,
+    stage: int,
+    prefix: str,
+) -> Optional[EntryDecision]:
+    closes = [float(bar.close) for bar in ctx.minute_bars if getattr(bar, "close", 0) > 0]
+    if len(closes) < RSI_SLOW_PERIOD + 2:
+        return None
+
+    rsi_fast = _rsi_from_closes(closes, RSI_FAST_PERIOD)
+    rsi_slow = _rsi_from_closes(closes, RSI_SLOW_PERIOD)
+    rsi_slow_prev = _rsi_from_closes(closes[:-1], RSI_SLOW_PERIOD)
+    if rsi_fast <= 0.0 or rsi_slow <= 0.0 or rsi_slow_prev <= 0.0:
+        return None
+
+    px_over_vwap = 0.0
+    if ctx.intraday_vwap and ctx.intraday_vwap > 0 and ctx.current_price > 0:
+        px_over_vwap = (float(ctx.current_price) / float(ctx.intraday_vwap)) - 1.0
+
+    if (
+        pullback_pct <= RSI_SHALLOW_PULLBACK_MAX
+        and px_over_vwap >= RSI_VWAP_OVERHEAT_PCT
+        and rsi_fast >= RSI_OVERBOUGHT_FAST
+    ):
+        return EntryDecision(
+            "wait",
+            0.0,
+            stage,
+            "{} RSI overheat: rsi7 {:.1f}, pullback {:.2%}, VWAP +{:.2%}".format(
+                prefix, rsi_fast, pullback_pct, px_over_vwap
+            ),
+            reason_code=overheat_code,
+        )
+
+    if rsi_slow < RSI_RECOVERY_MIN or rsi_slow <= rsi_slow_prev:
+        return EntryDecision(
+            "wait",
+            0.0,
+            stage,
+            "{} RSI recovery not confirmed: rsi14 {:.1f} -> {:.1f}".format(
+                prefix, rsi_slow_prev, rsi_slow
+            ),
+            reason_code=recovery_code,
+        )
+
+    return None
+
+
+def _pullback_confirmation_violation(
+    ctx: EntryContext,
+    *,
+    breakout_high: int,
+    stage: int,
+    reason_code: str,
+    prefix: str,
+    grade: str = "",
+) -> Optional[EntryDecision]:
+    """Require a real recovery sequence after pullback depth has passed.
+
+    Sequence: pullback low is formed -> current bar makes a higher low -> current
+    close recovers the previous bar high -> rebound volume expands after falling
+    volume on the pullback.
+    """
+    bars = list(ctx.minute_bars or [])
+    if len(bars) < 3 or breakout_high <= 0:
+        return None
+
+    cur = bars[-1]
+    prev = bars[-2]
+    if cur.low <= 0 or cur.close <= 0 or prev.high <= 0:
+        return None
+
+    anchor_high, pullback_low, valid = compute_pullback_anchor(
+        bars[:-1],
+        breakout_high_hint=breakout_high,
+        lookback=15,
+    )
+    if not valid or pullback_low <= 0:
+        return EntryDecision(
+            "wait",
+            0.0,
+            stage,
+            "{} pullback low not formed yet".format(prefix),
+            grade=grade,
+            reason_code=reason_code,
+        )
+
+    if cur.low <= pullback_low:
+        return EntryDecision(
+            "wait",
+            0.0,
+            stage,
+            "{} higher low not confirmed: cur low {:.0f} <= pullback low {:.0f}".format(
+                prefix, cur.low, pullback_low
+            ),
+            grade=grade,
+            reason_code=reason_code,
+        )
+
+    if cur.close <= prev.high:
+        return EntryDecision(
+            "wait",
+            0.0,
+            stage,
+            "{} previous high not recovered: close {:.0f} <= prev high {:.0f}".format(
+                prefix, cur.close, prev.high
+            ),
+            grade=grade,
+            reason_code=reason_code,
+        )
+
+    pullback_bars = [
+        bar for bar in bars[-6:-1]
+        if bar.close < bar.open and getattr(bar, "volume", 0) > 0
+    ]
+    if not pullback_bars or cur.volume <= 0:
+        return None
+
+    falling_volume_ok = True
+    if len(pullback_bars) >= 2:
+        falling_volume_ok = all(
+            later.volume <= earlier.volume
+            for earlier, later in zip(pullback_bars, pullback_bars[1:])
+        )
+    rebound_volume_ok = cur.volume > pullback_bars[-1].volume
+    if not falling_volume_ok or not rebound_volume_ok:
+        return EntryDecision(
+            "wait",
+            0.0,
+            stage,
+            "{} rebound volume not confirmed: pullback vols {}, rebound {}".format(
+                prefix,
+                "/".join(str(int(bar.volume)) for bar in pullback_bars),
+                int(cur.volume),
+            ),
+            grade=grade,
+            reason_code=reason_code,
+        )
+
+    return None
 
 
 def _hhmmss_from_ts(ts: float) -> int:
@@ -400,7 +725,10 @@ def _evaluate_first_entry_inner(ctx: EntryContext) -> EntryDecision:
         )
 
     # === 가짜 돌파 게이트 (5분봉 진행봉 윗꼬리) ===
-    if ctx.upper_wick_ratio_zero_bar > MAX_UPPER_WICK_RATIO:
+    # 0봉 돌파를 바로 감시로 올리는 A급 추격 후보에만 적용한다.
+    # B급은 이미 1봉전 돌파 이후의 눌림을 기다리는 구조라, 현재 진행봉 윗꼬리가
+    # 커지는 현상 자체가 정상적인 눌림일 수 있다.
+    if ctx.is_breakout_zero_bar and ctx.upper_wick_ratio_zero_bar > MAX_UPPER_WICK_RATIO:
         return EntryDecision(
             "wait", 0.0, 1,
             "5분봉 윗꼬리 과다 {:.0%} > {:.0%}".format(
@@ -468,22 +796,44 @@ def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
         )
 
     pullback_pct = (high_since - ctx.current_price) / high_since
-    if pullback_pct > MAX_DRAWDOWN_FROM_HIGH:
+    band_lo, band_hi = dynamic_pullback_band(ctx.atr_5m_pct)
+    drawdown_cap = dynamic_drawdown_cap(ctx.atr_5m_pct)
+    if pullback_pct > drawdown_cap:
         return EntryDecision(
-            "blocked", 0.0, 1, "B급: 고점 대비 -{:.2%} 초과".format(pullback_pct),
+            "blocked", 0.0, 1,
+            "B급: 고점 대비 -{:.2%} 초과(cap {:.2%}, atr {:.2%})".format(
+                pullback_pct, drawdown_cap, ctx.atr_5m_pct
+            ),
             reason_code=GATE_BGRADE_DRAWDOWN,
         )
-    if pullback_pct < PULLBACK_MIN_PCT:
+    if pullback_pct < band_lo:
         return EntryDecision(
             "wait", 0.0, 1,
-            "B급: 눌림 부족 ({:.2%} < {:.2%})".format(pullback_pct, PULLBACK_MIN_PCT),
+            "B급: 눌림 부족 ({:.2%} < {:.2%}, atr {:.2%})".format(
+                pullback_pct, band_lo, ctx.atr_5m_pct
+            ),
             reason_code=GATE_BGRADE_PULLBACK_SHALLOW,
         )
-    if pullback_pct > PULLBACK_MAX_PCT:
+    if pullback_pct > band_hi:
         return EntryDecision(
             "wait", 0.0, 1,
-            "B급: 눌림 깊음 ({:.2%} > {:.2%})".format(pullback_pct, PULLBACK_MAX_PCT),
+            "B급: 눌림 깊음 ({:.2%} > {:.2%}, atr {:.2%})".format(
+                pullback_pct, band_hi, ctx.atr_5m_pct
+            ),
             reason_code=GATE_BGRADE_PULLBACK_DEEP,
+        )
+
+    # === VWAP 지지 게이트 (고점추매 차단) ===
+    pullback_low = _resolve_pullback_low(ctx, breakout_high=high_since)
+    vwap_violation = _vwap_support_violation(ctx, ref_low=pullback_low)
+    if vwap_violation is not None:
+        low, threshold = vwap_violation
+        return EntryDecision(
+            "blocked", 0.0, 1,
+            "B급: 풀백 저점 {:.0f} < VWAP 지지 {:.0f} (vwap {:.0f})".format(
+                low, threshold, ctx.intraday_vwap
+            ),
+            reason_code=GATE_BGRADE_VWAP_LOST,
         )
 
     if not _has_neg_then_positive_pattern(
@@ -491,17 +841,48 @@ def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
         reference_high=high_since,
-        min_low_pullback_pct=PULLBACK_MIN_PCT,
+        min_low_pullback_pct=band_lo,
     ):
         return EntryDecision(
             "wait", 0.0, 1, "B급: 음봉→양봉 반전 미확인",
             reason_code=GATE_BGRADE_NO_REVERSAL,
         )
 
+    # 양봉 reversal 종가가 VWAP 위에서 형성됐는지 (고점추매 vs 정상 풀백 최종 분리)
+    rev_violation = _vwap_reversal_violation(ctx)
+    if rev_violation is not None:
+        cur, vwap = rev_violation
+        return EntryDecision(
+            "wait", 0.0, 1,
+            "B급: 양봉 반전 종가 {:.0f} < VWAP {:.0f} — 고점추매 위험".format(cur, vwap),
+            reason_code=GATE_BGRADE_VWAP_REVERSAL,
+        )
+
+    rsi_violation = _rsi_pullback_violation(
+        ctx,
+        pullback_pct=pullback_pct,
+        overheat_code=GATE_BGRADE_RSI_OVERHEAT,
+        recovery_code=GATE_BGRADE_RSI_NOT_RECOVERED,
+        stage=1,
+        prefix="B-grade",
+    )
+    if rsi_violation is not None:
+        return rsi_violation
+
+    confirm_violation = _pullback_confirmation_violation(
+        ctx,
+        breakout_high=high_since,
+        stage=1,
+        reason_code=GATE_BGRADE_PULLBACK_CONFIRM,
+        prefix="B-grade",
+    )
+    if confirm_violation is not None:
+        return confirm_violation
+
     return EntryDecision(
         "ready", DANTE_GRADE_B_RATIO, 2,
-        "B급 첫 눌림 본진입 (눌림 {:.2%}, {:.0%})".format(
-            pullback_pct, DANTE_GRADE_B_RATIO
+        "B급 첫 눌림 본진입 (눌림 {:.2%}, band {:.2%}~{:.2%}, {:.0%})".format(
+            pullback_pct, band_lo, band_hi, DANTE_GRADE_B_RATIO
         ),
         grade="B",
         reason_code=READY_BGRADE_PULLBACK,
@@ -604,33 +985,55 @@ def _evaluate_a_grade_watch_entry_inner(
         )
 
     pullback_pct = (breakout_high - ctx.current_price) / breakout_high
-    if pullback_pct > MAX_DRAWDOWN_FROM_HIGH:
+    band_lo, band_hi = dynamic_pullback_band(ctx.atr_5m_pct)
+    drawdown_cap = dynamic_drawdown_cap(ctx.atr_5m_pct)
+    if pullback_pct > drawdown_cap:
         return EntryDecision(
             "blocked", 0.0, 2,
-            "A-watch drawdown from high exceeded {:.2%}".format(pullback_pct),
+            "A-watch drawdown {:.2%} > cap {:.2%} (atr {:.2%})".format(
+                pullback_pct, drawdown_cap, ctx.atr_5m_pct
+            ),
             grade="A",
             reason_code=GATE_STAGE2_DRAWDOWN,
         )
-    if pullback_pct < PULLBACK_MIN_PCT:
+    if pullback_pct < band_lo:
         return EntryDecision(
             "wait", 0.0, 2,
-            "A-watch pullback shallow ({:.2%} < {:.2%})".format(pullback_pct, PULLBACK_MIN_PCT),
+            "A-watch pullback shallow ({:.2%} < {:.2%}, atr {:.2%})".format(
+                pullback_pct, band_lo, ctx.atr_5m_pct
+            ),
             grade="A",
             reason_code=GATE_STAGE2_PULLBACK_SHALLOW,
         )
-    if pullback_pct > PULLBACK_MAX_PCT:
+    if pullback_pct > band_hi:
         return EntryDecision(
             "wait", 0.0, 2,
-            "A-watch pullback deep ({:.2%} > {:.2%})".format(pullback_pct, PULLBACK_MAX_PCT),
+            "A-watch pullback deep ({:.2%} > {:.2%}, atr {:.2%})".format(
+                pullback_pct, band_hi, ctx.atr_5m_pct
+            ),
             grade="A",
             reason_code=GATE_STAGE2_PULLBACK_DEEP,
         )
+
+    pullback_low = _resolve_pullback_low(ctx, breakout_high=breakout_high)
+    vwap_violation = _vwap_support_violation(ctx, ref_low=pullback_low)
+    if vwap_violation is not None:
+        low, threshold = vwap_violation
+        return EntryDecision(
+            "blocked", 0.0, 2,
+            "A-watch pullback low {:.0f} < VWAP support {:.0f} (vwap {:.0f})".format(
+                low, threshold, ctx.intraday_vwap
+            ),
+            grade="A",
+            reason_code=GATE_STAGE2_VWAP_LOST,
+        )
+
     if not _has_neg_then_positive_pattern(
         ctx.minute_bars,
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
         reference_high=breakout_high,
-        min_low_pullback_pct=PULLBACK_MIN_PCT,
+        min_low_pullback_pct=band_lo,
     ):
         return EntryDecision(
             "wait", 0.0, 2, "A-watch reversal not confirmed",
@@ -638,11 +1041,45 @@ def _evaluate_a_grade_watch_entry_inner(
             reason_code=GATE_STAGE2_NO_REVERSAL,
         )
 
+    rev_violation = _vwap_reversal_violation(ctx)
+    if rev_violation is not None:
+        cur, vwap = rev_violation
+        return EntryDecision(
+            "wait", 0.0, 2,
+            "A-watch reversal close {:.0f} < VWAP {:.0f} — chase risk".format(cur, vwap),
+            grade="A",
+            reason_code=GATE_STAGE2_VWAP_REVERSAL,
+        )
+
+    rsi_violation = _rsi_pullback_violation(
+        ctx,
+        pullback_pct=pullback_pct,
+        overheat_code=GATE_STAGE2_RSI_OVERHEAT,
+        recovery_code=GATE_STAGE2_RSI_NOT_RECOVERED,
+        stage=2,
+        prefix="A-watch",
+    )
+    if rsi_violation is not None:
+        return rsi_violation
+
+    confirm_violation = _pullback_confirmation_violation(
+        ctx,
+        breakout_high=breakout_high,
+        stage=2,
+        reason_code=GATE_STAGE2_PULLBACK_CONFIRM,
+        prefix="A-watch",
+        grade="A",
+    )
+    if confirm_violation is not None:
+        return confirm_violation
+
     return EntryDecision(
         "ready",
         1.0,
         2,
-        "A-watch first pullback entry (pullback {:.2%}, 100%)".format(pullback_pct),
+        "A-watch pullback entry (pullback {:.2%}, band {:.2%}~{:.2%})".format(
+            pullback_pct, band_lo, band_hi
+        ),
         grade="A",
         reason_code=READY_AGRADE_SECOND,
     )
@@ -706,30 +1143,50 @@ def _evaluate_second_entry_inner(ctx: EntryContext) -> EntryDecision:
             reason_code=GATE_STAGE2_HIGH_DATA,
         )
     pullback_pct = (breakout_high - ctx.current_price) / breakout_high
+    band_lo, band_hi = dynamic_pullback_band(ctx.atr_5m_pct)
+    drawdown_cap = dynamic_drawdown_cap(ctx.atr_5m_pct)
 
-    if pullback_pct > MAX_DRAWDOWN_FROM_HIGH:
+    if pullback_pct > drawdown_cap:
         return EntryDecision(
             "blocked",
             0.0,
             2,
-            "고점 대비 -{:.2%} 초과(차단)".format(pullback_pct),
+            "고점 대비 -{:.2%} > cap {:.2%} (atr {:.2%})".format(
+                pullback_pct, drawdown_cap, ctx.atr_5m_pct
+            ),
             reason_code=GATE_STAGE2_DRAWDOWN,
         )
-    if pullback_pct < PULLBACK_MIN_PCT:
+    if pullback_pct < band_lo:
         return EntryDecision(
             "wait",
             0.0,
             2,
-            "눌림 부족 ({:.2%} < {:.2%})".format(pullback_pct, PULLBACK_MIN_PCT),
+            "눌림 부족 ({:.2%} < {:.2%}, atr {:.2%})".format(
+                pullback_pct, band_lo, ctx.atr_5m_pct
+            ),
             reason_code=GATE_STAGE2_PULLBACK_SHALLOW,
         )
-    if pullback_pct > PULLBACK_MAX_PCT:
+    if pullback_pct > band_hi:
         return EntryDecision(
             "wait",
             0.0,
             2,
-            "눌림 깊음 ({:.2%} > {:.2%})".format(pullback_pct, PULLBACK_MAX_PCT),
+            "눌림 깊음 ({:.2%} > {:.2%}, atr {:.2%})".format(
+                pullback_pct, band_hi, ctx.atr_5m_pct
+            ),
             reason_code=GATE_STAGE2_PULLBACK_DEEP,
+        )
+
+    pullback_low = _resolve_pullback_low(ctx, breakout_high=breakout_high)
+    vwap_violation = _vwap_support_violation(ctx, ref_low=pullback_low)
+    if vwap_violation is not None:
+        low, threshold = vwap_violation
+        return EntryDecision(
+            "blocked",
+            0.0,
+            2,
+            "본진입: 풀백 저점 {:.0f} < VWAP 지지 {:.0f}".format(low, threshold),
+            reason_code=GATE_STAGE2_VWAP_LOST,
         )
 
     if not _has_neg_then_positive_pattern(
@@ -737,18 +1194,50 @@ def _evaluate_second_entry_inner(ctx: EntryContext) -> EntryDecision:
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
         reference_high=breakout_high,
-        min_low_pullback_pct=PULLBACK_MIN_PCT,
+        min_low_pullback_pct=band_lo,
     ):
         return EntryDecision(
             "wait", 0.0, 2, "음봉→양봉 반전 미확인",
             reason_code=GATE_STAGE2_NO_REVERSAL,
         )
 
+    rev_violation = _vwap_reversal_violation(ctx)
+    if rev_violation is not None:
+        cur, vwap = rev_violation
+        return EntryDecision(
+            "wait", 0.0, 2,
+            "본진입: 양봉 반전 종가 {:.0f} < VWAP {:.0f} — 고점추매 위험".format(cur, vwap),
+            reason_code=GATE_STAGE2_VWAP_REVERSAL,
+        )
+
+    rsi_violation = _rsi_pullback_violation(
+        ctx,
+        pullback_pct=pullback_pct,
+        overheat_code=GATE_STAGE2_RSI_OVERHEAT,
+        recovery_code=GATE_STAGE2_RSI_NOT_RECOVERED,
+        stage=2,
+        prefix="Stage2",
+    )
+    if rsi_violation is not None:
+        return rsi_violation
+
+    confirm_violation = _pullback_confirmation_violation(
+        ctx,
+        breakout_high=breakout_high,
+        stage=2,
+        reason_code=GATE_STAGE2_PULLBACK_CONFIRM,
+        prefix="Stage2",
+    )
+    if confirm_violation is not None:
+        return confirm_violation
+
     return EntryDecision(
         "ready",
         DANTE_SECOND_ENTRY_RATIO,
         2,
-        "A급 본진입 (눌림 {:.2%}, {:.0%})".format(pullback_pct, DANTE_SECOND_ENTRY_RATIO),
+        "A급 본진입 (눌림 {:.2%}, band {:.2%}~{:.2%}, {:.0%})".format(
+            pullback_pct, band_lo, band_hi, DANTE_SECOND_ENTRY_RATIO
+        ),
         grade="A",
         reason_code=READY_AGRADE_SECOND,
     )

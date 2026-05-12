@@ -139,9 +139,12 @@ def load_training_data(target: str) -> pd.DataFrame:
         raise FileNotFoundError("No Dante training CSV rows found")
 
     label_columns = _label_columns_for_target(target)
-    missing = [column for column in FEATURES + label_columns if column not in df.columns]
-    if missing:
-        raise ValueError("Dante training columns missing: {}".format(missing))
+    missing_labels = [column for column in label_columns if column not in df.columns]
+    if missing_labels:
+        raise ValueError("Dante training columns missing: {}".format(missing_labels))
+    for feature in FEATURES:
+        if feature not in df.columns:
+            df[feature] = 0.0
 
     if "sample_id" in df.columns:
         df = df.drop_duplicates(subset=["sample_id"], keep="last")
