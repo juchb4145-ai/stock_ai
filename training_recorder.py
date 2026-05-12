@@ -1,18 +1,15 @@
 """학습/거래 로그 기록을 담당하는 Mixin 모듈.
 
-main.py 의 Kiwoom 클래스에서 다음 4개 트랙을 분리한다.
+main.py 의 Kiwoom 클래스에서 퀀트조건식 거래 로그와 호환 학습 트랙을 분리한다.
 
-  1) entry_training (구학습; 현재 비활성)
-        - register_training_sample / update_training_labels
-        - ensure_training_data_file / append_training_row
-  2) dante_entry_training (Phase A; ready 표본)
+  1) dante_entry_training (퀀트조건식 ready 표본; 기존 파일명 호환)
         - register_dante_training_sample / update_dante_training_labels
         - ensure_dante_training_data_file / append_dante_training_row
-  3) dante_shadow_training (false-negative 측정용; wait/blocked 표본)
+  2) dante_shadow_training (false-negative 측정용; wait/blocked 표본; 기존 파일명 호환)
         - register_dante_shadow_sample / update_dante_shadow_training_labels
         - ensure_dante_shadow_training_data_file / append_dante_shadow_training_row
         - _is_dante_shadow_data_ready (사전조건 게이트)
-  4) trade_log (모든 매수/매도 이벤트 누적 로그)
+  3) trade_log (모든 매수/매도 이벤트 누적 로그)
         - ensure_trade_log_file / append_trade_log
 
 설계 원칙:
@@ -47,13 +44,8 @@ logger = logging.getLogger("kiwoom")
 # 모듈 상수 (main.py 에서 re-export)
 # ---------------------------------------------------------------------------
 
-# === 구학습 트랙 (현재 비활성) ===
-TRAINING_DATA_ENABLED = False
 TRAINING_DATA_DIR = "data"
-TRAINING_ENTRY_CSV = os.path.join(TRAINING_DATA_DIR, "entry_training.csv")
 TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
-TRAINING_SAMPLE_COOLDOWN_SECONDS = 30
-TRAINING_LABEL_HORIZONS = (300, 600, 1200)
 
 # === 현재 운용 전략/조건식 로그 메타 ===
 TRADE_LOG_STRATEGY_NAME = "퀀트조건식"
@@ -69,7 +61,7 @@ TRADE_LOG_CONDITION_RULES = (
     "T: [일]1봉전 대비 0봉전 주가등락률 15% 이하"
 )
 
-# === 단테 학습 트랙 (Phase A) ===
+# === 퀀트조건식 ready 학습 트랙 (기존 dante 파일명 호환) ===
 DANTE_TRAINING_DATA_ENABLED = True
 DANTE_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_entry_training.csv")
 DANTE_TRAINING_LABEL_HORIZONS = (300, 600, 1200)  # 5/10/20분 단순 수익률
@@ -109,42 +101,13 @@ DANTE_TRAINING_FIELDS = [
     "labeled_at",
 ] + MARKET_FIELDS + MARKET_GATE_FIELDS
 
-# === 단테 shadow 학습 트랙 (false-negative 측정) ===
+# === 퀀트조건식 shadow 학습 트랙 (기존 dante 파일명 호환) ===
 DANTE_SHADOW_TRAINING_DATA_ENABLED = True
 DANTE_SHADOW_TRAINING_CSV = os.path.join(TRAINING_DATA_DIR, "dante_shadow_training.csv")
 DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS = 90  # ready 보다 길게(wait 줄줄이 막기)
 DANTE_SHADOW_TRAINING_FIELDS = ["decision_status", "reason_code"] + DANTE_TRAINING_FIELDS
 DANTE_CAPTURE_START_HHMMSS = 90500
 DANTE_CAPTURE_END_HHMMSS = 143000
-
-# === 구학습 entry CSV 헤더 (스코어/모델/기대수익 등) ===
-ENTRY_FEATURE_NAMES = [
-    "price_momentum",
-    "open_return",
-    "box_position",
-    "direction_score",
-    "volume_speed",
-    "spread_rate",
-]
-TRAINING_ENTRY_FIELDS = [
-    "sample_id",
-    "captured_at",
-    "captured_time",
-    "code",
-    "name",
-    "entry_price",
-    "score",
-    "expected_return",
-    "target_price",
-    "model_name",
-    "status",
-    "reason",
-] + ENTRY_FEATURE_NAMES + [
-    "return_5m",
-    "return_10m",
-    "return_20m",
-    "success_10m",
-]
 
 TRADE_LOG_FIELDS = [
     "logged_at",
@@ -191,11 +154,6 @@ TRADE_LOG_FIELDS = [
     "market_gate_reason",
 ]
 
-# update_training_labels 가 success_10m 라벨 분기에 사용하는 임계.
-# main.py 의 MIN_EXPECTED_RETURN 과 동일 의미. 두 곳에 두지 않기 위해 본 모듈을
-# 단일 출처로 둔다.
-MIN_EXPECTED_RETURN = 0.006
-
 
 def _attach_market_meta(row: Dict[str, Any], ctx: Any, decision: Any) -> None:
     """row 에 MARKET_FIELDS + MARKET_GATE_FIELDS 를 채워 넣는다(in-place).
@@ -239,7 +197,7 @@ def _ensure_csv_header(path: str, fieldnames: list, *, log_label: str) -> None:
 
 
 def _is_regular_dante_capture_session(ts: float) -> bool:
-    """단테 학습 표본을 남길 수 있는 평일 장중 매수 관찰 구간인지 확인한다."""
+    """퀀트조건식 학습 표본을 남길 수 있는 평일 장중 매수 관찰 구간인지 확인한다."""
     local = time.localtime(ts)
     if local.tm_wday >= 5:
         return False
@@ -258,120 +216,15 @@ class TrainingRecorderMixin:
     Kiwoom 클래스에 mixin 으로 합쳐진다. ``__init__`` 에서 다음 인스턴스 필드가
     이미 만들어져 있다고 가정한다(현재 main.Kiwoom 이 모두 충족).
 
-      - ``self.pending_training_samples``        : Dict[str, dict]
-      - ``self.last_training_sample_at``         : Dict[str, float]
       - ``self.pending_dante_samples``           : Dict[str, dict]
       - ``self.last_dante_sample_at``            : Dict[str, float]
       - ``self.pending_dante_shadow_samples``    : Dict[str, dict]
       - ``self.last_dante_shadow_sample_at``     : Dict[str, float]
 
-    외부 메서드 의존:
-      - ``self.normalize_code(code)``  (update_training_labels 가 사용)
     """
 
     # ------------------------------------------------------------------
-    # 구학습 트랙(entry_training.csv) — 현재 비활성
-    # ------------------------------------------------------------------
-
-    def ensure_training_data_file(self) -> None:
-        if not TRAINING_DATA_ENABLED:
-            return
-        os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
-        if os.path.exists(TRAINING_ENTRY_CSV):
-            return
-        with open(TRAINING_ENTRY_CSV, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
-            writer.writeheader()
-
-    def append_training_row(self, row: Dict[str, Any]) -> None:
-        if not TRAINING_DATA_ENABLED:
-            return
-        self.ensure_training_data_file()
-        with open(TRAINING_ENTRY_CSV, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=TRAINING_ENTRY_FIELDS)
-            writer.writerow(row)
-
-    def register_training_sample(
-        self,
-        code: str,
-        name: str,
-        entry_price: int,
-        features: Dict[str, float],
-        prediction: Dict[str, Any],
-    ) -> None:
-        if not TRAINING_DATA_ENABLED:
-            return
-        now = time.time()
-        last_at = self.last_training_sample_at.get(code, 0)
-        if now - last_at < TRAINING_SAMPLE_COOLDOWN_SECONDS:
-            return
-
-        sample_id = uuid.uuid4().hex
-        row = {
-            "sample_id": sample_id,
-            "captured_at": now,
-            "captured_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "code": code,
-            "name": name,
-            "entry_price": entry_price,
-            "score": prediction.get("score", 0),
-            "expected_return": prediction.get("expected_return", 0),
-            "target_price": prediction.get("target_price", entry_price),
-            "model_name": prediction.get("model_name", ""),
-            "status": prediction.get("status", ""),
-            "reason": prediction.get("reason", ""),
-        }
-        for feature_name in ENTRY_FEATURE_NAMES:
-            row[feature_name] = features.get(feature_name, 0)
-        for horizon in TRAINING_LABEL_HORIZONS:
-            row["return_{}m".format(horizon // 60)] = ""
-        row["success_10m"] = ""
-
-        self.pending_training_samples[sample_id] = {
-            "code": code,
-            "captured_at": now,
-            "entry_price": entry_price,
-            "row": row,
-            "labeled_horizons": set(),
-        }
-        self.last_training_sample_at[code] = now
-        logger.info(
-            "[학습데이터 후보] {} {} 기준가 {} sample {}".format(
-                name, code, entry_price, sample_id[:8]
-            )
-        )
-
-    def update_training_labels(self, code: str, current_price: int, received_at: float) -> None:
-        if not TRAINING_DATA_ENABLED:
-            return
-        code = self.normalize_code(code)
-        completed = []
-        for sample_id, sample in list(self.pending_training_samples.items()):
-            if sample["code"] != code:
-                continue
-            elapsed = received_at - sample["captured_at"]
-            for horizon in TRAINING_LABEL_HORIZONS:
-                if horizon in sample["labeled_horizons"] or elapsed < horizon:
-                    continue
-                return_rate = current_price / sample["entry_price"] - 1
-                sample["row"]["return_{}m".format(horizon // 60)] = return_rate
-                sample["labeled_horizons"].add(horizon)
-            if len(sample["labeled_horizons"]) == len(TRAINING_LABEL_HORIZONS):
-                return_10m = sample["row"].get("return_10m", 0)
-                sample["row"]["success_10m"] = 1 if return_10m >= MIN_EXPECTED_RETURN else 0
-                self.append_training_row(sample["row"])
-                completed.append(sample_id)
-                logger.info(
-                    "[학습데이터 저장] {} sample {} 10분수익률 {:.2%}".format(
-                        code, sample_id[:8], return_10m
-                    )
-                )
-
-        for sample_id in completed:
-            self.pending_training_samples.pop(sample_id, None)
-
-    # ------------------------------------------------------------------
-    # 단테 학습 트랙(Phase A)
+    # 퀀트조건식 ready 학습 트랙
     # ------------------------------------------------------------------
 
     def ensure_dante_training_data_file(self) -> None:
@@ -399,7 +252,7 @@ class TrainingRecorderMixin:
         """1차/2차 매수 'ready' 결정 직후 호출. 진입 피처를 캡처하고 사후 라벨링 큐에 등록한다.
 
         실제 매수 발주(send_order) 와 무관하게 호출된다.
-        매수 차단/실패가 일어나도 단테 게이트가 'ready' 라고 판단했으면 가설 표본으로 누적한다.
+        매수 차단/실패가 일어나도 퀀트조건식 평가가 'ready' 라고 판단했으면 가설 표본으로 누적한다.
         같은 종목에서 1분 안에 두 번 ready 가 떨어져도 한 번만 기록한다.
         """
         if not DANTE_TRAINING_DATA_ENABLED:
@@ -482,7 +335,7 @@ class TrainingRecorderMixin:
         }
         self.last_dante_sample_at[code] = now
         logger.info(
-            "[단테 학습데이터] 후보 등록 {} {} stage={} ratio={:.2f} sample {}".format(
+            "[퀀트조건식 학습데이터] 후보 등록 {} {} stage={} ratio={:.2f} sample {}".format(
                 name, code, row["entry_stage"], row["ratio"], sample_id[:8]
             )
         )
@@ -535,7 +388,7 @@ class TrainingRecorderMixin:
                 sample["finalized"] = True
                 completed.append(sample_id)
                 logger.info(
-                    "[단테 학습데이터] 라벨 완료 {} sample {} max {:.2%} min {:.2%} 1R={} 2R={} stop={}".format(
+                    "[퀀트조건식 학습데이터] 라벨 완료 {} sample {} max {:.2%} min {:.2%} 1R={} 2R={} stop={}".format(
                         code, sample_id[:8], max_ret, min_ret,
                         row["reached_1r"], row["reached_2r"], row["hit_stop"],
                     )
@@ -544,7 +397,7 @@ class TrainingRecorderMixin:
             self.pending_dante_samples.pop(sample_id, None)
 
     # ------------------------------------------------------------------
-    # 단테 shadow 학습 트랙 (false-negative 측정)
+    # 퀀트조건식 shadow 학습 트랙 (false-negative 측정)
     # ------------------------------------------------------------------
 
     def ensure_dante_shadow_training_data_file(self) -> None:
@@ -689,7 +542,7 @@ class TrainingRecorderMixin:
         }
         self.last_dante_shadow_sample_at[code] = now
         logger.info(
-            "[단테 shadow] 후보 등록 {} {} status={} stage={} sample {}".format(
+            "[퀀트조건식 shadow] 후보 등록 {} {} status={} stage={} sample {}".format(
                 name, code, status, row["entry_stage"], sample_id[:8]
             )
         )
@@ -743,7 +596,7 @@ class TrainingRecorderMixin:
                 sample["finalized"] = True
                 completed.append(sample_id)
                 logger.info(
-                    "[단테 shadow] 라벨 완료 {} sample {} status={} max {:.2%} min {:.2%} 1R={} stop={}".format(
+                    "[퀀트조건식 shadow] 라벨 완료 {} sample {} status={} max {:.2%} min {:.2%} 1R={} stop={}".format(
                         code, sample_id[:8], row["decision_status"], max_ret, min_ret,
                         row["reached_1r"], row["hit_stop"],
                     )

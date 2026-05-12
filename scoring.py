@@ -12,17 +12,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 # === 진입(매수) 점수 ===
 
-# 학습 CSV 헤더와 동기화되는 피처 목록(추가 시 entry_training.csv 마이그레이션 필요).
-# headroom 등 신규 파생 피처는 features dict에는 들어가지만 학습 컬럼에는 추가하지 않는다.
-ENTRY_FEATURE_NAMES = (
-    "price_momentum",
-    "open_return",
-    "box_position",
-    "direction_score",
-    "volume_speed",
-    "spread_rate",
-)
-
 # 모멘텀(직전 첫 틱 대비 등락률) 보정 상수: ~2.4% 모멘텀이면 만점
 ENTRY_MOMENTUM_SHIFT = 0.004
 ENTRY_MOMENTUM_SCALE = 0.024

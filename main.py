@@ -24,12 +24,8 @@ from quant_condition_strategy import QuantConditionStrategy, QuantStrategyConfig
 from training_recorder import (
     TrainingRecorderMixin,
     # 모듈 상수 re-export — 외부 테스트가 main.X 로 직접 접근하므로 호환 유지
-    TRAINING_DATA_ENABLED,
     TRAINING_DATA_DIR,
-    TRAINING_ENTRY_CSV,
     TRADE_LOG_CSV,
-    TRAINING_SAMPLE_COOLDOWN_SECONDS,
-    TRAINING_LABEL_HORIZONS,
     DANTE_TRAINING_DATA_ENABLED,
     DANTE_TRAINING_CSV,
     DANTE_TRAINING_LABEL_HORIZONS,
@@ -40,12 +36,10 @@ from training_recorder import (
     DANTE_SHADOW_TRAINING_CSV,
     DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS,
     DANTE_SHADOW_TRAINING_FIELDS,
-    ENTRY_FEATURE_NAMES,
     TRADE_LOG_CONDITION_FORMULA,
     TRADE_LOG_CONDITION_RULES,
     TRADE_LOG_RULE_VERSION,
     TRADE_LOG_STRATEGY_NAME,
-    TRAINING_ENTRY_FIELDS,
     TRADE_LOG_FIELDS,
 )
 
@@ -66,7 +60,7 @@ ORDER_SCREEN_NO = "0001"
 AI_SERVER_ENABLED = True
 AI_SERVER_URL = "http://127.0.0.1:8000"
 AI_SERVER_TIMEOUT_SECONDS = 0.35
-# 학습 트랙(구학습 + 단테 + shadow) 의 enable 플래그/CSV 경로/필드 정의는
+# 학습 트랙(단테 + shadow) 의 enable 플래그/CSV 경로/필드 정의는
 # training_recorder 모듈로 이전했다. 같은 이름의 모듈 상수를 main 에서 re-export
 # 하므로 기존 ``from main import DANTE_TRAINING_CSV`` 같은 사용처는 그대로 동작한다.
 
@@ -217,7 +211,7 @@ SELL_SKIP_LOG_COOLDOWN_SECONDS = 30
 TR_RESPONSE_TIMEOUT_MS = 5000
 AI_SERVER_FAILURE_THRESHOLD = 3
 AI_SERVER_COOLDOWN_SECONDS = 30
-# 학습/거래 로그 필드 정의(ENTRY_FEATURE_NAMES, TRAINING_ENTRY_FIELDS, TRADE_LOG_FIELDS)
+# 학습/거래 로그 필드 정의(TRADE_LOG_FIELDS)
 # 는 training_recorder.py 로 이전. 본 파일 상단 import 에서 re-export 한다.
 
 
@@ -257,8 +251,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.condition_registered_at = {}
         self.quant_strategy = QuantConditionStrategy(QUANT_STRATEGY_CONFIG)
         self.condition_capture_logger = ConditionCaptureLogger(CONDITION_CAPTURE_CSV)
-        self.pending_training_samples = {}
-        self.last_training_sample_at = {}
         # 단테 학습 트랙(Phase A) 의 sample_id → 진행 정보. 5/10/20분 horizon 라벨링 후 CSV flush.
         self.pending_dante_samples = {}
         self.last_dante_sample_at = {}
@@ -296,10 +288,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # 미수신 시 entry_strategy 가 neutral fallback 으로 안전 처리한다.
         self.market_state = MarketStateCache()
         self.index_realtime_registered = False
-        # 학습 데이터(entry_training.csv) 기반 보정값.
-        # 단테 룰 전환 직후에는 사용하지 않으므로 None 상태로 둔다.
-        self.dynamic_min_net_return = None
-        self.entry_calibration = self.load_entry_calibration()
         self.ai_server_failure_count = 0
         self.ai_server_cooldown_until = 0.0
         self.condition_timer = QTimer()
@@ -1153,7 +1141,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.update_monitoring_tick(code, tick)
         self.update_reentry_watch(code, close)
 
-        self.update_training_labels(code, close, received_at)
         self.update_dante_training_labels(code, close, received_at)
         self.update_dante_shadow_training_labels(code, close, received_at)
 
@@ -1221,7 +1208,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.pending_sell_intents.clear()
         self.pending_sell_order_codes.clear()
         self.condition_registered_at.clear()
-        self.last_training_sample_at.clear()
         self.last_dante_sample_at.clear()
         # 전날 미라벨링된 단테 샘플은 표본 신뢰도가 낮으므로 폐기한다.
         self.pending_dante_samples.clear()
@@ -1714,81 +1700,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
 
     def clamp(self, value, low=0.0, high=1.0):
         return max(low, min(high, value))
-
-    def load_entry_calibration(self, path=TRAINING_ENTRY_CSV, bins=10, min_per_bin=5, min_total=80):
-        """학습 데이터에서 score→평균 return_10m 매핑(보정 테이블)을 만든다.
-
-        - score를 bins개 구간으로 나눠 각 구간 평균 return_10m 을 계산한다.
-        - 각 구간에 표본이 min_per_bin개 미만이거나 전체가 min_total 미만이면 None 반환.
-        - return은 scoring.calibrated_return_from_score 가 사용하는 형식의 list of dict.
-        """
-        try:
-            if not os.path.exists(path):
-                return None
-            # 열 개수 불일치 행은 이후 줄에서 깨져도 전체 로드 실패하지 않도록 스킵(구학습 트랙 레거시 CSV).
-            try:
-                df = pd.read_csv(path, encoding="utf-8-sig", on_bad_lines="skip")
-            except TypeError:
-                # pandas <= 1.2.x
-                df = pd.read_csv(path, encoding="utf-8-sig")
-            if "score" not in df.columns or "return_10m" not in df.columns:
-                return None
-            df = df[["score", "return_10m"]].copy()
-            df["score"] = pd.to_numeric(df["score"], errors="coerce")
-            df["return_10m"] = pd.to_numeric(df["return_10m"], errors="coerce")
-            df = df.dropna()
-            if len(df) < min_total:
-                logger.info("[entry calibration] 표본 부족(%d < %d) → fallback 사용", len(df), min_total)
-                return None
-            edges = [i / bins for i in range(bins + 1)]
-            df["bin"] = pd.cut(df["score"], bins=edges, include_lowest=True, labels=False)
-            grouped = df.groupby("bin")
-            table = []
-            for bin_idx, group in grouped:
-                if len(group) < min_per_bin:
-                    continue
-                table.append({
-                    "score": float((edges[int(bin_idx)] + edges[int(bin_idx) + 1]) / 2),
-                    "return": float(group["return_10m"].mean()),
-                    "count": int(len(group)),
-                })
-            if len(table) < 3:
-                logger.info("[entry calibration] 유효 구간 부족(%d) → fallback 사용", len(table))
-                return None
-            table.sort(key=lambda row: row["score"])
-            logger.info("[entry calibration] %d개 구간 로드: %s", len(table),
-                        ["{:.2f}->{:+.2%}({})".format(r["score"], r["return"], r["count"]) for r in table])
-            self.dynamic_min_net_return = self._compute_dynamic_min_net_return(df["return_10m"])
-            return table
-        except Exception as exc:
-            logger.warning("[entry calibration] 로드 실패: %s", exc)
-            return None
-
-    def _compute_dynamic_min_net_return(self, returns):
-        """학습 데이터의 return_10m 분포에서 P50 기반의 자동 임계값을 계산한다.
-
-        - 표본이 너무 적으면 None 반환 → 정적 MIN_NET_EXPECTED_RETURN 사용.
-        - gross P50 에서 왕복비용을 차감한 net 값을 [floor, ceiling] 범위로 클램프한다.
-        """
-        try:
-            series = returns.dropna() if hasattr(returns, "dropna") else returns
-            if len(series) < 80:
-                return None
-            gross_p = float(series.quantile(DYNAMIC_MIN_NET_RETURN_PERCENTILE))
-            net = gross_p - ESTIMATED_ROUND_TRIP_COST_RATE
-            tuned = max(MIN_NET_EXPECTED_RETURN, min(net, DYNAMIC_MIN_NET_RETURN_CEILING))
-            logger.info(
-                "[entry calibration] 동적 매수 임계값 적용: P%.0f gross=%+.2f%%, 비용=%.2f%%, net=%+.2f%% → 임계 %.2f%%",
-                DYNAMIC_MIN_NET_RETURN_PERCENTILE * 100,
-                gross_p * 100,
-                ESTIMATED_ROUND_TRIP_COST_RATE * 100,
-                net * 100,
-                tuned * 100,
-            )
-            return tuned
-        except Exception as exc:
-            logger.warning("[entry calibration] 동적 임계값 계산 실패: %s", exc)
-            return None
 
     def gross_to_net_return(self, gross_return):
         gross_return = self.parse_float(gross_return, 0.0)
@@ -4493,13 +4404,12 @@ def _log_quant_condition_startup_banner():
         QUANT_TAKE_PROFIT_PCT * 100,
         QUANT_STOP_LOSS_PCT * 100,
     )
-    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, 주문간격 %.2fs(초당 5회 이하), AI서버=%s, 구학습=%s, 조건식학습=%s(%s), shadow=%s(%s)",
+    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, 주문간격 %.2fs(초당 5회 이하), AI서버=%s, 조건식학습=%s(%s), shadow=%s(%s)",
                 MAX_CONCURRENT_POSITIONS,
                 MAX_DAILY_BUY_COUNT,
                 OPENING_FORCE_EXIT,
                 ORDER_REQUEST_INTERVAL_SECONDS,
                 "ON" if AI_SERVER_ENABLED else "OFF",
-                "ON" if TRAINING_DATA_ENABLED else "OFF",
                 "ON" if DANTE_TRAINING_DATA_ENABLED else "OFF",
                 DANTE_TRAINING_CSV,
                 "ON" if DANTE_SHADOW_TRAINING_DATA_ENABLED else "OFF",

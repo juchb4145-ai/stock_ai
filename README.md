@@ -1,3 +1,8 @@
+# 퀀트조건식 눌림 자동매매
+
+현재 운영 기준은 영웅문 조건검색식 `퀀트조건식`입니다.
+조건식 편입 종목은 즉시 실시간 등록되고, 포착가 대비 -1.5% 눌림 + 체결강도 100% 이상에서 매수합니다.
+매도는 매수가 대비 +2% 전량 익절, -1.5% 전량 손절입니다.
 ------------------------------------------------------------------------------------------------------------------------------------
           
 OpenAPI는 안정적인 서비스 운영을 위해 몇가지 제한을 두고 있습니다.
@@ -101,8 +106,8 @@ python .\fetch_minute_bars.py           # 매매 종목 1분봉 캐시
 python .\analyze_today.py               # trade_review/daily_review/rule_overrides 산출
 python -m review.rolling                # 5/10/20 누적 + rule_candidates
 
-# 데이터가 충분히 쌓인 뒤, 64비트 venv에서 학습
-.\venv64\Scripts\python.exe .\train_lgbm.py
+# 데이터가 충분히 쌓인 뒤, 64비트 venv에서 보조 모델 학습(선택)
+.\venv64\Scripts\python.exe .\train_dante_lgbm.py
 
-# 학습된 모델을 쓰려면 FastAPI 재시작
+# 보조 모델을 쓰려면 FastAPI 재시작
 .\venv64\Scripts\python.exe -m uvicorn ai_server:app --host 127.0.0.1 --port 8000

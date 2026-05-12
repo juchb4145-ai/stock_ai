@@ -1,7 +1,7 @@
 # 자동매매 프로그램 — 전체 개요
 
-키움증권 OpenAPI 기반의 단테(Dante) 추세 추격형 자동매매 프로그램입니다.  
-조건검색 편입 종목을 실시간으로 받아 1차/2차 분할매수 → R-multiple 트레일링 → 사후 라벨링 → 매일 리뷰/룰 후보 산출까지 한 사이클을 자동으로 돌립니다.
+키움증권 OpenAPI 기반의 **퀀트조건식 눌림 자동매매 프로그램**입니다.  
+영웅문 조건검색식 `퀀트조건식` 편입 종목을 실시간으로 등록하고, 포착가 대비 -1.5% 눌림 + 체결강도 100% 이상에서 매수한 뒤 +2% 익절 / -1.5% 손절을 자동 집행합니다.
 
 본 문서는 시스템 **전체 그림과 인덱스** 입니다. 세부 운영 절차/안전장치는 하위 문서를 참고하세요.
 
@@ -17,7 +17,7 @@
 
 ## 1. 한 줄 요약
 
-**조건검색 편입 → 5분봉 BB/Envelope 추세 + 1분봉 눌림 진입 → R-multiple 손절/부분익절/트레일링 → 25분 사후 라벨링 → 매일 누적 통계로 룰 후보 제안.**
+**퀀트조건식 편입 → 즉시 실시간 등록 → 포착가 대비 -1.5% 눌림 + 체결강도 100% 이상 매수 → +2% 익절 / -1.5% 손절 → 거래 로그와 사후 리뷰 누적.**
 
 ---
 
@@ -29,13 +29,13 @@
 ├─ logging_setup.py              공용 로깅 (RotatingFileHandler + stdout)
 ├─ fid_codes.py                  키움 FID ↔ 한글 이름 매핑
 ├─ training_recorder.py          학습/거래 로그 CSV 기록 (Mixin)
-├─ entry_strategy.py             1차/2차 진입 평가 (순수 함수)
+├─ quant_condition_strategy.py   퀀트조건식 눌림 매수 / +2% 익절 / -1.5% 손절 순수 로직
+├─ entry_strategy.py             레거시 단테 게이트 및 학습 피처 보조 로직
 ├─ exit_strategy.py              R-multiple 청산 평가 (순수 함수)
 ├─ scoring.py                    점수/피처 계산 (학습 + fallback 공용)
 ├─ portfolio.py                  Position dataclass + 디스크 영속화
 ├─ bars.py                       1분봉 집계기 + 5분봉 BB/Envelope 캐시
-├─ ai_server.py                  FastAPI LightGBM 추론 서버 (현재 OFF)
-├─ train_lgbm.py                 구학습 트랙 학습 스크립트 (entry_training)
+├─ ai_server.py                  보조 FastAPI 추론 서버 (선택)
 ├─ analyze_today.py              일별 거래 리뷰 + 매크로 join + 분류
 ├─ fetch_market_context.py       KOSPI/KOSDAQ 일봉 매크로 (nightly)
 ├─ fetch_minute_bars.py          매매 종목 1분봉 캐시 (nightly)
@@ -80,7 +80,7 @@
 
 | 파일                                      | 역할                                                                                                                     |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| [main.py](../main.py)                   | 키움 OpenAPI 이벤트 루프, 조건식 편입 처리, 1차/2차 매수 발주, 매도 평가, portfolio 영속화, 학습 표본 등록의 오케스트레이션 (PyQt5 `QAxWidget` + `Kiwoom` 클래스). |
+| [main.py](../main.py)                   | 키움 OpenAPI 이벤트 루프, `퀀트조건식` 편입 처리, 실시간 등록, 눌림 매수 발주, 매도 평가, portfolio 영속화, 로그/학습 표본 등록의 오케스트레이션 (PyQt5 `QAxWidget` + `Kiwoom` 클래스). |
 | [logging_setup.py](../logging_setup.py) | `setup_logging()` — root logger 1회 초기화. `KIWOOM_LOG_LEVEL` 환경변수로 레벨 제어. `data/main.log` 5MB × 5개 회전.                   |
 | [fid_codes.py](../fid_codes.py)         | `FID_CODES` dict (키움 FID 코드 ↔ 한글 이름) + `get_fid()` 역방향 lookup.                                                         |
 
@@ -90,9 +90,10 @@
 
 | 파일                                        | 역할                                                                                                       | 핵심 상수                                                                                                           |
 | ----------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| [entry_strategy.py](../entry_strategy.py) | A급(0봉 돌파 추격) / B급(1봉 돌파+눌림) 분기, 게이트(체결강도/거래속도/스프레드/관찰시간/추세 필터/과열 차단/ATR 동적 풀백/VWAP 지지). | `DANTE_FIRST_ENTRY_RATIO=0.25` `DANTE_GRADE_B_RATIO=1.0` `MIN_CHEJAN_STRENGTH_HARD=120` `MAX_SPREAD_RATE=0.006` `ATR_PULLBACK_*_MULT` `VWAP_SUPPORT_BUFFER_PCT=0.003` |
+| [quant_condition_strategy.py](../quant_condition_strategy.py) | 현재 운용 중인 퀀트조건식 룰. 포착가 기준 -1.5% 눌림, 체결강도 100% 이상 매수, +2% 익절, -1.5% 손절을 순수 함수로 평가. | `pullback_pct=0.015` `min_chejan_strength=100` `take_profit_pct=0.02` `stop_loss_pct=0.015` |
+| [entry_strategy.py](../entry_strategy.py) | 레거시 단테 게이트/학습 피처 보조 로직. 현재 퀀트조건식 운용에서는 핵심 매수 트리거가 아님. | `DANTE_*` 내부 호환 상수 |
 | [exit_strategy.py](../exit_strategy.py)   | -1R 손절 → +1R BE 이동 → +2R 50% 부분익절 → 잔량 추세이탈 → 25분 시간손절.                                                  | `R_UNIT_PCT=0.015` (1R) `EXIT_BE_R=1.0` `EXIT_PARTIAL_R=2.0` `EXIT_TIME_LIMIT_SECONDS=1500`                     |
-| [scoring.py](../scoring.py)               | 진입 피처/점수, 호가단위 round_up, calibration, 단테 학습용 피처(`build_dante_entry_features`). main 과 ai_server 의 단일 출처. | `ENTRY_WEIGHT_*` `EXIT_WEIGHT_*` `_TICK_SIZE_TABLE`                                                             |
+| [scoring.py](../scoring.py)               | 호가단위 round_up, 보조 점수, 학습용 피처(`build_dante_entry_features`). `dante_*` 명칭은 기존 데이터/모델 호환을 위한 내부 이름. | `ENTRY_WEIGHT_*` `EXIT_WEIGHT_*` `_TICK_SIZE_TABLE`                                                             |
 
 
 ### 3.3 데이터 모델/캐시
@@ -102,7 +103,7 @@
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | [portfolio.py](../portfolio.py)                 | `Position` dataclass (`entry_stage`, `stop_price`, `breakout_grade`, `pending_sell_intent`...) + 디스크 영속화 (`save`/`load`). type-cast 강건성. |
 | [bars.py](../bars.py)                           | `MinuteBarAggregator` (실시간 틱 → 1분봉, 일중 VWAP, 풀백 저점) + `FiveMinIndicatorCache` (opt10080 → BB(45,2)/BB(55,2)/Envelope(13,2.5)/Envelope(22,2.5)/ATR(14)).        |
-| [training_recorder.py](../training_recorder.py) | `TrainingRecorderMixin` — Kiwoom 에 합쳐지는 mixin. 4개 트랙(구학습/dante/dante_shadow/trade_log) CSV 기록 분리. 같은 모듈 상수가 `main.X` 로도 re-export 됨.     |
+| [training_recorder.py](../training_recorder.py) | `TrainingRecorderMixin` — Kiwoom 에 합쳐지는 mixin. 퀀트조건식 거래 로그와 사후 학습 CSV 기록 분리. `dante_*` 파일명은 기존 분석 파이프라인 호환용.     |
 
 
 ### 3.4 학습/추론
@@ -110,8 +111,7 @@
 
 | 파일                                | 역할                                                                                                                      |
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| [train_lgbm.py](../train_lgbm.py) | LightGBM 분류기 학습 (`entry_training.csv` → `models/opening_lgbm.pkl`). 5-fold CV + threshold tuning. 64bit venv 에서 실행.     |
-| [ai_server.py](../ai_server.py)   | FastAPI 서버. main.py 가 진입 시점에 HTTP POST 로 점수를 받음. 모델 미설치 시 fallback 점수 사용. **현재 `AI_SERVER_ENABLED=False`** (단테 룰 운용 중). |
+| [ai_server.py](../ai_server.py)   | FastAPI 보조 추론 서버. 현재 핵심 매수/매도 판단은 `quant_condition_strategy.py` 룰이 담당하며, AI는 보조/실험 경로입니다. |
 
 
 ### 3.5 야간 리뷰 파이프라인
@@ -187,42 +187,32 @@ flowchart TB
 
 ---
 
-## 5. 단테 전략 핵심 룰 (한 화면 요약)
+## 5. 퀀트조건식 핵심 룰 (한 화면 요약)
 
 ```
-[조건검색]  영웅문 "단테떡상이"
-            5분봉 BB(45,2) / BB(55,2) / Envelope(13,2.5) / Envelope(22,2.5)
-            동시 상향돌파 + 일거래량 5만 + 체결강도 100%
+[조건검색]
+  영웅문 저장 조건식 이름: "퀀트조건식"
+  OnReceiveTrCondition 으로 편입 종목 수신
+  → 포착 당시 현재가를 capture_price 로 저장
+  → SetRealReg 로 현재가/체결강도 등 실시간 FID 등록
 
-[1차 진입 게이트]
-  관찰 ≥ 30s, 실시간 틱 ≥ 5, 스프레드 ≤ 0.6%
-  거래속도 ≥ 500주/s
-  체결강도: Hard ≥ 120 통과 / Soft 100~120 + 추세 상승 시만 통과
-  5분봉 추세 OK + 진행봉 윗꼬리 ≤ 30%
-  과열: 시가 대비 ≤ +8% 그리고 BB55 대비 ≤ +4%
+[매수]
+  현재가 <= 포착가 × (1 - 0.015)
+  체결강도 >= 100%
+  위 조건을 동시에 만족하면 매수 주문
+  주문 제한: ORDER_REQUEST_INTERVAL_SECONDS 로 1초 5회 이하 유지
 
-[A급 / B급 분기]
-  A급 (0봉 돌파)        → 1차 추격 25%        → 본진입 75% (눌림, 현재 watch-only)
-  B급 (1봉 돌파만)      → 1차 추격 없음       → 첫 눌림에서 100% 일괄
-  둘 다 아님            → wait
+[매도]
+  현재가 >= 매수가 × (1 + 0.02)  → 전량 익절
+  현재가 <= 매수가 × (1 - 0.015) → 전량 손절
 
-[2차 본진입 윈도우]  1차 체결 후 10분 안에 첫 눌림 발생
-  눌림 임계: ATR 동적 = ATR×0.20 ~ ATR×1.20 (정적 fallback 0.3% ~ 1.5%)
-  위태 차단: ATR×1.50 (정적 2.0%, floor 2.0% / cap 6.0%)
-  음봉 0~2개 후 양봉 반전 + 체결강도 유지
-  VWAP 지지: 풀백 저점 ≥ VWAP × (1 - 0.3%), 양봉 reversal 종가 ≥ VWAP
-
-[청산 (R-multiple, 1R = 1.5%)]
-  1) -1R 손절 (전량)
-  2) +1R 도달 → stop = entry (BE 보장)
-  3) +2R 도달 + 미부분익절 → 50% 부분 익절
-  4) 부분익절 후 잔량: 1분봉 5MA 이탈 / 체결강도 < 80 / 5분봉 Env(13) 이탈 → 청산
-  5) 25분 + r < 1R → 시간 손절
-  6) 15:15 강제 청산
+[로그]
+  조건식 포착가, 눌림률, 체결강도, 매수/매도 사유를 trade_log.csv 와 콘솔 로그에 남김
 ```
+
+> 참고: 코드와 CSV 일부에는 `dante_*` 이름이 아직 남아 있습니다. 이는 과거 단테 전략에서 이어진 파일명/테스트/분석 파이프라인 호환용 내부 명칭이며, 현재 운영 기준 문서는 `퀀트조건식` 룰을 우선합니다.
 
 ---
-
 ## 6. 학습/검증 트랙 — 현재 단계
 
 현재는 **데이터 누적 단계** 입니다. 학습된 모델을 운용에 반영하지 않고,
@@ -231,9 +221,8 @@ flowchart TB
 
 | 트랙                                  | 파일                               | 상태                                      | 표본 정의                                                                                             |
 | ----------------------------------- | -------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| 구학습 (`entry_training`)              | `data/entry_training.csv`        | **OFF** (`TRAINING_DATA_ENABLED=False`) | 구 LightGBM 진입 후보 — 단테 전환 후 비활성                                                                    |
-| 단테 ready (`dante_entry_training`)   | `data/dante_entry_training.csv`  | **ON**                                  | 게이트 `ready` 종목 + 25분 사후 라벨(`reached_1r`/`reached_2r`/`hit_stop`/`time_exit`). 60s cooldown        |
-| 단테 shadow (`dante_shadow_training`) | `data/dante_shadow_training.csv` | **ON**                                  | 게이트 `wait`/`blocked` 종목 (전략 임계 미달만; 데이터 부족은 제외) + 같은 25분 라벨. 90s cooldown. **false-negative 측정용** |
+| 퀀트 ready (`dante_entry_training`)   | `data/dante_entry_training.csv`  | **ON**                                  | 퀀트조건식 매수 후보/ready 표본 + 25분 사후 라벨. 파일명은 기존 호환상 `dante_*` 유지.        |
+| 퀀트 shadow (`dante_shadow_training`) | `data/dante_shadow_training.csv` | **ON**                                  | 퀀트조건식 기준에서 `wait`/`blocked` 된 표본 + 같은 25분 라벨. 파일명은 기존 호환상 `dante_*` 유지. |
 | 거래 로그                               | `data/trade_log.csv`             | **ON**                                  | 모든 매수/매도 이벤트 + reason/profit_rate/hold_seconds                                                    |
 
 
@@ -290,7 +279,6 @@ python .\apply_overrides.py             # mode=dry_run, 모듈 상수 변경 없
 python .\apply_overrides.py --commit    # mode=commit, high+approved 만 적용
 
 # === 표본이 충분히 쌓인 뒤, 64-bit venv 에서 학습 (선택) ===
-.\venv64\Scripts\python.exe .\train_lgbm.py
 .\venv64\Scripts\python.exe -m uvicorn ai_server:app --host 127.0.0.1 --port 8000
 ```
 
@@ -312,9 +300,10 @@ python .\apply_overrides.py --commit    # mode=commit, high+approved 만 적용
 
 | 카테고리      | 파일                                                            | 비고                                 |
 | --------- | ------------------------------------------------------------- | ---------------------------------- |
-| 진입 전략     | `test_entry_strategy.py`                                      | A급/B급 게이트, 눌림 윈도우                  |
+| 퀀트조건식     | `test_quant_condition_strategy.py`                            | 포착가 -1.5% 눌림, 체결강도, +2%/-1.5% 청산 |
+| 보조 진입 전략  | `test_entry_strategy.py`                                      | 레거시 A/B 게이트, 눌림 윈도우                  |
 | 청산 전략     | `test_exit_strategy.py`                                       | R-multiple 트레일링, 시간 손절             |
-| 단테 피처     | `test_dante_features.py`                                      | scoring.build_dante_entry_features |
+| 학습 피처     | `test_dante_features.py`                                      | 기존 호환명: scoring.build_dante_entry_features |
 | 분류기       | `test_classifier.py`                                          | 진입 4종 + 청산 4종 (v2)                 |
 | 1분봉       | `test_intraday.py`                                            | VWAP, 윗꼬리 D 피처                     |
 | 누적        | `test_rolling.py`                                             | 5/10/20 윈도우 + confidence           |
@@ -347,7 +336,7 @@ venv (`.\.venv\`) 에서 실행. LightGBM 학습은 64-bit (`.\venv64\`).
 본 문서는 시스템 전체 인덱스이므로, 코드 변경 이력은 git log 와 PR 설명에
 기록합니다. 주요 마일스톤만 요약:
 
-- **단테 전략 도입** — A급(0봉 돌파 추격) / B급(1봉 돌파+눌림) 분기, R-multiple 청산
+- **퀀트조건식 전략 전환** — 포착가 -1.5% 눌림 + 체결강도 100%, +2% 익절 / -1.5% 손절
 - **shadow 학습 트랙 추가** — `wait`/`blocked` 표본 사후 라벨링으로 false-negative 측정
 - **portfolio_state.json 영속화** — 장중 크래시 복원, 8개 전략 필드 보호
 - **review 시스템** — 매일 자동 분류 + 누적 통계 + 룰 후보 + dry_run/commit 적용기
