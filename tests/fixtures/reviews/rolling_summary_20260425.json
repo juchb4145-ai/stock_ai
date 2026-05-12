@@ -1,0 +1,397 @@
+{
+  "generated_at": "2026-04-30T11:05:49",
+  "as_of_date": "2026-04-25",
+  "windows": [
+    5,
+    10,
+    20
+  ],
+  "stats": [
+    {
+      "window": 5,
+      "dates": [
+        "2026-04-21",
+        "2026-04-22",
+        "2026-04-23",
+        "2026-04-24",
+        "2026-04-25"
+      ],
+      "n_total": 25,
+      "confidence": "medium",
+      "overall": {
+        "n": 25,
+        "win_rate": 0.4,
+        "avg_r": -0.03959999999999999,
+        "avg_realized": -0.0005960000000000002,
+        "avg_mfe_r": 1.628,
+        "avg_mae_r": -0.76,
+        "profit_factor": 0.9096422073984235
+      },
+      "by_entry_class": {
+        "breakout_chase": {
+          "n": 20,
+          "win_rate": 0.25,
+          "avg_r": -0.2995,
+          "avg_realized": -0.004495,
+          "avg_mfe_r": 1.29,
+          "avg_mae_r": -0.825,
+          "profit_factor": 0.45482110369921164
+        },
+        "first_pullback": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      },
+      "by_exit_class": {
+        "bad_stop": {
+          "n": 10,
+          "win_rate": 0.0,
+          "avg_r": -0.599,
+          "avg_realized": -0.00899,
+          "avg_mfe_r": 1.7,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "good_stop": {
+          "n": 5,
+          "win_rate": 0.0,
+          "avg_r": -1.0,
+          "avg_realized": -0.015,
+          "avg_mfe_r": 0.28,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "clean_exit": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 1.48,
+          "avg_mae_r": -0.3,
+          "profit_factor": null
+        },
+        "late_take": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      },
+      "by_entry_exit": {
+        "breakout_chase|bad_stop": {
+          "n": 10,
+          "win_rate": 0.0,
+          "avg_r": -0.599,
+          "avg_realized": -0.00899,
+          "avg_mfe_r": 1.7,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "breakout_chase|good_stop": {
+          "n": 5,
+          "win_rate": 0.0,
+          "avg_r": -1.0,
+          "avg_realized": -0.015,
+          "avg_mfe_r": 0.28,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "breakout_chase|clean_exit": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 1.48,
+          "avg_mae_r": -0.3,
+          "profit_factor": null
+        },
+        "first_pullback|late_take": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      }
+    },
+    {
+      "window": 10,
+      "dates": [
+        "2026-04-21",
+        "2026-04-22",
+        "2026-04-23",
+        "2026-04-24",
+        "2026-04-25"
+      ],
+      "n_total": 25,
+      "confidence": "medium",
+      "overall": {
+        "n": 25,
+        "win_rate": 0.4,
+        "avg_r": -0.03959999999999999,
+        "avg_realized": -0.0005960000000000002,
+        "avg_mfe_r": 1.628,
+        "avg_mae_r": -0.76,
+        "profit_factor": 0.9096422073984235
+      },
+      "by_entry_class": {
+        "breakout_chase": {
+          "n": 20,
+          "win_rate": 0.25,
+          "avg_r": -0.2995,
+          "avg_realized": -0.004495,
+          "avg_mfe_r": 1.29,
+          "avg_mae_r": -0.825,
+          "profit_factor": 0.45482110369921164
+        },
+        "first_pullback": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      },
+      "by_exit_class": {
+        "bad_stop": {
+          "n": 10,
+          "win_rate": 0.0,
+          "avg_r": -0.599,
+          "avg_realized": -0.00899,
+          "avg_mfe_r": 1.7,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "good_stop": {
+          "n": 5,
+          "win_rate": 0.0,
+          "avg_r": -1.0,
+          "avg_realized": -0.015,
+          "avg_mfe_r": 0.28,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "clean_exit": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 1.48,
+          "avg_mae_r": -0.3,
+          "profit_factor": null
+        },
+        "late_take": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      },
+      "by_entry_exit": {
+        "breakout_chase|bad_stop": {
+          "n": 10,
+          "win_rate": 0.0,
+          "avg_r": -0.599,
+          "avg_realized": -0.00899,
+          "avg_mfe_r": 1.7,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "breakout_chase|good_stop": {
+          "n": 5,
+          "win_rate": 0.0,
+          "avg_r": -1.0,
+          "avg_realized": -0.015,
+          "avg_mfe_r": 0.28,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "breakout_chase|clean_exit": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 1.48,
+          "avg_mae_r": -0.3,
+          "profit_factor": null
+        },
+        "first_pullback|late_take": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      }
+    },
+    {
+      "window": 20,
+      "dates": [
+        "2026-04-21",
+        "2026-04-22",
+        "2026-04-23",
+        "2026-04-24",
+        "2026-04-25"
+      ],
+      "n_total": 25,
+      "confidence": "medium",
+      "overall": {
+        "n": 25,
+        "win_rate": 0.4,
+        "avg_r": -0.03959999999999999,
+        "avg_realized": -0.0005960000000000002,
+        "avg_mfe_r": 1.628,
+        "avg_mae_r": -0.76,
+        "profit_factor": 0.9096422073984235
+      },
+      "by_entry_class": {
+        "breakout_chase": {
+          "n": 20,
+          "win_rate": 0.25,
+          "avg_r": -0.2995,
+          "avg_realized": -0.004495,
+          "avg_mfe_r": 1.29,
+          "avg_mae_r": -0.825,
+          "profit_factor": 0.45482110369921164
+        },
+        "first_pullback": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      },
+      "by_exit_class": {
+        "bad_stop": {
+          "n": 10,
+          "win_rate": 0.0,
+          "avg_r": -0.599,
+          "avg_realized": -0.00899,
+          "avg_mfe_r": 1.7,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "good_stop": {
+          "n": 5,
+          "win_rate": 0.0,
+          "avg_r": -1.0,
+          "avg_realized": -0.015,
+          "avg_mfe_r": 0.28,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "clean_exit": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 1.48,
+          "avg_mae_r": -0.3,
+          "profit_factor": null
+        },
+        "late_take": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      },
+      "by_entry_exit": {
+        "breakout_chase|bad_stop": {
+          "n": 10,
+          "win_rate": 0.0,
+          "avg_r": -0.599,
+          "avg_realized": -0.00899,
+          "avg_mfe_r": 1.7,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "breakout_chase|good_stop": {
+          "n": 5,
+          "win_rate": 0.0,
+          "avg_r": -1.0,
+          "avg_realized": -0.015,
+          "avg_mfe_r": 0.28,
+          "avg_mae_r": -1.0,
+          "profit_factor": 0.0
+        },
+        "breakout_chase|clean_exit": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 1.48,
+          "avg_mae_r": -0.3,
+          "profit_factor": null
+        },
+        "first_pullback|late_take": {
+          "n": 5,
+          "win_rate": 1.0,
+          "avg_r": 1.0,
+          "avg_realized": 0.015,
+          "avg_mfe_r": 2.98,
+          "avg_mae_r": -0.5,
+          "profit_factor": null
+        }
+      }
+    }
+  ],
+  "overrides_evidence_by_window": {
+    "5d": [
+      {
+        "rule": "break_even_cut",
+        "title": "⑤ 본절컷(BE 스탑 이동을 +0.7R로 앞당김)",
+        "n": 2,
+        "ratio": 0.6667,
+        "confidence": "medium",
+        "summary": "+1R 도달 후 손절 2/3건 (67%). EXIT_BE_R 1.0→0.7",
+        "date": "2026-04-25"
+      }
+    ],
+    "10d": [
+      {
+        "rule": "break_even_cut",
+        "title": "⑤ 본절컷(BE 스탑 이동을 +0.7R로 앞당김)",
+        "n": 2,
+        "ratio": 0.6667,
+        "confidence": "medium",
+        "summary": "+1R 도달 후 손절 2/3건 (67%). EXIT_BE_R 1.0→0.7",
+        "date": "2026-04-25"
+      }
+    ],
+    "20d": [
+      {
+        "rule": "break_even_cut",
+        "title": "⑤ 본절컷(BE 스탑 이동을 +0.7R로 앞당김)",
+        "n": 2,
+        "ratio": 0.6667,
+        "confidence": "medium",
+        "summary": "+1R 도달 후 손절 2/3건 (67%). EXIT_BE_R 1.0→0.7",
+        "date": "2026-04-25"
+      }
+    ]
+  }
+}

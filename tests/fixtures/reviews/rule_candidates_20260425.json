@@ -1,0 +1,130 @@
+{
+  "generated_at": "2026-04-30T11:05:49",
+  "as_of_date": "2026-04-25",
+  "windows": [
+    5,
+    10,
+    20
+  ],
+  "auto_apply_globally_disabled": true,
+  "note": "rolling 모듈은 후보만 만든다. 모든 confidence 의 후보가 auto_apply=false 로 떨어지며, 실제 적용은 PR-A(dry_run) 의 별도 모듈이 담당한다.",
+  "candidates": [
+    {
+      "rule_id": "wait_for_pullback",
+      "title": "② 더 기다리기(A급 1차 추격 비활성)",
+      "triggered_windows": [
+        5,
+        10,
+        20
+      ],
+      "confidence": "medium",
+      "n_largest_window": 20,
+      "consistent_across_windows": true,
+      "evidence": {
+        "5d": {
+          "n": 20,
+          "total": 25,
+          "ratio": 0.8,
+          "a_avg_r": -0.2995,
+          "b_avg_r": 1.0
+        },
+        "10d": {
+          "n": 20,
+          "total": 25,
+          "ratio": 0.8,
+          "a_avg_r": -0.2995,
+          "b_avg_r": 1.0
+        },
+        "20d": {
+          "n": 20,
+          "total": 25,
+          "ratio": 0.8,
+          "a_avg_r": -0.2995,
+          "b_avg_r": 1.0
+        }
+      },
+      "proposed_overrides": {
+        "entry_strategy": {
+          "DANTE_FIRST_ENTRY_RATIO": 0.0
+        }
+      },
+      "auto_apply": false,
+      "reason_no_apply": "rolling 모듈은 후보만 생성한다 — 적용은 PR-A(dry_run)"
+    },
+    {
+      "rule_id": "take_profit_faster",
+      "title": "③ 빨리 익절(부분익절 R 단축)",
+      "triggered_windows": [
+        5,
+        10,
+        20
+      ],
+      "confidence": "medium",
+      "n_largest_window": 5,
+      "consistent_across_windows": true,
+      "evidence": {
+        "5d": {
+          "n": 5,
+          "total": 10,
+          "ratio": 0.5,
+          "avg_give_back_r": 1.98
+        },
+        "10d": {
+          "n": 5,
+          "total": 10,
+          "ratio": 0.5,
+          "avg_give_back_r": 1.98
+        },
+        "20d": {
+          "n": 5,
+          "total": 10,
+          "ratio": 0.5,
+          "avg_give_back_r": 1.98
+        }
+      },
+      "proposed_overrides": {
+        "exit_strategy": {
+          "EXIT_PARTIAL_R": "max(1.0, EXIT_PARTIAL_R - 0.5)"
+        }
+      },
+      "auto_apply": false,
+      "reason_no_apply": "rolling 모듈은 후보만 생성한다 — 적용은 PR-A(dry_run)"
+    },
+    {
+      "rule_id": "break_even_cut",
+      "title": "⑤ 본절컷(BE 스탑 조기 이동)",
+      "triggered_windows": [
+        5,
+        10,
+        20
+      ],
+      "confidence": "medium",
+      "n_largest_window": 10,
+      "consistent_across_windows": true,
+      "evidence": {
+        "5d": {
+          "n": 10,
+          "total": 15,
+          "ratio": 0.6666666666666666
+        },
+        "10d": {
+          "n": 10,
+          "total": 15,
+          "ratio": 0.6666666666666666
+        },
+        "20d": {
+          "n": 10,
+          "total": 15,
+          "ratio": 0.6666666666666666
+        }
+      },
+      "proposed_overrides": {
+        "exit_strategy": {
+          "EXIT_BE_R": "max(0.5, EXIT_BE_R - 0.3)"
+        }
+      },
+      "auto_apply": false,
+      "reason_no_apply": "rolling 모듈은 후보만 생성한다 — 적용은 PR-A(dry_run)"
+    }
+  ]
+}

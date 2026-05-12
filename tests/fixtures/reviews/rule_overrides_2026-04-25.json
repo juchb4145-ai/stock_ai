@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-04-25T15:35:00",
+  "target_date": "2026-04-25",
+  "applies_to_next_trading_day": true,
+  "overrides": {
+    "exit_strategy": {
+      "EXIT_BE_R": 0.7
+    }
+  },
+  "evidence": [
+    {
+      "rule": "break_even_cut",
+      "title": "⑤ 본절컷(BE 스탑 이동을 +0.7R로 앞당김)",
+      "n": 2,
+      "ratio": 0.6667,
+      "confidence": "medium",
+      "summary": "+1R 도달 후 손절 2/3건 (67%). EXIT_BE_R 1.0→0.7"
+    }
+  ]
+}
