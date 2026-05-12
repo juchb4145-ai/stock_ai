@@ -15,10 +15,12 @@ import scoring
 import entry_strategy
 import exit_strategy
 from bars import FiveMinIndicatorCache, MinuteBarAggregator
+from condition_capture_logger import CONDITION_CAPTURE_CSV, ConditionCaptureLogger
 from market_state import KOSDAQ_CODE, KOSPI_CODE, MarketStateCache
 from portfolio import LoadedPortfolioState, Position, PortfolioState
 from logging_setup import setup_logging
 from fid_codes import FID_CODES, FID_NAME_TO_CODE, get_fid
+from quant_condition_strategy import QuantConditionStrategy, QuantStrategyConfig
 from training_recorder import (
     TrainingRecorderMixin,
     # 모듈 상수 re-export — 외부 테스트가 main.X 로 직접 접근하므로 호환 유지
@@ -105,6 +107,16 @@ QUANT_TAKE_PROFIT_PCT = SAFE_PULLBACK_TAKE_PROFIT_PCT
 QUANT_STOP_LOSS_PCT = SAFE_PULLBACK_STOP_LOSS_PCT
 QUANT_PLAN_SOURCE = "quant_condition_pullback"
 QUANT_GRADE = "QUANT"
+QUANT_STRATEGY_CONFIG = QuantStrategyConfig(
+    condition_name=CONDITION_NAME,
+    entry_pullback_pct=QUANT_ENTRY_PULLBACK_PCT,
+    min_chejan_strength=QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+    take_profit_pct=QUANT_TAKE_PROFIT_PCT,
+    stop_loss_pct=QUANT_STOP_LOSS_PCT,
+    max_positions=SAFE_PULLBACK_MAX_POSITIONS,
+    plan_source=QUANT_PLAN_SOURCE,
+    grade=QUANT_GRADE,
+)
 ENTRY_PLAN_EXPIRY_SECONDS = 45
 # 매수 미체결 만료 점검 주기 (ms). 45초 expiry 와 ±2~5초 정밀도면 충분.
 BUY_ORDER_EXPIRY_CHECK_INTERVAL_MS = 5000
@@ -243,6 +255,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.realtime_ticks = {}
         self.orderbook_snapshots = {}
         self.condition_registered_at = {}
+        self.quant_strategy = QuantConditionStrategy(QUANT_STRATEGY_CONFIG)
+        self.condition_capture_logger = ConditionCaptureLogger(CONDITION_CAPTURE_CSV)
         self.pending_training_samples = {}
         self.last_training_sample_at = {}
         # 단테 학습 트랙(Phase A) 의 sample_id → 진행 정보. 5/10/20분 horizon 라벨링 후 CSV flush.
@@ -592,12 +606,24 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         codes = [code for code in code_list.split(';') if code]
         logger.info("[조건검색 초기조회] {}({}) {}건".format(condition_name, condition_index, len(codes)))
         for code in codes:
-            self.register_condition_detected_stock(code, condition_name, "I")
+            self.register_condition_detected_stock(
+                code,
+                condition_name,
+                "I",
+                condition_index=condition_index,
+                screen_no=screen_no,
+            )
 
     def _on_receive_real_condition(self, code, event_type, condition_name, condition_index):
         if event_type == "I":
             logger.info("[조건편입] {} {}({})".format(code, condition_name, condition_index))
-            self.register_condition_detected_stock(code, condition_name, event_type)
+            self.register_condition_detected_stock(
+                code,
+                condition_name,
+                event_type,
+                condition_index=condition_index,
+                screen_no=CONDITION_SCREEN_NO,
+            )
         elif event_type == "D":
             logger.info("[조건이탈] {} {}({})".format(code, condition_name, condition_index))
 
@@ -846,7 +872,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return True
         return False
 
-    def register_condition_detected_stock(self, code, condition_name="", event_type="I"):
+    def register_condition_detected_stock(
+        self,
+        code,
+        condition_name="",
+        event_type="I",
+        *,
+        condition_index="",
+        screen_no="",
+    ):
         """조건식 포착 직후 실시간 등록과 감시 큐 등록을 한 번에 수행한다."""
         code = self.normalize_code(code)
         if not code:
@@ -854,7 +888,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         watch = self.ensure_monitoring_stock(code)
         watch["condition_name"] = condition_name or CONDITION_NAME
         watch["condition_event_type"] = event_type
+        watch["condition_index"] = condition_index
         watch["condition_formula"] = TRADE_LOG_CONDITION_FORMULA
+        try:
+            self.condition_capture_logger.append_detection(
+                code=code,
+                name=self.get_code_name(code),
+                condition_name=condition_name or CONDITION_NAME,
+                condition_index=condition_index,
+                event_type=event_type,
+                screen_no=screen_no or CONDITION_SCREEN_NO,
+            )
+        except Exception as exc:
+            logger.warning("[조건검색 포착 로그 실패] %s %s", code, exc)
         if code not in self.realtime_registered_codes:
             self.register_realtime_stock(code)
             self.condition_registered_at[code] = time.time()
@@ -1992,9 +2038,24 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         watch["last_price"] = close
         if self.parse_int(watch.get("capture_price", 0)) <= 0:
             watch["capture_price"] = close
-            watch["target_price"] = scoring.round_down_to_tick(close * (1 - SAFE_PULLBACK_MIN_DROP_PCT))
+            watch["target_price"] = self.quant_strategy.trigger_price(close)
             watch["capture_accum_volume"] = accum_volume
             watch["breakout_volume"] = max(self.monitoring_volume_5m(code), 0)
+            try:
+                self.condition_capture_logger.append_capture_price(
+                    code=code,
+                    name=self.get_code_name(code),
+                    condition_name=watch.get("condition_name", CONDITION_NAME),
+                    condition_index=watch.get("condition_index", ""),
+                    event_type=watch.get("condition_event_type", ""),
+                    screen_no=self.realtime_code_screens.get(code, REALTIME_SCREEN_NO),
+                    capture_price=close,
+                    entry_trigger_price=watch["target_price"],
+                    chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
+                    accum_volume=accum_volume,
+                )
+            except Exception as exc:
+                logger.warning("[조건검색 포착가 로그 실패] %s %s", code, exc)
             logger.info(
                 "[퀀트조건식 포착가 저장] %s capture=%s entry_trigger=%s(-%.2f%%) strength_min=%.0f",
                 code,
@@ -2098,43 +2159,25 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return {"status": "wait", "stage": 2, "reason": "포착가 저장 대기", "reason_code": "SAFE_NO_CAPTURE"}
 
         name = self.get_code_name(code)
-        pullback_pct = (capture_price - current_price) / capture_price
         chejan_strength = self.parse_float(tick.get("chejan_strength", 0.0), 0.0)
         target_price = self.parse_int(watch.get("target_price", 0))
         if target_price <= 0:
-            target_price = scoring.round_down_to_tick(capture_price * (1 - QUANT_ENTRY_PULLBACK_PCT))
+            target_price = self.quant_strategy.trigger_price(capture_price)
             watch["target_price"] = target_price
 
-        if pullback_pct < QUANT_ENTRY_PULLBACK_PCT:
+        entry_decision = self.quant_strategy.evaluate_entry(
+            capture_price=capture_price,
+            current_price=current_price,
+            chejan_strength=chejan_strength,
+            active_positions=self.active_position_count(),
+        )
+        if entry_decision.status != "ready":
             watch["status"] = "WATCHING"
-            return {
-                "status": "wait",
-                "stage": 2,
-                "reason": "퀀트조건식 눌림 대기 {:.2%} < {:.2%} (capture={} trigger={})".format(
-                    pullback_pct,
-                    QUANT_ENTRY_PULLBACK_PCT,
-                    capture_price,
-                    target_price,
-                ),
-                "reason_code": "SAFE_PULLBACK_SHALLOW",
-                "capture_price": capture_price,
-                "pullback_pct": pullback_pct,
-                "chejan_strength": chejan_strength,
-            }
-        if chejan_strength < QUANT_ENTRY_CHEJAN_STRENGTH_MIN:
-            return {
-                "status": "wait",
-                "stage": 2,
-                "reason": "퀀트조건식 체결강도 대기 {:.1f} < {:.0f} (pullback {:.2%})".format(
-                    chejan_strength,
-                    QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
-                    pullback_pct,
-                ),
-                "reason_code": "SAFE_CHEJAN_WAIT",
-                "capture_price": capture_price,
-                "pullback_pct": pullback_pct,
-                "chejan_strength": chejan_strength,
-            }
+            return entry_decision.to_prediction(
+                code=code,
+                name=name,
+                config=QUANT_STRATEGY_CONFIG,
+            )
 
         if watch.get("status") != "READY":
             watch["status"] = "READY"
@@ -2145,55 +2188,23 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 code,
                 capture_price,
                 current_price,
-                pullback_pct * 100,
+                entry_decision.pullback_pct * 100,
                 chejan_strength,
             )
 
-        if self.active_position_count() >= SAFE_PULLBACK_MAX_POSITIONS:
-            return {
-                "status": "wait",
-                "stage": 2,
-                "reason": "최대 보유 종목 {}개 도달".format(SAFE_PULLBACK_MAX_POSITIONS),
-                "reason_code": "SAFE_MAX_POSITIONS",
-            }
-
-        entry_limit_price = scoring.round_down_to_tick(current_price)
-        stop_price = scoring.round_down_to_tick(entry_limit_price * (1 - QUANT_STOP_LOSS_PCT))
-        take_profit_price = scoring.round_up_to_tick(entry_limit_price * (1 + QUANT_TAKE_PROFIT_PCT))
-        return {
-            "status": "ready",
-            "code": code,
-            "name": name,
-            "current_price": current_price,
-            "ratio": 1.0,
-            "stage": 2,
-            "score": 1.0,
-            "grade": QUANT_GRADE,
-            "reason": "포착가 대비 눌림 {:.2%} >= {:.2%} + 체결강도 {:.1f} >= {:.0f}".format(
-                pullback_pct,
-                QUANT_ENTRY_PULLBACK_PCT,
-                chejan_strength,
-                QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
-            ),
-            "reason_code": "QUANT_PULLBACK_READY",
-            "capture_price": capture_price,
-            "safe_target_price": target_price,
-            "entry_limit_price": entry_limit_price,
-            "stop_price": stop_price,
-            "take_profit_price": take_profit_price,
-            "order_gubun": "00",
-            "plan_source": QUANT_PLAN_SOURCE,
-            "entry_plan_reason": "퀀트조건식 포착가 -1.5% 눌림 지정가, +2% 익절/-1.5% 손절",
-            "chejan_strength": chejan_strength,
-            "pullback_pct": pullback_pct,
-            "volume_speed": 0.0,
-            "spread_rate": 0.0,
-            "daily_turnover": time_filter.get("daily_turnover", 0),
-            "turnover_rank": time_filter.get("turnover_rank", 0),
-            "ranked_count": time_filter.get("ranked_count", 0),
-            "time_filter_phase": time_filter.get("phase", ""),
-            "time_filter_weight": time_filter.get("weight", 1.0),
-        }
+        return entry_decision.to_prediction(
+            code=code,
+            name=name,
+            config=QUANT_STRATEGY_CONFIG,
+            extra={
+                "safe_target_price": target_price,
+                "daily_turnover": time_filter.get("daily_turnover", 0),
+                "turnover_rank": time_filter.get("turnover_rank", 0),
+                "ranked_count": time_filter.get("ranked_count", 0),
+                "time_filter_phase": time_filter.get("phase", ""),
+                "time_filter_weight": time_filter.get("weight", 1.0),
+            },
+        )
 
     def score_safe_pullback_second_entry(self, code, position):
         code = self.normalize_code(code)
@@ -4067,6 +4078,24 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             }
         if not entry_price or position is None:
             return {"action": "hold", "qty_ratio": 0.0, "reason": "진입가/Position 정보 부족"}
+
+        order_context = getattr(position, "order_context", {}) or {}
+        is_quant_position = (
+            getattr(position, "breakout_grade", "") == QUANT_GRADE
+            or order_context.get("plan_source") == QUANT_PLAN_SOURCE
+        )
+        if is_quant_position:
+            quant_exit = self.quant_strategy.evaluate_exit(
+                entry_price=entry_price,
+                current_price=current_price,
+            )
+            if quant_exit.action == "sell":
+                return {
+                    "action": quant_exit.action,
+                    "qty_ratio": quant_exit.qty_ratio,
+                    "reason": quant_exit.reason,
+                    "mark_partial_taken": False,
+                }
 
         # Position 누락 필드 보정.
         now_ts = time.time()
