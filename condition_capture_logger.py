@@ -6,17 +6,22 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
+from trade_config import TRADE_CONFIG
+
 
 CONDITION_CAPTURE_CSV = os.path.join("data", "condition_captures.csv")
 
 CONDITION_CAPTURE_FIELDS = [
     "logged_at",
     "event",
+    "detected_at",
     "captured_at",
     "captured_time",
     "code",
     "name",
     "condition_name",
+    "condition_formula",
+    "condition_formula_version",
     "condition_index",
     "event_type",
     "screen_no",
@@ -24,6 +29,7 @@ CONDITION_CAPTURE_FIELDS = [
     "entry_trigger_price",
     "chejan_strength",
     "accum_volume",
+    "signal_source",
     "source",
 ]
 
@@ -43,6 +49,8 @@ class ConditionCaptureEvent:
     code: str
     name: str = ""
     condition_name: str = ""
+    condition_formula: str = ""
+    condition_formula_version: str = ""
     condition_index: Union[str, int] = ""
     event_type: str = ""
     screen_no: str = ""
@@ -50,8 +58,10 @@ class ConditionCaptureEvent:
     entry_trigger_price: int = 0
     chejan_strength: float = 0.0
     accum_volume: int = 0
+    signal_source: str = TRADE_CONFIG.signal_source
     source: str = "kiwoom"
     logged_at: str = ""
+    detected_at: str = ""
     captured_at: str = ""
     captured_time: str = ""
 
@@ -68,11 +78,16 @@ class ConditionCaptureEvent:
         return {
             "logged_at": logged_at,
             "event": self.event,
+            "detected_at": self.detected_at or captured_at,
             "captured_at": captured_at,
             "captured_time": captured_time,
             "code": self.code,
             "name": self.name,
             "condition_name": self.condition_name,
+            "condition_formula": self.condition_formula or TRADE_CONFIG.condition_formula,
+            "condition_formula_version": (
+                self.condition_formula_version or TRADE_CONFIG.condition_formula_version
+            ),
             "condition_index": self.condition_index,
             "event_type": self.event_type,
             "screen_no": self.screen_no,
@@ -80,6 +95,7 @@ class ConditionCaptureEvent:
             "entry_trigger_price": self.entry_trigger_price,
             "chejan_strength": self.chejan_strength,
             "accum_volume": self.accum_volume,
+            "signal_source": self.signal_source,
             "source": self.source,
         }
 

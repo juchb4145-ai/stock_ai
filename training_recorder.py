@@ -35,6 +35,7 @@ import entry_strategy
 import exit_strategy
 import scoring
 from market_state import SNAPSHOT_FIELD_NAMES
+from trade_config import TRADE_CONFIG
 
 
 logger = logging.getLogger("kiwoom")
@@ -48,10 +49,12 @@ TRAINING_DATA_DIR = "data"
 TRADE_LOG_CSV = os.path.join(TRAINING_DATA_DIR, "trade_log.csv")
 
 # === 현재 운용 전략/조건식 로그 메타 ===
-TRADE_LOG_STRATEGY_NAME = "퀀트조건식"
+TRADE_LOG_STRATEGY_NAME = TRADE_CONFIG.strategy_name
 TRADE_LOG_RULE_VERSION = "quant_condition_v1"
-TRADE_LOG_CONDITION_NAME = "퀀트조건식"
-TRADE_LOG_CONDITION_FORMULA = "A and J and N and P and S and T"
+TRADE_LOG_CONDITION_NAME = TRADE_CONFIG.condition_name
+TRADE_LOG_CONDITION_FORMULA = TRADE_CONFIG.condition_formula
+TRADE_LOG_CONDITION_FORMULA_VERSION = TRADE_CONFIG.condition_formula_version
+TRADE_LOG_SIGNAL_SOURCE = TRADE_CONFIG.signal_source
 TRADE_LOG_CONDITION_RULES = (
     "A: [5분]0봉전 Bollinger Band(20,2) 종가 상한선 상향돌파 | "
     "J: 체결강도 110.0% 이상 1000.0% 이하 | "
@@ -116,7 +119,10 @@ TRADE_LOG_FIELDS = [
     "rule_version",
     "condition_name",
     "condition_formula",
+    "condition_formula_version",
     "condition_rules",
+    "detected_at",
+    "signal_source",
     "code",
     "name",
     "side",
@@ -620,7 +626,9 @@ class TrainingRecorderMixin:
         row["rule_version"] = TRADE_LOG_RULE_VERSION
         row["condition_name"] = TRADE_LOG_CONDITION_NAME
         row["condition_formula"] = TRADE_LOG_CONDITION_FORMULA
+        row["condition_formula_version"] = TRADE_LOG_CONDITION_FORMULA_VERSION
         row["condition_rules"] = TRADE_LOG_CONDITION_RULES
+        row["signal_source"] = TRADE_LOG_SIGNAL_SOURCE
         for key, value in kwargs.items():
             if key in row:
                 row[key] = value

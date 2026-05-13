@@ -689,7 +689,7 @@ def run_rolling(
     # tighten 룰이 같은 target 을 동시에 건드리면 release 후보를 자동으로 무력화한다.
     # 양방향 동시 변경 → 모듈 상수 진동 위험을 PR-A 적용기 이전 단계에서 차단.
     shadow_evidence: Optional[Dict[str, object]] = None
-    if include_shadow:
+    if include_shadow and any(candidate_rows_by_window.values()):
         try:
             from .shadow_rules import (
                 build_shadow_evidence,

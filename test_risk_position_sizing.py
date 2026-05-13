@@ -67,7 +67,7 @@ class _StubKiwoom:
         self.target_returns = {}
         self.dante_reentry_watchlist = {}
         self.dante_a_watchlist = {}
-        self.send_order_calls = []
+        self.guarded_order_calls = []
         self.trade_log_calls = []
         self.saved_best = False
         self.saved_portfolio = False
@@ -80,7 +80,21 @@ class _StubKiwoom:
         return self.deposit
 
     def send_order(self, *args):
-        self.send_order_calls.append(args)
+        raise AssertionError("place_buy_order must use submit_order_guarded")
+
+    def submit_order_guarded(self, request):
+        self.guarded_order_calls.append(
+            (
+                request.rqname,
+                request.screen_no,
+                request.order_type,
+                request.code,
+                request.quantity,
+                request.price,
+                request.order_gubun,
+                request.order_no,
+            )
+        )
         return 0
 
     def append_trade_log(self, *args, **kwargs):
@@ -136,6 +150,12 @@ def _prediction(**overrides):
         "grade": "B",
         "reason_code": entry_strategy.READY_BGRADE_PULLBACK,
         "reason": "테스트 진입",
+        "final_entry_allowed": True,
+        "final_reason": "test final pass",
+        "final_reason_code": "FINAL_BUY_READY",
+        "strategy_version": "test",
+        "legacy_filter_enabled": True,
+        "decision_trace": {"test": True},
     }
     payload.update(overrides)
     return payload
@@ -195,8 +215,8 @@ class PlaceBuyOrderSizingTests(unittest.TestCase):
         kw = _StubKiwoom(deposit=10_000_000)
         kw.place_buy_order("A000001", _prediction(), ratio=1.0, stage=2)
 
-        self.assertEqual(len(kw.send_order_calls), 1)
-        args = kw.send_order_calls[0]
+        self.assertEqual(len(kw.guarded_order_calls), 1)
+        args = kw.guarded_order_calls[0]
         self.assertEqual(args[0], "buy")
         self.assertEqual(args[3], "000001")
         self.assertEqual(args[4], 333)
@@ -221,7 +241,7 @@ class PlaceBuyOrderSizingTests(unittest.TestCase):
 
         kw.place_buy_order("A000001", _prediction(), ratio=1.0, stage=2)
 
-        self.assertEqual(kw.send_order_calls, [])
+        self.assertEqual(kw.guarded_order_calls, [])
         self.assertEqual(len(kw.trade_log_calls), 1)
         self.assertEqual(kw.trade_log_calls[0][1]["reason"], "리스크 예산 부족")
 

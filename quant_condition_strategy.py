@@ -4,21 +4,22 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import scoring
+from trade_config import TRADE_CONFIG
 
 
 @dataclass(frozen=True)
 class QuantStrategyConfig:
-    condition_name: str = "퀀트조건식"
-    entry_pullback_pct: float = 0.015
-    max_pullback_pct: float = 0.030
-    rebound_confirm_pct: float = 0.003
-    min_chejan_strength: float = 100.0
+    condition_name: str = TRADE_CONFIG.strategy_name
+    entry_pullback_pct: float = TRADE_CONFIG.pullback_entry_pct
+    max_pullback_pct: float = TRADE_CONFIG.max_pullback_pct
+    rebound_confirm_pct: float = TRADE_CONFIG.rebound_confirm_pct
+    min_chejan_strength: float = TRADE_CONFIG.min_trade_strength
     market_min_chejan_strength: Dict[str, float] = field(
-        default_factory=lambda: {"weak": 120.0}
+        default_factory=lambda: {"weak": TRADE_CONFIG.weak_market_min_trade_strength}
     )
     take_profit_pct: float = 0.020
     stop_loss_pct: float = 0.015
-    max_positions: int = 3
+    max_positions: int = TRADE_CONFIG.max_positions
     plan_source: str = "quant_condition_pullback"
     grade: str = "QUANT"
     order_gubun: str = "00"

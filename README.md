@@ -111,3 +111,21 @@ python -m review.rolling                # 5/10/20 누적 + rule_candidates
 
 # 보조 모델을 쓰려면 FastAPI 재시작
 .\venv64\Scripts\python.exe -m uvicorn ai_server:app --host 127.0.0.1 --port 8000
+
+## MomentumBreakoutStrategy replay
+
+Replay the Python second-pass entry gate without Kiwoom, QAxWidget, or any order API:
+
+```powershell
+.\venv64\Scripts\python.exe .\momentum_replay.py --events .\sample_data\momentum_condition_events.csv --bars .\sample_data\momentum_minute_bars.csv --output .\sample_data\momentum_replay_results.csv
+```
+
+Inputs:
+- `sample_data/momentum_condition_events.csv`: mock HTS condition-search detections.
+- `sample_data/momentum_minute_bars.csv`: 1-minute or 5-minute bars after each detection.
+
+Output:
+- `sample_data/momentum_replay_results.csv`: code, detection time, capture price, decision, entry/stop/target prices, reason, and chase-risk score.
+
+Safety:
+- `momentum_replay.py` does not import `main.py`, Kiwoom COM objects, `send_order`, or live order paths.
