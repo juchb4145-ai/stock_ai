@@ -50,7 +50,7 @@ logger = setup_logging()
 # 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 조건식 자체의 A/J/N/P/S/T
 # 필터는 영웅문 조건검색이 담당하고, 이 프로그램은 편입 후 실시간으로 포착가 대비
 # -1.5% 눌림 + 체결강도 100% 이상만 진입 트리거로 확인한다.
-CONDITION_NAME = "퀀트조건식"
+CONDITION_NAME = "단테떡상이"
 CONDITION_SCREEN_NO = "0150"
 REALTIME_SCREEN_NO = "0160"
 # KOSPI/KOSDAQ 업종지수 실시간용 별도 스크린(종목 실시간과 충돌 방지).
@@ -80,7 +80,8 @@ RISK_PER_TRADE_RATE = 0.005
 MAX_PORTFOLIO_RISK_RATE = 0.02
 MIN_ORDER_CASH = 50_000
 SAFE_PULLBACK_MIN_DROP_PCT = 0.015
-SAFE_PULLBACK_MAX_DROP_PCT = 0.999
+SAFE_PULLBACK_MAX_DROP_PCT = 0.030
+SAFE_PULLBACK_REBOUND_CONFIRM_PCT = 0.003
 SAFE_PULLBACK_RUNAWAY_PCT = 0.030
 SAFE_PULLBACK_VOLUME_RATIO_MAX = 0.30
 SAFE_PULLBACK_CASH_RATE = 0.10
@@ -104,6 +105,8 @@ QUANT_GRADE = "QUANT"
 QUANT_STRATEGY_CONFIG = QuantStrategyConfig(
     condition_name=CONDITION_NAME,
     entry_pullback_pct=QUANT_ENTRY_PULLBACK_PCT,
+    max_pullback_pct=SAFE_PULLBACK_MAX_DROP_PCT,
+    rebound_confirm_pct=SAFE_PULLBACK_REBOUND_CONFIRM_PCT,
     min_chejan_strength=QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
     take_profit_pct=QUANT_TAKE_PROFIT_PCT,
     stop_loss_pct=QUANT_STOP_LOSS_PCT,
@@ -2075,12 +2078,21 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if target_price <= 0:
             target_price = self.quant_strategy.trigger_price(capture_price)
             watch["target_price"] = target_price
+        recent_low_price = self.parse_int(watch.get("recent_low_price", capture_price))
+        if recent_low_price <= 0:
+            recent_low_price = capture_price
+        recent_low_price = min(recent_low_price, current_price)
+        watch["recent_low_price"] = recent_low_price
+        market_snapshot = self.market_state.snapshot()
+        market_regime = getattr(market_snapshot, "market_regime", "") or "neutral"
 
         entry_decision = self.quant_strategy.evaluate_entry(
             capture_price=capture_price,
             current_price=current_price,
             chejan_strength=chejan_strength,
             active_positions=self.active_position_count(),
+            recent_low_price=recent_low_price,
+            market_state=market_regime,
         )
         if entry_decision.status != "ready":
             watch["status"] = "WATCHING"
