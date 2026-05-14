@@ -14,8 +14,10 @@ from trade_config import TRADE_CONFIG, TradeConfig
 logger = logging.getLogger(__name__)
 
 ALLOW_ENTRY = "ALLOW_ENTRY"
+ALLOW_LATE_A_GRADE_ENTRY = "ALLOW_LATE_A_GRADE_ENTRY"
 ALLOW_MANAGE_ONLY = "ALLOW_MANAGE_ONLY"
 ALLOW_CANDIDATE_CAPTURE = "ALLOW_CANDIDATE_CAPTURE"
+ALLOW_ANALYSIS_ONLY = "ALLOW_ANALYSIS_ONLY"
 BLOCK_PRE_OPEN = "BLOCK_PRE_OPEN"
 BLOCK_OPENING_STABILIZATION = "BLOCK_OPENING_STABILIZATION"
 BLOCK_AFTER_ENTRY_CUTOFF = "BLOCK_AFTER_ENTRY_CUTOFF"
@@ -24,7 +26,9 @@ BLOCK_CLOSING_AUCTION = "BLOCK_CLOSING_AUCTION"
 BLOCK_AFTER_MARKET = "BLOCK_AFTER_MARKET"
 BLOCK_NON_TRADING_DAY = "BLOCK_NON_TRADING_DAY"
 FORCE_EXIT_WINDOW = "FORCE_EXIT_WINDOW"
+CLOSING_AUCTION_EMERGENCY_EXIT = "CLOSING_AUCTION_EMERGENCY_EXIT"
 TIME_POLICY_DISABLED = "TIME_POLICY_DISABLED"
+TOO_LATE_FOR_ENTRY_WINDOW = "TOO_LATE_FOR_ENTRY_WINDOW"
 
 SESSION_DISABLED = "disabled"
 SESSION_NON_TRADING_DAY = "non_trading_day"
@@ -44,6 +48,11 @@ class TimeDecision:
     next_allowed_time: Optional[str]
     config_version: str
     time_decision_id: str = ""
+    entry_allowed: bool = False
+    capture_allowed: bool = False
+    manage_allowed: bool = False
+    analysis_allowed: bool = False
+    candidate_role: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -55,6 +64,11 @@ class TimeDecision:
             "next_allowed_time": self.next_allowed_time,
             "config_version": self.config_version,
             "time_decision_id": self.time_decision_id,
+            "entry_allowed": bool(self.entry_allowed),
+            "capture_allowed": bool(self.capture_allowed),
+            "manage_allowed": bool(self.manage_allowed),
+            "analysis_allowed": bool(self.analysis_allowed),
+            "candidate_role": self.candidate_role,
         }
 
 
@@ -124,6 +138,8 @@ class TimePolicy:
         self.candidate_capture_end = parse_clock(config.candidate_capture_end)
         self.entry_windows = parse_windows(config.entry_windows)
         self.no_new_entry_after = parse_clock(config.no_new_entry_after)
+        self.late_a_grade_entry_start = parse_clock(config.late_a_grade_entry_start)
+        self.late_a_grade_entry_end = parse_clock(config.late_a_grade_entry_end)
         self.force_exit_start = parse_clock(config.force_exit_start)
         self.force_exit_deadline = parse_clock(config.force_exit_deadline)
         self.closing_auction_start = parse_clock(config.closing_auction_start)
@@ -222,6 +238,144 @@ class TimePolicy:
         self._maybe_log(decision, log, context)
         return decision
 
+    def evaluate_trading_candidate_capture(
+        self,
+        *,
+        now: Optional[object] = None,
+        min_observation_sec: Optional[float] = None,
+        log: bool = False,
+        context: Optional[Dict[str, object]] = None,
+    ) -> TimeDecision:
+        """Return whether a detection should enter the live trading candidate pool.
+
+        Candidate capture is intentionally wider than buy entry. This method is
+        the narrower live-trading gate: detections outside a usable entry window
+        can still be logged as analysis samples without becoming orderable
+        candidates.
+        """
+        local_dt = self._coerce_datetime(now)
+        base_context = dict(context or {})
+        capture_decision = self.evaluate_candidate_capture(
+            now=local_dt,
+            log=False,
+            context=base_context,
+        )
+        if not capture_decision.capture_allowed:
+            self._maybe_log(capture_decision, log, base_context)
+            return capture_decision
+
+        min_obs = (
+            float(min_observation_sec)
+            if min_observation_sec is not None
+            else float(getattr(self.config, "min_candidate_age_seconds", 0) or 0)
+        )
+        trading_context = dict(base_context)
+        trading_context.setdefault("candidate_role", "trading")
+        trading_context.setdefault("min_observation_sec", min_obs)
+
+        entry_decision = self.evaluate_entry(
+            now=local_dt,
+            log=False,
+            context=trading_context,
+        )
+        deadline = self.entry_window_deadline(now=local_dt, context=trading_context)
+        if entry_decision.allowed and self._observation_overruns_deadline(
+            local_dt,
+            min_obs,
+            deadline,
+        ):
+            decision = self._decision(
+                False,
+                ALLOW_ANALYSIS_ONLY,
+                TOO_LATE_FOR_ENTRY_WINDOW,
+                local_dt,
+                session=capture_decision.session,
+                next_allowed_time=entry_decision.next_allowed_time,
+                candidate_role="analysis_only",
+                context=trading_context,
+            )
+            self._maybe_log(decision, log, trading_context)
+            return decision
+
+        if entry_decision.allowed:
+            role = (
+                "trading_late_a_grade"
+                if entry_decision.action == ALLOW_LATE_A_GRADE_ENTRY
+                else "trading"
+            )
+            decision = self._decision(
+                True,
+                entry_decision.action
+                if entry_decision.action == ALLOW_LATE_A_GRADE_ENTRY
+                else ALLOW_CANDIDATE_CAPTURE,
+                entry_decision.action
+                if entry_decision.action == ALLOW_LATE_A_GRADE_ENTRY
+                else ALLOW_CANDIDATE_CAPTURE,
+                local_dt,
+                session=capture_decision.session,
+                candidate_role=role,
+                context=trading_context,
+            )
+            self._maybe_log(decision, log, trading_context)
+            return decision
+
+        if entry_decision.reason_code == BLOCK_OPENING_STABILIZATION:
+            opening_deadline = self.entry_window_deadline(
+                now=local_dt,
+                context=trading_context,
+                include_next=True,
+            )
+            if not self._observation_overruns_deadline(local_dt, min_obs, opening_deadline):
+                decision = self._decision(
+                    True,
+                    ALLOW_CANDIDATE_CAPTURE,
+                    ALLOW_CANDIDATE_CAPTURE,
+                    local_dt,
+                    session=capture_decision.session,
+                    next_allowed_time=entry_decision.next_allowed_time,
+                    candidate_role="trading",
+                    context=trading_context,
+                )
+                self._maybe_log(decision, log, trading_context)
+                return decision
+
+        late_context = dict(trading_context)
+        late_context["late_a_grade_candidate"] = True
+        late_deadline = self.entry_window_deadline(now=local_dt, context=late_context)
+        if (
+            bool(getattr(self.config, "allow_late_a_grade_entry", False))
+            and late_deadline is not None
+            and not self._observation_overruns_deadline(
+                local_dt,
+                float(getattr(self.config, "min_candidate_age_a_grade_seconds", min_obs) or min_obs),
+                late_deadline,
+            )
+        ):
+            decision = self._decision(
+                True,
+                ALLOW_LATE_A_GRADE_ENTRY,
+                ALLOW_LATE_A_GRADE_ENTRY,
+                local_dt,
+                session=capture_decision.session,
+                candidate_role="trading_late_a_grade_watch",
+                context=late_context,
+            )
+            self._maybe_log(decision, log, late_context)
+            return decision
+
+        decision = self._decision(
+            False,
+            ALLOW_ANALYSIS_ONLY,
+            entry_decision.reason_code,
+            local_dt,
+            session=capture_decision.session,
+            next_allowed_time=entry_decision.next_allowed_time,
+            candidate_role="analysis_only",
+            context=trading_context,
+        )
+        self._maybe_log(decision, log, trading_context)
+        return decision
+
     def evaluate_entry(
         self,
         *,
@@ -291,6 +445,15 @@ class TimePolicy:
                 local_dt,
                 session=session,
                 next_allowed_time=self._combine_iso(local_dt.date(), self.entry_windows[0][0]),
+            )
+        elif self._late_a_grade_entry_allowed(clock, context):
+            decision = self._decision(
+                True,
+                ALLOW_LATE_A_GRADE_ENTRY,
+                ALLOW_LATE_A_GRADE_ENTRY,
+                local_dt,
+                session=session,
+                context=context,
             )
         elif clock >= self.no_new_entry_after:
             decision = self._decision(
@@ -365,6 +528,16 @@ class TimePolicy:
                 session=session,
                 next_allowed_time=self._next_entry_start(local_dt),
             )
+        elif session == SESSION_CLOSING_AUCTION:
+            allowed = bool(getattr(self.config, "allow_closing_auction_emergency_exit", True))
+            decision = self._decision(
+                allowed,
+                CLOSING_AUCTION_EMERGENCY_EXIT if allowed else BLOCK_CLOSING_AUCTION,
+                CLOSING_AUCTION_EMERGENCY_EXIT if allowed else BLOCK_CLOSING_AUCTION,
+                local_dt,
+                session=session,
+                next_allowed_time=None if allowed else self._next_entry_start(local_dt),
+            )
         elif self.force_exit_start <= clock <= self.force_exit_deadline:
             decision = self._decision(
                 True,
@@ -429,6 +602,115 @@ class TimePolicy:
         if log:
             self.log_decision(decision, context=context)
 
+    def permission_snapshot(
+        self,
+        *,
+        now: Optional[object] = None,
+        context: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, bool]:
+        local_dt = self._coerce_datetime(now)
+        if not bool(self.config.time_policy_enabled):
+            return {
+                "entry_allowed": True,
+                "capture_allowed": True,
+                "manage_allowed": True,
+                "analysis_allowed": True,
+            }
+        session = self.calendar.session_for(local_dt)
+        clock = local_dt.time().replace(tzinfo=None)
+        capture_allowed = (
+            session == SESSION_REGULAR
+            and self.candidate_capture_start <= clock <= self.candidate_capture_end
+            and clock < self.regular_close
+        )
+        entry_allowed = self._entry_allowed_for_clock(clock, session, context)
+        manage_allowed = session not in {
+            SESSION_NON_TRADING_DAY,
+            SESSION_PRE_OPEN,
+            SESSION_AFTER_MARKET,
+        } and (
+            session != SESSION_CLOSING_AUCTION
+            or bool(getattr(self.config, "allow_closing_auction_emergency_exit", True))
+        )
+        return {
+            "entry_allowed": bool(entry_allowed),
+            "capture_allowed": bool(capture_allowed),
+            "manage_allowed": bool(manage_allowed),
+            "analysis_allowed": bool(capture_allowed),
+        }
+
+    def entry_window_deadline(
+        self,
+        *,
+        now: Optional[object] = None,
+        context: Optional[Dict[str, object]] = None,
+        include_next: bool = False,
+    ) -> Optional[datetime]:
+        local_dt = self._coerce_datetime(now)
+        if not bool(self.config.time_policy_enabled):
+            return datetime.combine(local_dt.date(), self.regular_close, tzinfo=self.timezone)
+        session = self.calendar.session_for(local_dt)
+        if session not in {SESSION_PRE_OPEN, SESSION_REGULAR}:
+            return None
+        clock = local_dt.time().replace(tzinfo=None)
+        if self._late_a_grade_entry_allowed(clock, context):
+            return datetime.combine(
+                local_dt.date(),
+                self.late_a_grade_entry_end,
+                tzinfo=self.timezone,
+            )
+        for start, end in self.entry_windows:
+            if start <= clock <= end or (include_next and clock < start):
+                return datetime.combine(local_dt.date(), end, tzinfo=self.timezone)
+        return None
+
+    def _entry_allowed_for_clock(
+        self,
+        clock: dt_time,
+        session: str,
+        context: Optional[Dict[str, object]],
+    ) -> bool:
+        if session == SESSION_AFTER_MARKET:
+            return bool(self.config.allow_after_hours_entry)
+        if session != SESSION_REGULAR:
+            return False
+        if self.force_exit_start <= clock <= self.force_exit_deadline:
+            return False
+        if clock >= self.no_new_entry_after:
+            return False
+        return self._in_windows(clock, self.entry_windows) or self._late_a_grade_entry_allowed(
+            clock,
+            context,
+        )
+
+    def _late_a_grade_entry_allowed(
+        self,
+        clock: dt_time,
+        context: Optional[Dict[str, object]],
+    ) -> bool:
+        if not bool(getattr(self.config, "allow_late_a_grade_entry", False)):
+            return False
+        if not (self.late_a_grade_entry_start <= clock <= self.late_a_grade_entry_end):
+            return False
+        ctx = context or {}
+        grade = str(ctx.get("candidate_grade") or ctx.get("grade") or "").upper()
+        entry_type = str(ctx.get("entry_type") or "").upper()
+        return (
+            bool(ctx.get("late_a_grade_candidate"))
+            or grade == "A"
+            or entry_type == "BREAKOUT_SMALL"
+        )
+
+    @staticmethod
+    def _observation_overruns_deadline(
+        local_dt: datetime,
+        min_observation_sec: float,
+        deadline: Optional[datetime],
+    ) -> bool:
+        if deadline is None:
+            return True
+        return local_dt + timedelta(seconds=max(float(min_observation_sec or 0), 0.0)) > deadline
+
     def _decision(
         self,
         allowed: bool,
@@ -438,6 +720,8 @@ class TimePolicy:
         *,
         session: str = "",
         next_allowed_time: Optional[str] = None,
+        candidate_role: str = "",
+        context: Optional[Dict[str, object]] = None,
     ) -> TimeDecision:
         local_dt = self._coerce_datetime(now)
         session_value = (
@@ -445,6 +729,7 @@ class TimePolicy:
             if bool(self.config.time_policy_enabled)
             else SESSION_DISABLED
         )
+        permissions = self.permission_snapshot(now=local_dt, context=context)
         return TimeDecision(
             allowed=bool(allowed),
             action=str(action),
@@ -454,6 +739,11 @@ class TimePolicy:
             next_allowed_time=next_allowed_time,
             config_version=self.config_version,
             time_decision_id=uuid.uuid4().hex,
+            entry_allowed=permissions["entry_allowed"],
+            capture_allowed=permissions["capture_allowed"],
+            manage_allowed=permissions["manage_allowed"],
+            analysis_allowed=permissions["analysis_allowed"],
+            candidate_role=str(candidate_role or ""),
         )
 
     def _coerce_datetime(self, now: Optional[object]) -> datetime:

@@ -685,6 +685,20 @@ class OrderGuard:
                 )
 
         if request.normalized_side == "buy" and not request.is_cancel:
+            if (
+                bool(getattr(self.config, "block_new_buys_on_exit_escalation", True))
+                and request.context.get("exit_escalation_active") is True
+            ):
+                return self._decision(
+                    allowed=False,
+                    mode=mode,
+                    reason="exit_escalation_active",
+                    request=request,
+                    risk_state=risk_state,
+                    requested_amount=requested_amount,
+                    blocked_by="exit_escalation",
+                    time_decision=time_decision,
+                )
             if request.context.get("final_entry_allowed") is not True:
                 return self._decision(
                     allowed=False,

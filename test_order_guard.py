@@ -10,6 +10,7 @@ from trade_config import TradeConfig
 SEOUL = load_timezone("Asia/Seoul")
 ALLOWED_TS = datetime(2026, 5, 13, 9, 5, 0, tzinfo=SEOUL).timestamp()
 PRE_OPEN_TS = datetime(2026, 5, 13, 8, 59, 0, tzinfo=SEOUL).timestamp()
+FORCE_EXIT_TS = datetime(2026, 5, 13, 15, 10, 0, tzinfo=SEOUL).timestamp()
 
 
 def _buy_request(code="005930", quantity=10, final_entry_allowed=True):
@@ -504,6 +505,64 @@ class OrderGuardTests(unittest.TestCase):
         self.assertEqual(no_exit_policy.reason, "missing_exit_policy_decision")
         self.assertFalse(no_position.allowed)
         self.assertEqual(no_position.reason, "missing_sell_position")
+
+    def test_sell_does_not_require_final_entry_decision(self):
+        config = TradeConfig(dry_run=False, live_trading_enabled=True, time_policy_enabled=False)
+        guard = OrderGuard(config)
+
+        decision = guard.validate(
+            _sell_request(),
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                open_positions={"005930"},
+            ),
+        )
+
+        self.assertTrue(decision.allowed)
+
+    def test_exit_escalation_blocks_new_buys(self):
+        config = TradeConfig(dry_run=True, paper_portfolio_enabled=True)
+        guard = OrderGuard(config)
+        request = _buy_request()
+        request.context["exit_escalation_active"] = True
+
+        decision = guard.validate(request, now=ALLOWED_TS)
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "exit_escalation_active")
+        self.assertEqual(decision.blocked_by, "exit_escalation")
+
+    def test_stop_sell_allowed_during_no_buy_force_exit_window(self):
+        config = TradeConfig(dry_run=False, live_trading_enabled=True)
+        guard = OrderGuard(config)
+
+        buy_decision = guard.validate(
+            _buy_request(),
+            now=FORCE_EXIT_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+            ),
+        )
+        sell_decision = guard.validate(
+            _sell_request(),
+            now=FORCE_EXIT_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                open_positions={"005930"},
+            ),
+        )
+
+        self.assertFalse(buy_decision.allowed)
+        self.assertEqual(buy_decision.blocked_by, "time_policy")
+        self.assertTrue(sell_decision.allowed)
+        self.assertEqual(sell_decision.time_decision["reason_code"], "FORCE_EXIT_WINDOW")
 
     def test_cancel_requires_cancel_policy_and_original_order_state(self):
         config = TradeConfig(dry_run=False, live_trading_enabled=True, time_policy_enabled=False)

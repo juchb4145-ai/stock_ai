@@ -90,6 +90,23 @@ class TradeConfigBoolEnvTests(unittest.TestCase):
         self.assertFalse(config.allow_after_hours_entry)
         self.assertFalse(config.allow_nxt_trading)
 
+    def test_exit_policy_defaults_are_configured(self):
+        config = TradeConfig()
+
+        self.assertTrue(config.technical_stop_enabled)
+        self.assertTrue(config.structure_stop_enabled)
+        self.assertTrue(config.vwap_stop_enabled)
+        self.assertEqual(config.vwap_reclaim_wait_sec, 60)
+        self.assertEqual(config.recent_low_lookback_bars, 3)
+        self.assertTrue(config.enable_r_multiple_exit)
+        self.assertTrue(config.partial_take_profit_enabled)
+        self.assertEqual(config.first_partial_take_profit_r, 2.0)
+        self.assertEqual(config.force_exit_start, "15:05:00")
+        self.assertEqual(config.force_exit_deadline, "15:19:30")
+        self.assertTrue(config.allow_closing_auction_emergency_exit)
+        self.assertTrue(config.block_new_buys_on_exit_escalation)
+        self.assertEqual(config.max_sell_retry_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

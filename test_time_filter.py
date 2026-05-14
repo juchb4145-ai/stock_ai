@@ -11,6 +11,7 @@ from time_policy import (
     BLOCK_NON_TRADING_DAY,
     BLOCK_OPENING_STABILIZATION,
     BLOCK_PRE_OPEN,
+    CLOSING_AUCTION_EMERGENCY_EXIT,
     FORCE_EXIT_WINDOW,
     TimePolicy,
     load_timezone,
@@ -78,6 +79,20 @@ class TimePolicyTests(unittest.TestCase):
 
     def test_blocks_entry_during_closing_auction(self):
         decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("15:22:00"))
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_CLOSING_AUCTION)
+
+    def test_closing_auction_manage_is_emergency_policy_only(self):
+        decision = TimePolicy(TradeConfig()).evaluate_manage(now=_at("15:22:00"))
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.action, CLOSING_AUCTION_EMERGENCY_EXIT)
+        self.assertEqual(decision.reason_code, CLOSING_AUCTION_EMERGENCY_EXIT)
+
+    def test_closing_auction_manage_can_be_disabled_by_config(self):
+        config = TradeConfig(allow_closing_auction_emergency_exit=False)
+        decision = TimePolicy(config).evaluate_manage(now=_at("15:22:00"))
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason_code, BLOCK_CLOSING_AUCTION)

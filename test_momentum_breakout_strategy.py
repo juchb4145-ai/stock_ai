@@ -81,7 +81,8 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         decision = strategy.evaluate(_ctx())
 
         self.assertEqual(decision.action, EntryDecision.BUY)
-        self.assertEqual(decision.reason_code, "BUY_PULLBACK_CONFIRMED")
+        self.assertEqual(decision.reason_code, "BUY_PULLBACK_RECLAIM")
+        self.assertEqual(decision.entry_type, "PULLBACK_RECLAIM")
         self.assertEqual(decision.entry_ratio, 1.0)
 
     def test_time_policy_blocks_buy_even_when_momentum_setup_is_valid(self):
@@ -138,6 +139,14 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
 
         self.assertEqual(decision.action, EntryDecision.WAIT_DATA)
         self.assertEqual(decision.reason_code, "MISSING_TURNOVER_SPEED")
+
+    def test_missing_vwap_forbids_buy(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig(require_vwap_filter=True))
+
+        decision = strategy.evaluate(_ctx(intraday_vwap=None))
+
+        self.assertEqual(decision.action, EntryDecision.WAIT_DATA)
+        self.assertEqual(decision.reason_code, "MISSING_VWAP")
 
     def test_missing_candle_cache_forbids_breakout_probe(self):
         strategy = MomentumBreakoutStrategy(TradeConfig())
@@ -237,6 +246,75 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         self.assertEqual(decision.action, EntryDecision.BLOCK_CHASE)
         self.assertEqual(decision.reason_code, "BLOCK_SIGNAL_CANDLE_TOP")
 
+    def test_low_volume_pullback_can_buy_as_partial_position_after_rebound(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(min_turnover_speed_per_min=999_999_999)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                volume_ratio=0.05,
+                turnover_speed_per_min=10_000_000,
+                recent_low_to_current_pct=0.004,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "BUY_PULLBACK_RECLAIM")
+        self.assertEqual(decision.entry_ratio, 0.25)
+        self.assertEqual(decision.position_size_multiplier, 0.25)
+        self.assertEqual(decision.metrics["weak_volume_partial_relief"], 1.0)
+
+    def test_low_volume_without_rebound_stays_rejected(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(min_turnover_speed_per_min=999_999_999)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                volume_ratio=0.05,
+                turnover_speed_per_min=10_000_000,
+                recent_low_to_current_pct=0.0,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.REJECT)
+        self.assertEqual(decision.reason_code, "WEAK_VOLUME_RATIO")
+
+    def test_marginal_spread_can_buy_as_partial_position_when_flow_confirms(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(min_turnover_speed_per_min=999_999_999)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                spread_rate=0.0065,
+                volume_ratio=0.20,
+                turnover_speed_per_min=10_000_000,
+                recent_low_to_current_pct=0.004,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "BUY_PULLBACK_RECLAIM")
+        self.assertEqual(decision.entry_ratio, 0.25)
+        self.assertEqual(decision.metrics["spread_gate_relaxed"], 1.0)
+
+    def test_was_below_vwap_waits_for_reclaim_buffer_before_buying(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig())
+
+        decision = strategy.evaluate(
+            _ctx(
+                was_below_vwap=True,
+                current_price=9_850,
+                intraday_vwap=9_845,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.WAIT_RECLAIM_VWAP)
+        self.assertEqual(decision.reason_code, "WAIT_RECLAIM_VWAP")
+        self.assertEqual(decision.metrics["vwap_reclaim_confirmed"], 0.0)
+
     def test_logs_raw_momentum_metrics_for_each_decision(self):
         strategy = MomentumBreakoutStrategy(TradeConfig())
 
@@ -246,7 +324,9 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         payload = _log_payload(logs.output[-1])
         self.assertEqual(decision.action, EntryDecision.BUY)
         self.assertEqual(payload["event"], "momentum_entry_decision")
-        self.assertEqual(payload["reason_code"], "buy_pullback_confirmed")
+        self.assertEqual(payload["reason_code"], "buy_pullback_reclaim")
+        self.assertEqual(payload["entry_type"], "PULLBACK_RECLAIM")
+        self.assertEqual(payload["prior_high_source"], "candle")
         self.assertIn("chase_risk_score", payload)
         self.assertEqual(payload["volume_ratio"], 1.5)
         self.assertEqual(payload["spread_rate"], 0.001)

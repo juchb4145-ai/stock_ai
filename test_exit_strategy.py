@@ -1,24 +1,16 @@
-"""exit_strategy 단위 테스트.
-
-R-multiple 손절/BE/+2R 부분익절, 부분익절 후 추세 이탈, 시간 손절을
-모두 표 형태로 커버한다.
-
-실행:
-    .\\venv64\\Scripts\\python.exe -m unittest test_exit_strategy -v
-"""
-
 from __future__ import annotations
 
 import time
 import unittest
 from typing import List
 
-from bars import FiveMinIndicators, MinuteBar
+from bars import MinuteBar
 from portfolio import Position
+from trade_config import TradeConfig
 import exit_strategy as xs
 
 
-def make_bar(*, ts: float, close: int, open_: int = 0, high: int = 0, low: int = 0) -> MinuteBar:
+def make_bar(*, ts: float, close: int, open_: int = 0, high: int = 0, low: int = 0, volume: int = 100) -> MinuteBar:
     open_ = open_ or close
     high = high or max(open_, close)
     low = low or min(open_, close)
@@ -28,7 +20,7 @@ def make_bar(*, ts: float, close: int, open_: int = 0, high: int = 0, low: int =
         high=high,
         low=low,
         close=close,
-        volume=100,
+        volume=volume,
         received_at=ts,
     )
 
@@ -39,7 +31,6 @@ def base_position(
     quantity: int = 40,
     partial_taken: bool = False,
     stop_price: int | None = None,
-    breakout_high: int | None = None,
     entry1_offset_secs: float = -120.0,
 ) -> Position:
     pos = Position(
@@ -52,7 +43,8 @@ def base_position(
         partial_taken=partial_taken,
     )
     pos.stop_price = stop_price if stop_price is not None else int(entry_price * (1 - xs.R_UNIT_PCT))
-    pos.breakout_high = breakout_high if breakout_high is not None else entry_price
+    pos.breakout_high = entry_price
+    pos.highest_price = entry_price
     pos.entry1_time = time.time() + entry1_offset_secs
     pos.entry_time = pos.entry1_time
     return pos
@@ -64,169 +56,187 @@ def ctx(
     current_price: int,
     chejan_strength: float = 120.0,
     minute_bars: List[MinuteBar] | None = None,
-    five_min_ind: FiveMinIndicators | None = None,
     now_ts: float | None = None,
+    intraday_vwap: float = 0.0,
+    vwap_below_since: float = 0.0,
+    signal_bar_low: int = 0,
+    chejan_strength_history: List[float] | None = None,
+    force_exit: bool = False,
+    closing_auction_emergency: bool = False,
+    config: TradeConfig | None = None,
 ) -> xs.ExitContext:
     return xs.ExitContext(
         position=position,
         current_price=current_price,
         chejan_strength=chejan_strength,
         minute_bars=minute_bars or [],
-        five_min_ind=five_min_ind,
+        five_min_ind=None,
         now_ts=now_ts or time.time(),
+        intraday_vwap=intraday_vwap,
+        vwap_below_since=vwap_below_since,
+        signal_bar_low=signal_bar_low,
+        chejan_strength_history=chejan_strength_history,
+        force_exit=force_exit,
+        closing_auction_emergency=closing_auction_emergency,
+        config=config or TradeConfig(),
     )
 
 
-class StopLossTests(unittest.TestCase):
-    def test_sells_when_price_at_or_below_stop(self):
-        pos = base_position(stop_price=9_850)
+class StructuredExitTests(unittest.TestCase):
+    def test_hard_stop_beats_profit_take(self):
+        pos = base_position(stop_price=10_500)
+        pos.highest_price = 10_600
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_200))
+
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_BREAK_EVEN_STOP_AFTER_1R)
+        self.assertEqual(d.exit_type, xs.EXIT_TYPE_BREAK_EVEN_STOP)
+
+    def test_fixed_hard_stop(self):
+        pos = base_position(stop_price=9_000)
+
         d = xs.evaluate_exit(ctx(position=pos, current_price=9_850))
-        self.assertEqual(d.action, "sell")
-        self.assertIn("손절", d.reason)
 
-    def test_holds_when_price_above_stop(self):
-        pos = base_position(stop_price=9_850)
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_HARD_STOP_FIXED_PCT)
+
+    def test_break_even_stop_after_1r(self):
+        pos = base_position(stop_price=10_000)
+
         d = xs.evaluate_exit(ctx(position=pos, current_price=10_000))
-        self.assertEqual(d.action, "hold")
 
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_type, xs.EXIT_TYPE_BREAK_EVEN_STOP)
+        self.assertEqual(d.exit_reason_code, xs.REASON_BREAK_EVEN_STOP_AFTER_1R)
 
-class BreakEvenTests(unittest.TestCase):
-    def test_marks_be_update_when_above_1r(self):
-        pos = base_position(entry_price=10_000)  # stop = 9_850
-        # +1.6% 수익 → r ≈ 1.07 → BE 트리거
+    def test_holds_and_marks_be_update_when_above_1r(self):
+        pos = base_position(entry_price=10_000, stop_price=9_850)
+
         d = xs.evaluate_exit(ctx(position=pos, current_price=10_160))
-        self.assertEqual(d.action, "hold")
+
+        self.assertEqual(d.action, xs.ACTION_HOLD)
         self.assertTrue(d.update_stop_to_be)
 
-    def test_does_not_update_be_below_1r(self):
-        pos = base_position(entry_price=10_000)
-        # +0.5% 수익 → BE 트리거 안 됨
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_050))
-        self.assertEqual(d.action, "hold")
-        self.assertFalse(d.update_stop_to_be)
+    def test_structure_stop_signal_bar_low_break(self):
+        pos = base_position()
 
+        d = xs.evaluate_exit(ctx(position=pos, current_price=9_940, signal_bar_low=9_950))
 
-class PartialExitTests(unittest.TestCase):
-    def test_triggers_partial_at_2r(self):
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_STRUCTURE_SIGNAL_BAR_LOW_BREAK)
+        self.assertEqual(d.exit_type, xs.EXIT_TYPE_STRUCTURE_STOP)
+
+    def test_structure_stop_recent_1m_low_break(self):
+        pos = base_position()
+        now = time.time() - 300
+        bars = [
+            make_bar(ts=now, close=10_050, low=10_000),
+            make_bar(ts=now + 60, close=10_040, low=10_010),
+            make_bar(ts=now + 120, close=10_030, low=10_020),
+            make_bar(ts=now + 180, close=9_990, low=9_990),
+        ]
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=9_990, minute_bars=bars))
+
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_STRUCTURE_RECENT_1M_LOW_BREAK)
+
+    def test_vwap_reclaim_failed(self):
+        pos = base_position()
+        now = time.time()
+
+        d = xs.evaluate_exit(
+            ctx(
+                position=pos,
+                current_price=9_950,
+                intraday_vwap=10_000,
+                vwap_below_since=now - 61,
+                now_ts=now,
+            )
+        )
+
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_VWAP_RECLAIM_FAILED)
+
+    def test_vwap_fast_drop(self):
+        pos = base_position()
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=9_890, intraday_vwap=10_000))
+
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_VWAP_BREAK_FAST_DROP)
+
+    def test_momentum_trade_strength_drop(self):
+        pos = base_position()
+
+        d = xs.evaluate_exit(
+            ctx(
+                position=pos,
+                current_price=10_020,
+                chejan_strength=80,
+                chejan_strength_history=[150, 145, 80],
+            )
+        )
+
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_MOMENTUM_TRADE_STRENGTH_DROP)
+
+    def test_bearish_volume_candle(self):
+        pos = base_position()
+        now = time.time() - 120
+        bars = [
+            make_bar(ts=now, open_=10_000, close=10_020, volume=100),
+            make_bar(ts=now + 60, open_=10_020, close=10_010, volume=180),
+        ]
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_010, minute_bars=bars))
+
+        self.assertEqual(d.action, xs.ACTION_STOP_LOSS)
+        self.assertEqual(d.exit_reason_code, xs.REASON_MOMENTUM_VOLUME_BEARISH_CANDLE)
+
+    def test_partial_take_profit_at_2r(self):
         pos = base_position(entry_price=10_000, partial_taken=False)
-        # +3.0% 수익 → r=2.0 → 부분 익절 트리거
+
         d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
-        self.assertEqual(d.action, "partial_sell")
-        self.assertAlmostEqual(d.qty_ratio, xs.EXIT_PARTIAL_RATIO)
+
+        self.assertEqual(d.action, xs.ACTION_SELL_PARTIAL)
+        self.assertAlmostEqual(d.qty_ratio, 0.5)
         self.assertTrue(d.mark_partial_taken)
-        # 동시에 BE 스탑 이동도 함께 표시
-        self.assertTrue(d.update_stop_to_be)
+        self.assertEqual(d.exit_reason_code, xs.REASON_TAKE_PROFIT_2R_PARTIAL)
 
-    def test_does_not_repeat_partial_after_taken(self):
+    def test_trailing_high_pullback(self):
         pos = base_position(entry_price=10_000, partial_taken=True)
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
-        # 이미 부분 익절을 한 번 했으므로 partial_sell 액션이 다시 나오면 안 됨
-        self.assertNotEqual(d.action, "partial_sell")
-
-
-class TrailingRemainderTests(unittest.TestCase):
-    def test_sells_remainder_when_giveback_exceeds_trailing_r(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        pos.highest_price = 10_405  # 405원 = 2.7R 고점
-        # 10_405 → 10_300 반납폭 105원 = 0.7R
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
-        self.assertEqual(d.action, "sell")
-        self.assertIn("잔량 트레일링", d.reason)
-        self.assertIn("0.70R", d.reason)
-
-    def test_does_not_apply_trailing_before_partial(self):
-        pos = base_position(entry_price=10_000, partial_taken=False)
         pos.highest_price = 10_405
-        # 부분익절 전에는 고점 대비 0.7R 이상 반납해도 잔량 트레일링이 아니다.
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_295))
-        self.assertEqual(d.action, "hold")
 
-    def test_holds_when_highest_price_missing_after_partial(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        pos.highest_price = 0
         d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
-        self.assertEqual(d.action, "hold")
 
-    def test_holds_when_giveback_is_below_trailing_r(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        pos.highest_price = 10_360
-        # 60원 반납 = 0.4R 이므로 0.7R 트레일링 미달.
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_300))
-        self.assertEqual(d.action, "hold")
+        self.assertEqual(d.action, xs.ACTION_TRAILING_STOP)
+        self.assertEqual(d.exit_reason_code, xs.REASON_TRAILING_HIGH_PULLBACK)
 
-
-class TrendExitTests(unittest.TestCase):
-    def _bars_with_5ma_below(self, *, current: int) -> List[MinuteBar]:
-        ts = time.time() - 60 * 6
-        # 종가가 점점 떨어지는 봉 5개 → 5MA가 현재가보다 높게 형성
-        closes = [10_400, 10_380, 10_350, 10_330, 10_310]
-        bars = []
-        for c in closes:
-            bars.append(make_bar(ts=ts, close=c))
-            ts += 60
-        # 현재 진행봉 (current 가격)
-        bars.append(make_bar(ts=ts, close=current))
-        return bars
-
-    def test_sells_remainder_on_5ma_break_after_partial_when_below_1r(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        bars = self._bars_with_5ma_below(current=10_100)
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_100, minute_bars=bars))
-        self.assertEqual(d.action, "sell")
-        self.assertIn("MA", d.reason)
-        self.assertIn("+1R", d.reason)
-
-    def test_holds_remainder_on_5ma_break_after_partial_while_above_1r(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        bars = self._bars_with_5ma_below(current=10_290)
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_290, minute_bars=bars))
-        self.assertEqual(d.action, "hold")
-
-    def test_does_not_apply_5ma_exit_before_partial(self):
-        pos = base_position(entry_price=10_000, partial_taken=False)
-        bars = self._bars_with_5ma_below(current=10_290)
-        # +2.9% 수익(<2R) 인 부분익절 전 상태에서 5MA 이탈만으로는 청산하지 않는다.
-        # 단, 본 케이스는 현재가 10_290 → r ≈ 1.93 < 2 이므로 partial 트리거도 안 된다.
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_290, minute_bars=bars))
-        self.assertEqual(d.action, "hold")
-
-    def test_sells_remainder_on_chejan_strength_collapse_after_partial(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        d = xs.evaluate_exit(
-            ctx(position=pos, current_price=10_300, chejan_strength=50.0)
-        )
-        self.assertEqual(d.action, "sell")
-        self.assertIn("체결강도", d.reason)
-
-    def test_sells_remainder_on_5min_envelope_break_after_partial(self):
-        pos = base_position(entry_price=10_000, partial_taken=True)
-        ind = FiveMinIndicators(
-            bb_upper_45_2=11_000,
-            bb_upper_55_2=11_200,
-            env_upper_13_25=10_500,
-            env_upper_22_25=10_700,
-            last_close=10_300,
-            closes_count=60,
-        )
-        d = xs.evaluate_exit(
-            ctx(position=pos, current_price=10_300, five_min_ind=ind)
-        )
-        self.assertEqual(d.action, "sell")
-        self.assertIn("Env(13)", d.reason)
-
-
-class TimeExitTests(unittest.TestCase):
-    def test_sells_after_25min_when_below_1r(self):
+    def test_time_stop_no_progress(self):
         pos = base_position(entry_price=10_000, entry1_offset_secs=-(xs.EXIT_TIME_LIMIT_SECONDS + 30))
+
         d = xs.evaluate_exit(ctx(position=pos, current_price=10_050))
-        self.assertEqual(d.action, "sell")
-        self.assertIn("시간 손절", d.reason)
 
-    def test_holds_when_above_1r_even_after_long_hold(self):
-        pos = base_position(entry_price=10_000, entry1_offset_secs=-(xs.EXIT_TIME_LIMIT_SECONDS + 30))
-        # +1.6% (>1R) 이면 시간 손절 트리거 안 됨
-        d = xs.evaluate_exit(ctx(position=pos, current_price=10_160))
-        self.assertEqual(d.action, "hold")
+        self.assertEqual(d.action, xs.ACTION_TIME_STOP)
+        self.assertEqual(d.exit_reason_code, xs.REASON_TIME_STOP_NO_PROGRESS)
+
+    def test_force_exit_after_1505(self):
+        pos = base_position()
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_050, force_exit=True))
+
+        self.assertEqual(d.action, xs.ACTION_FORCE_EXIT)
+        self.assertEqual(d.exit_reason_code, xs.REASON_FORCE_EXIT_AFTER_1505)
+
+    def test_closing_auction_emergency_exit(self):
+        pos = base_position()
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_050, closing_auction_emergency=True))
+
+        self.assertEqual(d.action, xs.ACTION_FORCE_EXIT)
+        self.assertEqual(d.exit_reason_code, xs.REASON_CLOSING_AUCTION_EMERGENCY_EXIT)
 
 
 if __name__ == "__main__":

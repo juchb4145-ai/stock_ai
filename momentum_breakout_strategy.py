@@ -16,10 +16,14 @@ from trade_config import TRADE_CONFIG, TradeConfig
 
 logger = logging.getLogger(__name__)
 
+ENTRY_TYPE_BREAKOUT_SMALL = "BREAKOUT_SMALL"
+ENTRY_TYPE_PULLBACK_RECLAIM = "PULLBACK_RECLAIM"
+
 
 class EntryDecision(str, Enum):
     BUY = "BUY"
     WAIT_PULLBACK = "WAIT_PULLBACK"
+    WAIT_RECLAIM_VWAP = "WAIT_RECLAIM_VWAP"
     WAIT_DATA = "WAIT_DATA"
     BLOCK_CHASE = "BLOCK_CHASE"
     REJECT = "REJECT"
@@ -32,6 +36,8 @@ class MomentumDecision:
     reason_code: str
     chase_risk_score: float = 0.0
     entry_ratio: float = 0.0
+    entry_type: str = ""
+    position_size_multiplier: float = 0.0
     metrics: Dict[str, float] = field(default_factory=dict)
 
 
@@ -48,6 +54,8 @@ class MomentumContext:
     prior_high: Optional[int] = None
     prior_low: Optional[int] = None
     short_ma: Optional[float] = None
+    realtime_day_high: int = 0
+    rolling_high_since_capture: int = 0
     high_since_capture: int = 0
     upper_wick_ratio: Optional[float] = None
     signal_candle_range_pct: Optional[float] = None
@@ -55,6 +63,8 @@ class MomentumContext:
     recent_low_to_current_pct: Optional[float] = None
     tick_count: int = 0
     now_ts: float = 0.0
+    was_below_vwap: bool = False
+    short_reclaim_high: int = 0
 
 
 class MomentumBreakoutStrategy:
@@ -78,11 +88,42 @@ class MomentumBreakoutStrategy:
         self._log_decision(ctx, decision)
         return decision
 
+    def analysis_snapshot(
+        self,
+        ctx: MomentumContext,
+        *,
+        reason_code: str,
+        reason_detail: str,
+        blocked_by: str = "time_policy",
+    ) -> MomentumDecision:
+        """Emit a non-orderable momentum snapshot for analysis-only candidates."""
+        age = ctx.candidate.age_seconds(ctx.now_ts or time.time())
+        metrics = self._metrics(ctx, age)
+        metrics["analysis_only"] = 1.0
+        metrics["analysis_snapshot"] = 1.0
+        metrics["orderable"] = 0.0
+        metrics["blocked_by"] = blocked_by
+        metrics["time_policy_reason_code"] = str(reason_code or "")
+        decision = MomentumDecision(
+            EntryDecision.REJECT,
+            reason_detail,
+            str(reason_code or "ANALYSIS_ONLY"),
+            chase_risk_score=metrics.get("chase_risk_score", 0.0),
+            entry_type="ANALYSIS_ONLY",
+            metrics=metrics,
+        )
+        self._log_decision(ctx, decision)
+        return decision
+
     def _evaluate(self, ctx: MomentumContext) -> MomentumDecision:
         c = ctx.candidate
         now_ts = ctx.now_ts or time.time()
         age = c.age_seconds(now_ts)
         metrics = self._metrics(ctx, age)
+        late_a_grade_candidate = self._late_a_grade_candidate(ctx, metrics)
+        min_observation_sec = self._min_observation_seconds(late_a_grade_candidate)
+        metrics["min_observation_sec"] = float(min_observation_sec)
+        metrics["late_a_grade_candidate"] = 1.0 if late_a_grade_candidate else 0.0
 
         if bool(self.config.time_policy_enabled):
             time_decision = self.time_policy.evaluate_entry(
@@ -92,6 +133,9 @@ class MomentumBreakoutStrategy:
                     "symbol": c.code,
                     "candidate_id": getattr(c, "candidate_id", ""),
                     "strategy_name": self.config.strategy_name,
+                    "late_a_grade_candidate": late_a_grade_candidate,
+                    "entry_type": ENTRY_TYPE_BREAKOUT_SMALL if late_a_grade_candidate else "",
+                    "candidate_grade": "A" if late_a_grade_candidate else "",
                 },
             )
             metrics["time_decision_id"] = getattr(time_decision, "time_decision_id", "")
@@ -99,6 +143,9 @@ class MomentumBreakoutStrategy:
             metrics["time_policy_config_version"] = time_decision.config_version
             if not time_decision.allowed:
                 return self._time_policy_block(time_decision, metrics)
+            cutoff_block = self._entry_cutoff_block(ctx, metrics, age, min_observation_sec)
+            if cutoff_block is not None:
+                return cutoff_block
 
         if c.is_expired(now=now_ts, expiry_seconds=self.config.candidate_expiry_seconds):
             return MomentumDecision(
@@ -116,11 +163,11 @@ class MomentumBreakoutStrategy:
                 "WAIT_PRICE_CAPTURE",
                 metrics=metrics,
             )
-        if age < self.config.min_candidate_age_seconds:
+        if age < min_observation_sec:
             return MomentumDecision(
                 EntryDecision.WAIT_PULLBACK,
                 "candidate observation age {:.0f}/{}s".format(
-                    age, self.config.min_candidate_age_seconds
+                    age, min_observation_sec
                 ),
                 "WAIT_MIN_AGE",
                 metrics=metrics,
@@ -144,17 +191,19 @@ class MomentumBreakoutStrategy:
         turnover_speed = float(ctx.turnover_speed_per_min or 0.0)
         upper_wick_ratio = float(ctx.upper_wick_ratio or 0.0)
         intraday_vwap = float(ctx.intraday_vwap or 0.0)
+        bullish_reversal = self._bullish_reversal(ctx.minute_bars)
 
         if spread_rate < 0 or spread_rate > self.config.max_spread_pct:
-            return MomentumDecision(
-                EntryDecision.REJECT,
-                "spread too wide {:.2%} > {:.2%}".format(
-                    spread_rate, self.config.max_spread_pct
-                ),
-                "REJECT_SPREAD",
-                chase_risk_score=metrics["chase_risk_score"],
-                metrics=metrics,
-            )
+            if not self._conditional_spread_relief(ctx, metrics, bullish_reversal):
+                return MomentumDecision(
+                    EntryDecision.REJECT,
+                    "spread too wide {:.2%} > {:.2%}".format(
+                        spread_rate, self.config.max_spread_pct
+                    ),
+                    "REJECT_SPREAD",
+                    chase_risk_score=metrics["chase_risk_score"],
+                    metrics=metrics,
+                )
         if ctx.chejan_strength < self.config.min_trade_strength:
             return MomentumDecision(
                 EntryDecision.REJECT,
@@ -170,35 +219,13 @@ class MomentumBreakoutStrategy:
             and intraday_vwap > 0
             and ctx.current_price < intraday_vwap
         ):
-            return MomentumDecision(
-                EntryDecision.REJECT,
-                "VWAP recovery failed current={} vwap={:.0f}".format(
-                    ctx.current_price, intraday_vwap
-                ),
-                "REJECT_VWAP_LOST",
-                chase_risk_score=metrics["chase_risk_score"],
-                metrics=metrics,
-            )
-        if volume_ratio < self.config.min_volume_ratio:
-            return MomentumDecision(
-                EntryDecision.REJECT,
-                "weak_volume_ratio {:.2f} < {:.2f}".format(
-                    volume_ratio, self.config.min_volume_ratio
-                ),
-                "WEAK_VOLUME_RATIO",
-                chase_risk_score=metrics["chase_risk_score"],
-                metrics=metrics,
-            )
-        if turnover_speed < self.config.min_turnover_speed_per_min:
-            return MomentumDecision(
-                EntryDecision.REJECT,
-                "weak_turnover_speed {:.0f} < {:.0f}".format(
-                    turnover_speed, self.config.min_turnover_speed_per_min
-                ),
-                "WEAK_TURNOVER_SPEED",
-                chase_risk_score=metrics["chase_risk_score"],
-                metrics=metrics,
-            )
+            return self._below_vwap_decision(ctx, metrics)
+        reclaim_decision = self._vwap_reclaim_confirmation(ctx, metrics, bullish_reversal)
+        if reclaim_decision is not None:
+            return reclaim_decision
+        flow_decision = self._flow_gate_decision(ctx, metrics)
+        if flow_decision is not None:
+            return flow_decision
         if metrics["chase_distance_pct"] > self.config.max_chase_distance_pct:
             return MomentumDecision(
                 EntryDecision.BLOCK_CHASE,
@@ -236,9 +263,40 @@ class MomentumBreakoutStrategy:
                 metrics=metrics,
             )
 
-        bullish_reversal = self._bullish_reversal(ctx.minute_bars)
         pullback_pct = metrics["pullback_pct"]
-        if pullback_pct >= self.config.pullback_entry_pct:
+        if self._breakout_small_ready(ctx, metrics, bullish_reversal):
+            ratio = self._entry_size_multiplier(
+                metrics,
+                float(getattr(self.config, "breakout_probe_entry_ratio", 0.25) or 0.25),
+            )
+            return MomentumDecision(
+                EntryDecision.BUY,
+                "breakout small entry strength={:.1f} volume_ratio={:.2f}".format(
+                    ctx.chejan_strength, volume_ratio
+                ),
+                "BUY_BREAKOUT_SMALL",
+                chase_risk_score=metrics["chase_risk_score"],
+                entry_ratio=ratio,
+                entry_type=ENTRY_TYPE_BREAKOUT_SMALL,
+                position_size_multiplier=ratio,
+                metrics=metrics,
+            )
+
+        effective_pullback_pct = float(metrics.get("effective_pullback_entry_pct", self.config.pullback_entry_pct))
+        if pullback_pct >= effective_pullback_pct:
+            reclaim_high = int(ctx.short_reclaim_high or 0)
+            if ctx.was_below_vwap and reclaim_high > 0 and ctx.current_price < reclaim_high:
+                return MomentumDecision(
+                    EntryDecision.WAIT_RECLAIM_VWAP,
+                    "waiting for short reclaim high current={} high={}".format(
+                        ctx.current_price,
+                        reclaim_high,
+                    ),
+                    "REJECT_RECLAIM_FAILED",
+                    chase_risk_score=metrics["chase_risk_score"],
+                    entry_type=ENTRY_TYPE_PULLBACK_RECLAIM,
+                    metrics=metrics,
+                )
             if self.config.require_one_min_reversal and not bullish_reversal:
                 return MomentumDecision(
                     EntryDecision.WAIT_PULLBACK,
@@ -252,9 +310,11 @@ class MomentumBreakoutStrategy:
                 "pullback entry confirmed pullback={:.2%} strength={:.1f} volume_ratio={:.2f}".format(
                     pullback_pct, ctx.chejan_strength, volume_ratio
                 ),
-                "BUY_PULLBACK_CONFIRMED",
+                "BUY_PULLBACK_RECLAIM",
                 chase_risk_score=metrics["chase_risk_score"],
-                entry_ratio=1.0,
+                entry_ratio=self._entry_size_multiplier(metrics, 1.0),
+                entry_type=ENTRY_TYPE_PULLBACK_RECLAIM,
+                position_size_multiplier=self._entry_size_multiplier(metrics, 1.0),
                 metrics=metrics,
             )
 
@@ -269,16 +329,24 @@ class MomentumBreakoutStrategy:
                 "breakout continuation probe strength={:.1f} volume_ratio={:.2f}".format(
                     ctx.chejan_strength, volume_ratio
                 ),
-                "BUY_BREAKOUT_PROBE",
+                "BUY_BREAKOUT_SMALL",
                 chase_risk_score=metrics["chase_risk_score"],
-                entry_ratio=self.config.breakout_probe_entry_ratio,
+                entry_ratio=self._entry_size_multiplier(
+                    metrics,
+                    self.config.breakout_probe_entry_ratio,
+                ),
+                entry_type=ENTRY_TYPE_BREAKOUT_SMALL,
+                position_size_multiplier=self._entry_size_multiplier(
+                    metrics,
+                    self.config.breakout_probe_entry_ratio,
+                ),
                 metrics=metrics,
             )
 
         return MomentumDecision(
             EntryDecision.WAIT_PULLBACK,
             "waiting for first pullback pullback={:.2%} < {:.2%}".format(
-                pullback_pct, self.config.pullback_entry_pct
+                pullback_pct, effective_pullback_pct
             ),
             "WAIT_PULLBACK",
             chase_risk_score=metrics["chase_risk_score"],
@@ -336,6 +404,283 @@ class MomentumBreakoutStrategy:
                 metrics,
             )
         return None
+
+    def _below_vwap_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+    ) -> MomentumDecision:
+        spread_rate = float(ctx.spread_rate or 0.0)
+        recent_rebound = float(metrics.get("recent_low_to_current_pct", 0.0) or 0.0)
+        orderbook_available = not self._missing_number(ctx.spread_rate)
+        strong_reclaim_flow = (
+            ctx.chejan_strength >= float(getattr(self.config, "vwap_reclaim_wait_trade_strength", 180.0) or 180.0)
+            and recent_rebound >= float(getattr(self.config, "vwap_reclaim_min_rebound_pct", 0.003) or 0.003)
+            and spread_rate <= self.config.max_spread_pct
+            and orderbook_available
+        )
+        blocked_metrics = dict(metrics or {})
+        blocked_metrics["was_below_vwap"] = 1.0
+        blocked_metrics["vwap_reclaim_candidate"] = 1.0 if strong_reclaim_flow else 0.0
+        blocked_metrics["orderbook_available"] = 1.0 if orderbook_available else 0.0
+        if strong_reclaim_flow:
+            return MomentumDecision(
+                EntryDecision.WAIT_RECLAIM_VWAP,
+                "below VWAP but flow is strong; wait for reclaim current={} vwap={:.0f}".format(
+                    ctx.current_price,
+                    float(ctx.intraday_vwap or 0.0),
+                ),
+                "WAIT_RECLAIM_VWAP",
+                chase_risk_score=blocked_metrics.get("chase_risk_score", 0.0),
+                entry_type=ENTRY_TYPE_PULLBACK_RECLAIM,
+                metrics=blocked_metrics,
+            )
+        return MomentumDecision(
+            EntryDecision.REJECT,
+            "below VWAP with weak reclaim flow current={} vwap={:.0f} strength={:.1f}".format(
+                ctx.current_price,
+                float(ctx.intraday_vwap or 0.0),
+                ctx.chejan_strength,
+            ),
+            "BLOCK_BELOW_VWAP_WEAK_FLOW",
+            chase_risk_score=blocked_metrics.get("chase_risk_score", 0.0),
+            metrics=blocked_metrics,
+        )
+
+    def _conditional_spread_relief(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> bool:
+        metrics["spread_gate_relaxed"] = 0.0
+        if not bool(getattr(self.config, "conditional_spread_relief_enabled", False)):
+            return False
+        if ctx.was_below_vwap:
+            return False
+        spread_rate = float(ctx.spread_rate or 0.0)
+        max_conditional = float(
+            getattr(self.config, "max_conditional_spread_pct", self.config.max_spread_pct)
+            or self.config.max_spread_pct
+        )
+        if spread_rate <= self.config.max_spread_pct or spread_rate > max_conditional:
+            return False
+        if ctx.chejan_strength < float(
+            getattr(self.config, "conditional_spread_min_trade_strength", 0.0) or 0.0
+        ):
+            return False
+        if float(ctx.volume_ratio or 0.0) < float(
+            getattr(self.config, "conditional_spread_min_volume_ratio", 0.0) or 0.0
+        ):
+            return False
+        if metrics.get("pullback_pct", 0.0) < float(
+            metrics.get("effective_pullback_entry_pct", self.config.pullback_entry_pct)
+        ):
+            return False
+        if metrics.get("recent_low_to_current_pct", 0.0) < float(
+            getattr(self.config, "conditional_spread_min_rebound_pct", 0.0) or 0.0
+        ):
+            return False
+        if self.config.require_one_min_reversal and not bullish_reversal:
+            return False
+
+        metrics["spread_gate_relaxed"] = 1.0
+        metrics["spread_gate_max_pct"] = max_conditional
+        metrics["spread_position_size_multiplier"] = float(
+            getattr(self.config, "conditional_spread_position_size_multiplier", 0.25)
+            or 0.25
+        )
+        return True
+
+    def _vwap_reclaim_confirmation(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> Optional[MomentumDecision]:
+        if not self.config.require_vwap_filter or not ctx.was_below_vwap:
+            return None
+        if self._missing_number(ctx.intraday_vwap) or float(ctx.intraday_vwap or 0.0) <= 0:
+            return None
+        vwap = float(ctx.intraday_vwap or 0.0)
+        buffer_pct = max(
+            0.0,
+            float(getattr(self.config, "vwap_reclaim_confirm_buffer_pct", 0.0) or 0.0),
+        )
+        reclaim_price = vwap * (1.0 + buffer_pct)
+        blocked_metrics = dict(metrics or {})
+        blocked_metrics["vwap_reclaim_price"] = reclaim_price
+        blocked_metrics["vwap_reclaim_confirmed"] = 0.0
+        if ctx.current_price < reclaim_price:
+            return MomentumDecision(
+                EntryDecision.WAIT_RECLAIM_VWAP,
+                "waiting for VWAP reclaim confirmation current={} reclaim={:.0f}".format(
+                    ctx.current_price,
+                    reclaim_price,
+                ),
+                "WAIT_RECLAIM_VWAP",
+                chase_risk_score=blocked_metrics.get("chase_risk_score", 0.0),
+                entry_type=ENTRY_TYPE_PULLBACK_RECLAIM,
+                metrics=blocked_metrics,
+            )
+        if self.config.require_one_min_reversal and not bullish_reversal:
+            return MomentumDecision(
+                EntryDecision.WAIT_RECLAIM_VWAP,
+                "waiting for bullish one-minute reversal after VWAP reclaim",
+                "WAIT_RECLAIM_VWAP",
+                chase_risk_score=blocked_metrics.get("chase_risk_score", 0.0),
+                entry_type=ENTRY_TYPE_PULLBACK_RECLAIM,
+                metrics=blocked_metrics,
+            )
+        metrics["vwap_reclaim_price"] = reclaim_price
+        metrics["vwap_reclaim_confirmed"] = 1.0
+        return None
+
+    def _flow_gate_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+    ) -> Optional[MomentumDecision]:
+        volume_ratio = float(ctx.volume_ratio or 0.0)
+        turnover_speed = float(ctx.turnover_speed_per_min or 0.0)
+        min_turnover = float(self.config.min_turnover_speed_per_min or 0.0)
+        strong_strength = float(
+            getattr(self.config, "strong_trade_strength_for_volume_relief", 300.0) or 300.0
+        )
+        mid_strength = float(
+            getattr(self.config, "vwap_reclaim_buy_trade_strength", 150.0) or 150.0
+        )
+        if ctx.chejan_strength >= strong_strength:
+            min_volume = float(
+                getattr(self.config, "strong_trade_strength_min_volume_ratio", 0.3) or 0.3
+            )
+            require_both = False
+            score_bucket = "strong_strength_volume_relief"
+        elif ctx.chejan_strength >= mid_strength:
+            min_volume = float(
+                getattr(self.config, "vwap_reclaim_min_volume_ratio", 0.8) or 0.8
+            )
+            require_both = False
+            score_bucket = "mid_strength_volume_or_turnover"
+        else:
+            min_volume = float(self.config.min_volume_ratio or 0.0)
+            require_both = bool(self.config.require_turnover_speed)
+            score_bucket = "baseline_and"
+
+        volume_ok = (not self.config.require_volume_ratio) or volume_ratio >= min_volume
+        turnover_ok = (
+            (not self.config.require_turnover_speed)
+            or min_turnover <= 0
+            or turnover_speed >= min_turnover
+        )
+        if require_both:
+            flow_ok = volume_ok and turnover_ok
+        else:
+            flow_ok = volume_ok or turnover_ok
+
+        metrics["flow_score_bucket"] = score_bucket
+        metrics["volume_gate_min_ratio"] = min_volume
+        metrics["volume_gate_relaxed_by_strength"] = 1.0 if min_volume < self.config.min_volume_ratio else 0.0
+        metrics["turnover_gate_min_per_min"] = min_turnover
+        metrics["flow_gate_volume_ok"] = 1.0 if volume_ok else 0.0
+        metrics["flow_gate_turnover_ok"] = 1.0 if turnover_ok else 0.0
+        metrics["flow_gate_ok"] = 1.0 if flow_ok else 0.0
+
+        if flow_ok:
+            return None
+        if self._weak_volume_partial_entry_relief(
+            ctx,
+            metrics,
+            volume_ok=volume_ok,
+            turnover_ok=turnover_ok,
+        ):
+            return None
+        if not volume_ok:
+            return MomentumDecision(
+                EntryDecision.REJECT,
+                "weak_volume_ratio {:.2f} < {:.2f} bucket={}".format(
+                    volume_ratio,
+                    min_volume,
+                    score_bucket,
+                ),
+                "WEAK_VOLUME_RATIO",
+                chase_risk_score=metrics["chase_risk_score"],
+                metrics=metrics,
+            )
+        return MomentumDecision(
+            EntryDecision.REJECT,
+            "weak_turnover_speed {:.0f} < {:.0f} bucket={}".format(
+                turnover_speed,
+                min_turnover,
+                score_bucket,
+            ),
+            "WEAK_TURNOVER_SPEED",
+            chase_risk_score=metrics["chase_risk_score"],
+            metrics=metrics,
+        )
+
+    def _weak_volume_partial_entry_relief(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        *,
+        volume_ok: bool,
+        turnover_ok: bool,
+    ) -> bool:
+        metrics["weak_volume_partial_relief"] = 0.0
+        if volume_ok or not bool(getattr(self.config, "weak_volume_partial_entry_enabled", False)):
+            return False
+        if ctx.chejan_strength < float(
+            getattr(self.config, "weak_volume_partial_min_trade_strength", 0.0) or 0.0
+        ):
+            return False
+        if (
+            float(ctx.spread_rate or 0.0) > self.config.max_spread_pct
+            and metrics.get("spread_gate_relaxed", 0.0) <= 0.0
+        ):
+            return False
+        volume_ratio = float(ctx.volume_ratio or 0.0)
+        min_partial_volume = float(
+            getattr(self.config, "weak_volume_partial_min_volume_ratio", 0.0) or 0.0
+        )
+        if volume_ratio < min_partial_volume and not turnover_ok:
+            return False
+        if metrics.get("pullback_pct", 0.0) < float(
+            metrics.get("effective_pullback_entry_pct", self.config.pullback_entry_pct)
+        ):
+            return False
+        if metrics.get("recent_low_to_current_pct", 0.0) < float(
+            getattr(self.config, "weak_volume_partial_min_rebound_pct", 0.0) or 0.0
+        ):
+            return False
+
+        metrics["flow_score_bucket"] = "weak_volume_partial_pullback"
+        metrics["flow_gate_ok"] = 1.0
+        metrics["weak_volume_partial_relief"] = 1.0
+        metrics["weak_volume_partial_min_ratio"] = min_partial_volume
+        metrics["weak_volume_position_size_multiplier"] = float(
+            getattr(self.config, "weak_volume_partial_position_size_multiplier", 0.25)
+            or 0.25
+        )
+        return True
+
+    @staticmethod
+    def _entry_size_multiplier(metrics: Dict[str, float], default: float) -> float:
+        multiplier = float(default or 0.0)
+        for key in (
+            "weak_volume_position_size_multiplier",
+            "spread_position_size_multiplier",
+        ):
+            value = metrics.get(key)
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                multiplier = min(multiplier, number)
+        return multiplier
 
     def _hard_chase_block(
         self,
@@ -406,7 +751,7 @@ class MomentumBreakoutStrategy:
 
     def _metrics(self, ctx: MomentumContext, age: float) -> Dict[str, float]:
         c = ctx.candidate
-        prior_high = self._prior_high(ctx)
+        prior_high, prior_high_source = self._prior_high_with_source(ctx)
         prior_low = self._prior_low(ctx)
         pullback_pct = (
             (c.capture_price - ctx.current_price) / c.capture_price
@@ -476,6 +821,18 @@ class MomentumBreakoutStrategy:
             if not self._missing_number(ctx.turnover_speed_per_min)
             else 0.0
         )
+        is_above_vwap = (
+            1.0
+            if self._missing_number(ctx.intraday_vwap)
+            or float(ctx.intraday_vwap or 0.0) <= 0
+            or ctx.current_price >= float(ctx.intraday_vwap or 0.0)
+            else 0.0
+        )
+        adaptive_pullback_pct = self._adaptive_pullback_pct(ctx)
+        effective_pullback_pct = float(self.config.pullback_entry_pct)
+        if bool(getattr(self.config, "adaptive_pullback_enabled", False)) and adaptive_pullback_pct > 0:
+            effective_pullback_pct = min(effective_pullback_pct, adaptive_pullback_pct)
+        pullback_dry_run = self._pullback_dry_run(c.capture_price, pullback_pct)
 
         risk = 0.0
         if self.config.max_spread_pct > 0:
@@ -496,6 +853,8 @@ class MomentumBreakoutStrategy:
             risk += 15.0
         if recent_low_to_current_pct > self.config.max_recent_low_to_current_pct:
             risk += 20.0
+        if prior_high_source not in {"candle"}:
+            risk += 8.0 if prior_high_source in {"rolling_since_capture", "realtime_day_high"} else 14.0
 
         return {
             "age_seconds": age,
@@ -504,10 +863,12 @@ class MomentumBreakoutStrategy:
             "capture_chase_pct": capture_chase_pct,
             "prior_high_chase_pct": prior_high_chase_pct,
             "prior_high": float(prior_high),
+            "prior_high_source": prior_high_source,
             "prior_low": float(prior_low),
             "spread_rate": spread_rate,
             "volume_ratio": volume_ratio,
             "turnover_speed_per_min": turnover_speed,
+            "is_above_vwap": is_above_vwap,
             "upper_wick_ratio": upper_wick_ratio,
             "signal_candle_range_pct": signal_candle_range_pct,
             "position_in_signal_candle_pct": position_in_signal_candle_pct,
@@ -515,6 +876,12 @@ class MomentumBreakoutStrategy:
             "extension_from_vwap_pct": extension_from_vwap_pct,
             "extension_from_short_ma_pct": extension_from_short_ma_pct,
             "chase_risk_score": min(risk, 100.0),
+            "adaptive_pullback_entry_pct": adaptive_pullback_pct,
+            "effective_pullback_entry_pct": effective_pullback_pct,
+            "pullback_dry_run": pullback_dry_run,
+            "was_below_vwap": 1.0 if ctx.was_below_vwap else 0.0,
+            "short_reclaim_high": float(ctx.short_reclaim_high or 0),
+            "prior_high_fallback_used": 0.0 if prior_high_source == "candle" else 1.0,
         }
 
     @staticmethod
@@ -544,7 +911,6 @@ class MomentumBreakoutStrategy:
         wait_codes = {
             "BLOCK_PRE_OPEN",
             "BLOCK_OPENING_STABILIZATION",
-            "ALLOW_MANAGE_ONLY",
         }
         action = (
             EntryDecision.WAIT_PULLBACK
@@ -562,6 +928,94 @@ class MomentumBreakoutStrategy:
             chase_risk_score=blocked_metrics.get("chase_risk_score", 0.0),
             metrics=blocked_metrics,
         )
+
+    def _entry_cutoff_block(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        age: float,
+        min_observation_sec: float,
+    ) -> Optional[MomentumDecision]:
+        if not bool(getattr(self.config, "entry_cutoff_guard_enabled", True)):
+            return None
+        deadline = self.time_policy.entry_window_deadline(
+            now=ctx.now_ts or time.time(),
+            context={
+                "late_a_grade_candidate": bool(metrics.get("late_a_grade_candidate")),
+                "entry_type": ENTRY_TYPE_BREAKOUT_SMALL
+                if bool(metrics.get("late_a_grade_candidate"))
+                else "",
+                "candidate_grade": "A" if bool(metrics.get("late_a_grade_candidate")) else "",
+            },
+        )
+        if deadline is None:
+            return None
+        remaining_observation = max(float(min_observation_sec or 0.0) - float(age or 0.0), 0.0)
+        now_ts = float(ctx.now_ts or time.time())
+        if now_ts + remaining_observation <= deadline.timestamp():
+            return None
+        blocked_metrics = dict(metrics or {})
+        blocked_metrics["entry_cutoff_ts"] = deadline.timestamp()
+        blocked_metrics["remaining_observation_sec"] = remaining_observation
+        return MomentumDecision(
+            EntryDecision.REJECT,
+            "too late for entry window remaining_observation={:.1f}s cutoff={}".format(
+                remaining_observation,
+                deadline.isoformat(),
+            ),
+            "TOO_LATE_FOR_ENTRY_WINDOW",
+            chase_risk_score=blocked_metrics.get("chase_risk_score", 0.0),
+            metrics=blocked_metrics,
+        )
+
+    def _min_observation_seconds(self, late_a_grade_candidate: bool) -> float:
+        if late_a_grade_candidate:
+            return float(
+                getattr(
+                    self.config,
+                    "min_candidate_age_a_grade_seconds",
+                    self.config.min_candidate_age_seconds,
+                )
+                or self.config.min_candidate_age_seconds
+            )
+        return float(self.config.min_candidate_age_seconds)
+
+    def _late_a_grade_candidate(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+    ) -> bool:
+        if not bool(getattr(self.config, "allow_late_a_grade_entry", False)):
+            return False
+        return self._breakout_small_ready(ctx, metrics, self._bullish_reversal(ctx.minute_bars))
+
+    def _breakout_small_ready(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> bool:
+        if not bool(self.config.allow_breakout_probe_entry):
+            return False
+        c = ctx.candidate
+        if ctx.current_price <= 0 or c.capture_price <= 0:
+            return False
+        if ctx.current_price < c.capture_price:
+            return False
+        if self.config.require_one_min_reversal and not bullish_reversal:
+            return False
+        if metrics.get("chase_risk_score", 100.0) > self.config.max_chase_risk_score * 0.7:
+            return False
+        if self.config.require_vwap_filter and metrics.get("is_above_vwap", 1.0) <= 0:
+            return False
+        if (
+            metrics.get("spread_rate", 1.0) > self.config.max_spread_pct
+            and metrics.get("spread_gate_relaxed", 0.0) <= 0.0
+        ):
+            return False
+        if metrics.get("upper_wick_ratio", 1.0) > self.config.max_upper_wick_ratio:
+            return False
+        return True
 
     def _log_decision(self, ctx: MomentumContext, decision: MomentumDecision) -> None:
         c = ctx.candidate
@@ -593,8 +1047,15 @@ class MomentumBreakoutStrategy:
             "candidate_age_sec": self._optional_number(metrics.get("age_seconds")),
             "high_distance_pct": self._optional_number(metrics.get("chase_distance_pct")),
             "prior_high": self._positive_optional_number(metrics.get("prior_high")),
+            "prior_high_source": metrics.get("prior_high_source"),
             "upper_wick_ratio": self._optional_number(ctx.upper_wick_ratio),
+            "was_below_vwap": bool(metrics.get("was_below_vwap") or ctx.was_below_vwap),
+            "short_reclaim_high": self._positive_optional_number(metrics.get("short_reclaim_high")),
+            "vwap_reclaim_candidate": bool(metrics.get("vwap_reclaim_candidate", 0.0)),
             "pullback_pct": self._optional_number(metrics.get("pullback_pct")),
+            "effective_pullback_entry_pct": self._optional_number(metrics.get("effective_pullback_entry_pct")),
+            "adaptive_pullback_entry_pct": self._optional_number(metrics.get("adaptive_pullback_entry_pct")),
+            "pullback_dry_run": metrics.get("pullback_dry_run"),
             "candle_cache_available": bool(ctx.minute_bars),
             "orderbook_available": not self._missing_number(ctx.spread_rate),
             "market_data_available": self._market_data_available(ctx, metrics),
@@ -604,6 +1065,18 @@ class MomentumBreakoutStrategy:
             "extension_from_vwap_pct": self._optional_number(metrics.get("extension_from_vwap_pct")),
             "extension_from_short_ma_pct": self._optional_number(metrics.get("extension_from_short_ma_pct")),
             "entry_type": self._entry_type(decision),
+            "position_size_multiplier": self._optional_number(decision.position_size_multiplier),
+            "flow_score_bucket": metrics.get("flow_score_bucket"),
+            "flow_gate_ok": self._optional_number(metrics.get("flow_gate_ok")),
+            "volume_gate_min_ratio": self._optional_number(metrics.get("volume_gate_min_ratio")),
+            "weak_volume_partial_relief": bool(metrics.get("weak_volume_partial_relief", 0.0)),
+            "weak_volume_partial_min_ratio": self._optional_number(
+                metrics.get("weak_volume_partial_min_ratio")
+            ),
+            "spread_gate_relaxed": bool(metrics.get("spread_gate_relaxed", 0.0)),
+            "spread_gate_max_pct": self._optional_number(metrics.get("spread_gate_max_pct")),
+            "vwap_reclaim_price": self._positive_optional_number(metrics.get("vwap_reclaim_price")),
+            "vwap_reclaim_confirmed": self._optional_number(metrics.get("vwap_reclaim_confirmed")),
             "blocked_by": self._blocked_by(decision),
             "time_decision_id": metrics.get("time_decision_id"),
             "time_policy_reason_code": metrics.get("time_policy_reason_code"),
@@ -616,15 +1089,22 @@ class MomentumBreakoutStrategy:
 
     @staticmethod
     def _entry_type(decision: MomentumDecision) -> Optional[str]:
-        if decision.reason_code == "BUY_PULLBACK_CONFIRMED":
-            return "pullback"
-        if decision.reason_code == "BUY_BREAKOUT_PROBE":
-            return "breakout_probe"
+        if decision.entry_type:
+            return decision.entry_type
+        if decision.reason_code in {"BUY_PULLBACK_CONFIRMED", "BUY_PULLBACK_RECLAIM"}:
+            return ENTRY_TYPE_PULLBACK_RECLAIM
+        if decision.reason_code in {"BUY_BREAKOUT_PROBE", "BUY_BREAKOUT_SMALL"}:
+            return ENTRY_TYPE_BREAKOUT_SMALL
         return None
 
     @staticmethod
     def _blocked_by(decision: MomentumDecision) -> Optional[str]:
-        if decision.action in {EntryDecision.BLOCK_CHASE, EntryDecision.REJECT, EntryDecision.WAIT_DATA}:
+        if decision.action in {
+            EntryDecision.BLOCK_CHASE,
+            EntryDecision.REJECT,
+            EntryDecision.WAIT_DATA,
+            EntryDecision.WAIT_RECLAIM_VWAP,
+        }:
             return decision.reason_code.lower()
         return None
 
@@ -679,9 +1159,9 @@ class MomentumBreakoutStrategy:
         except (TypeError, ValueError):
             return True
 
-    def _prior_high(self, ctx: MomentumContext) -> int:
+    def _prior_high_with_source(self, ctx: MomentumContext):
         if ctx.prior_high is not None and ctx.prior_high > 0:
-            return int(ctx.prior_high)
+            return int(ctx.prior_high), "candle"
         bars = list(ctx.minute_bars or [])
         if self.config.exclude_current_bar_from_high_distance and bars:
             bars = bars[:-1]
@@ -689,7 +1169,22 @@ class MomentumBreakoutStrategy:
             bars = bars[-self.config.high_distance_lookback_bars :]
         highs = [int(getattr(bar, "high", 0) or 0) for bar in bars]
         highs = [value for value in highs if value > 0]
-        return max(highs) if highs else 0
+        if highs:
+            return max(highs), "candle"
+        rolling_high = int(ctx.rolling_high_since_capture or ctx.high_since_capture or 0)
+        if rolling_high > 0:
+            return rolling_high, "rolling_since_capture"
+        if int(ctx.realtime_day_high or 0) > 0:
+            return int(ctx.realtime_day_high), "realtime_day_high"
+        first_capture = int(getattr(ctx.candidate, "first_capture_price", 0) or ctx.candidate.capture_price or 0)
+        if first_capture > 0:
+            return first_capture, "first_capture_price"
+        if ctx.current_price > 0:
+            return int(ctx.current_price), "current_price_fallback"
+        return 0, "missing"
+
+    def _prior_high(self, ctx: MomentumContext) -> int:
+        return self._prior_high_with_source(ctx)[0]
 
     def _prior_low(self, ctx: MomentumContext) -> int:
         if ctx.prior_low is not None and ctx.prior_low > 0:
@@ -701,7 +1196,53 @@ class MomentumBreakoutStrategy:
             bars = bars[-self.config.high_distance_lookback_bars :]
         lows = [int(getattr(bar, "low", 0) or 0) for bar in bars]
         lows = [value for value in lows if value > 0]
-        return min(lows) if lows else 0
+        if lows:
+            return min(lows)
+        if int(getattr(ctx.candidate, "recent_low_price", 0) or 0) > 0:
+            return int(getattr(ctx.candidate, "recent_low_price", 0) or 0)
+        return int(ctx.current_price or 0)
+
+    def _adaptive_pullback_pct(self, ctx: MomentumContext) -> float:
+        bars = list(ctx.minute_bars or [])[-5:]
+        ranges = []
+        for bar in bars:
+            close = float(getattr(bar, "close", 0) or 0)
+            high = float(getattr(bar, "high", 0) or 0)
+            low = float(getattr(bar, "low", 0) or 0)
+            if close > 0 and high > low:
+                ranges.append((high - low) / close)
+        if not ranges:
+            return 0.0
+        raw = (
+            sum(ranges) / len(ranges)
+            * float(getattr(self.config, "adaptive_pullback_volatility_multiplier", 0.5) or 0.5)
+        )
+        lo = float(getattr(self.config, "adaptive_pullback_min_pct", 0.005) or 0.005)
+        hi = float(getattr(self.config, "adaptive_pullback_max_pct", 0.015) or 0.015)
+        return max(lo, min(raw, hi))
+
+    def _pullback_dry_run(self, capture_price: int, pullback_pct: float) -> Dict[str, object]:
+        levels = []
+        for item in str(getattr(self.config, "pullback_dry_run_levels", "") or "").split(","):
+            text = item.strip()
+            if not text:
+                continue
+            try:
+                value = float(text)
+            except ValueError:
+                continue
+            if value > 0:
+                levels.append(value)
+        if not levels:
+            levels = [0.005, 0.008, 0.010, 0.015]
+        out: Dict[str, object] = {}
+        for level in levels:
+            key = "{:.4f}".format(level)
+            out[key] = {
+                "passes": bool(pullback_pct >= level),
+                "trigger_price": int(capture_price * (1.0 - level)) if capture_price > 0 else None,
+            }
+        return out
 
     @staticmethod
     def _bullish_reversal(minute_bars: Sequence[MinuteBar]) -> bool:
