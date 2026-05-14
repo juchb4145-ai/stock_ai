@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
+from candidate_registry import CONDITION_COMBO_META_FIELDS, LEADER_META_FIELDS
 from trade_config import TRADE_CONFIG
 
 
@@ -25,6 +26,8 @@ CONDITION_CAPTURE_FIELDS = [
     "code",
     "name",
     "condition_name",
+    *CONDITION_COMBO_META_FIELDS,
+    *LEADER_META_FIELDS,
     "strategy_name",
     "condition_formula",
     "condition_formula_version",
@@ -64,6 +67,24 @@ class ConditionCaptureEvent:
     symbol_name: str = ""
     name: str = ""
     condition_name: str = ""
+    primary_condition_name: str = ""
+    bonus_condition_name: str = ""
+    quant_detected: Union[bool, str, None] = ""
+    dante_detected: Union[bool, str, None] = ""
+    condition_combo: str = ""
+    condition_score_bonus: Union[float, str, None] = ""
+    first_condition_name: str = ""
+    last_condition_name: str = ""
+    first_condition_detected_at: Union[float, str, None] = ""
+    bonus_condition_detected_at: Union[float, str, None] = ""
+    time_between_conditions_sec: Union[float, str, None] = ""
+    trade_value_since_capture: Union[int, float, str, None] = ""
+    turnover_speed_per_min: Union[float, str, None] = ""
+    volume_ratio_1m: Union[float, str, None] = ""
+    volume_ratio_5m: Union[float, str, None] = ""
+    turnover_rank_market: Union[int, str, None] = ""
+    turnover_rank_sector: Union[int, str, None] = ""
+    leader_score: Union[float, str, None] = ""
     strategy_name: str = ""
     condition_formula: str = ""
     condition_formula_version: str = ""
@@ -115,6 +136,30 @@ class ConditionCaptureEvent:
             "code": self.code,
             "name": self.name,
             "condition_name": self.condition_name,
+            "primary_condition_name": (
+                self.primary_condition_name
+                or getattr(TRADE_CONFIG, "primary_condition_name", TRADE_CONFIG.condition_name)
+            ),
+            "bonus_condition_name": (
+                self.bonus_condition_name
+                or getattr(TRADE_CONFIG, "bonus_condition_name", TRADE_CONFIG.legacy_condition_name)
+            ),
+            "quant_detected": self.quant_detected,
+            "dante_detected": self.dante_detected,
+            "condition_combo": self.condition_combo,
+            "condition_score_bonus": self.condition_score_bonus,
+            "first_condition_name": self.first_condition_name,
+            "last_condition_name": self.last_condition_name,
+            "first_condition_detected_at": self.first_condition_detected_at,
+            "bonus_condition_detected_at": self.bonus_condition_detected_at,
+            "time_between_conditions_sec": self.time_between_conditions_sec,
+            "trade_value_since_capture": self.trade_value_since_capture,
+            "turnover_speed_per_min": self.turnover_speed_per_min,
+            "volume_ratio_1m": self.volume_ratio_1m,
+            "volume_ratio_5m": self.volume_ratio_5m,
+            "turnover_rank_market": self.turnover_rank_market,
+            "turnover_rank_sector": self.turnover_rank_sector,
+            "leader_score": self.leader_score,
             "strategy_name": self.strategy_name or TRADE_CONFIG.strategy_name,
             "condition_formula": self.condition_formula or TRADE_CONFIG.condition_formula,
             "condition_formula_version": (
@@ -198,7 +243,9 @@ class ConditionCaptureLogger:
         capture_allowed: Union[bool, str, None] = "",
         manage_allowed: Union[bool, str, None] = "",
         analysis_allowed: Union[bool, str, None] = "",
+        condition_meta: Optional[Dict[str, object]] = None,
     ) -> None:
+        condition_meta = dict(condition_meta or {})
         self.append(
             ConditionCaptureEvent(
                 event="condition_detected",
@@ -218,6 +265,10 @@ class ConditionCaptureLogger:
                 capture_allowed=capture_allowed,
                 manage_allowed=manage_allowed,
                 analysis_allowed=analysis_allowed,
+                **{
+                    key: condition_meta.get(key, "")
+                    for key in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)
+                },
             )
         )
 
@@ -238,7 +289,15 @@ class ConditionCaptureLogger:
         accum_volume: int = 0,
         signal_source: str = "",
         detected_at: str = "",
+        candidate_role: str = "trading",
+        time_policy_reason: str = "",
+        entry_allowed: Union[bool, str, None] = "",
+        capture_allowed: Union[bool, str, None] = "",
+        manage_allowed: Union[bool, str, None] = "",
+        analysis_allowed: Union[bool, str, None] = "",
+        condition_meta: Optional[Dict[str, object]] = None,
     ) -> None:
+        condition_meta = dict(condition_meta or {})
         self.append(
             ConditionCaptureEvent(
                 event="capture_price",
@@ -256,6 +315,16 @@ class ConditionCaptureLogger:
                 accum_volume=accum_volume,
                 signal_source=signal_source or TRADE_CONFIG.signal_source,
                 detected_at=detected_at,
+                candidate_role=candidate_role,
+                time_policy_reason=time_policy_reason,
+                entry_allowed=entry_allowed,
+                capture_allowed=capture_allowed,
+                manage_allowed=manage_allowed,
+                analysis_allowed=analysis_allowed,
+                **{
+                    key: condition_meta.get(key, "")
+                    for key in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)
+                },
             )
         )
 
@@ -264,7 +333,23 @@ def read_condition_captures(path: str = CONDITION_CAPTURE_CSV) -> List[Dict[str,
     if not os.path.exists(path):
         return []
     with open(path, newline="", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for row in rows:
+        for field in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS):
+            row.setdefault(field, "")
+        if not row.get("primary_condition_name"):
+            row["primary_condition_name"] = getattr(
+                TRADE_CONFIG,
+                "primary_condition_name",
+                TRADE_CONFIG.condition_name,
+            )
+        if not row.get("bonus_condition_name"):
+            row["bonus_condition_name"] = getattr(
+                TRADE_CONFIG,
+                "bonus_condition_name",
+                TRADE_CONFIG.legacy_condition_name,
+            )
+    return rows
 
 
 def capture_price_events(rows: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:

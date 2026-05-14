@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from bars import MinuteBar
-from candidate_registry import Candidate
+from candidate_registry import Candidate, calculate_leader_score
 from momentum_breakout_strategy import (
     EntryDecision,
     MomentumBreakoutStrategy,
@@ -362,6 +362,26 @@ class MomentumReplayRunner:
                 signal_candle_range_pct = None
                 position_in_signal_candle_pct = None
                 upper_wick_ratio = None
+            trade_value_since_capture = int(candidate.trade_value_since_capture or 0)
+            leader_score = calculate_leader_score(
+                turnover_speed_per_min=(float(bar.close) * float(volume_delta)) if volume_delta > 0 else 0.0,
+                volume_ratio_1m=float(volume_ratio or 0.0),
+                volume_ratio_5m=float(volume_ratio or 0.0),
+                trade_value_since_capture=float(trade_value_since_capture or 0.0),
+                turnover_rank_market=1 if trade_value_since_capture > 0 else 0,
+                ranked_count=1 if trade_value_since_capture > 0 else 0,
+                condition_combo=str((candidate.meta or {}).get("condition_combo", "")),
+                vwap_support_ok=not vwap or bar.close >= vwap,
+                chejan_strength=bar.chejan_strength or candidate.last_chejan_strength,
+                opening_phase=True,
+                config=self.config,
+            )
+            # Legacy replay fixtures do not carry live turnover-rank snapshots.
+            # Keep the replay focused on historical momentum behavior.
+            leader_score = max(
+                leader_score,
+                float(getattr(self.config, "opening_min_leader_score", 0.0) or 0.0),
+            )
             ctx = MomentumContext(
                 candidate=candidate,
                 current_price=bar.close,
@@ -369,6 +389,12 @@ class MomentumReplayRunner:
                 spread_rate=bar.spread_rate or self._spread_rate(bar) or None,
                 volume_ratio=volume_ratio or None,
                 turnover_speed_per_min=(float(bar.close) * float(volume_delta)) if volume_delta > 0 else None,
+                trade_value_since_capture=trade_value_since_capture,
+                volume_ratio_1m=volume_ratio or 0.0,
+                volume_ratio_5m=volume_ratio or 0.0,
+                turnover_rank_market=1 if trade_value_since_capture > 0 else 0,
+                turnover_rank_sector=0,
+                leader_score=leader_score,
                 intraday_vwap=vwap or None,
                 minute_bars=seen[-5:],
                 prior_high=prior_high,

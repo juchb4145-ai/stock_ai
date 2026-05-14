@@ -193,6 +193,27 @@ class MinuteBarAggregator:
             return 0
         return int(min(lows))
 
+    def first_pullback_reversal_confirmed(
+        self,
+        code: str,
+        *,
+        current_price: int = 0,
+    ) -> bool:
+        """Return True when the latest 1m bar confirms rebound after pullback."""
+        bars = self.all_bars(code)
+        if not bars:
+            return False
+        cur = bars[-1]
+        cur_close = int(current_price or cur.close or 0)
+        cur_open = int(cur.open or 0)
+        if cur_close > 0 and cur_open > 0 and cur_close > cur_open:
+            return True
+        if len(bars) >= 2:
+            prev_high = int(getattr(bars[-2], "high", 0) or 0)
+            if cur_close > 0 and prev_high > 0 and cur_close >= prev_high:
+                return True
+        return False
+
 
 # === 5분봉 지표 ===
 

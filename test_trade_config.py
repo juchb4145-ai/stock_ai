@@ -51,6 +51,13 @@ class TradeConfigBoolEnvTests(unittest.TestCase):
     def test_risk_reward_defaults_and_replay_fallbacks(self):
         config = TradeConfig()
 
+        self.assertEqual(config.condition_name, "단테떡상이_수정")
+        self.assertEqual(config.legacy_condition_name, "단테떡상이")
+        self.assertEqual(config.primary_condition_name, "단테떡상이_수정")
+        self.assertEqual(config.bonus_condition_name, "단테떡상이")
+        self.assertEqual(config.entry_strategy_version, "quant_first_pullback_v1")
+        self.assertFalse(config.allow_breakout_probe_entry)
+        self.assertEqual(config.breakout_probe_entry_ratio, 0.0)
         self.assertEqual(config.cash_usage_ratio, 0.98)
         self.assertEqual(config.max_position_cash_ratio, 0.10)
         self.assertEqual(config.default_stop_loss_pct, 0.015)
@@ -106,6 +113,37 @@ class TradeConfigBoolEnvTests(unittest.TestCase):
         self.assertTrue(config.allow_closing_auction_emergency_exit)
         self.assertTrue(config.block_new_buys_on_exit_escalation)
         self.assertEqual(config.max_sell_retry_count, 3)
+
+    def test_condition_role_env_overrides_keep_legacy_compatibility(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KIWOOM_PRIMARY_CONDITION_NAME": "primary-new",
+                "KIWOOM_BONUS_CONDITION_NAME": "bonus-new",
+            },
+            clear=True,
+        ):
+            config = TradeConfig.from_env()
+
+        self.assertEqual(config.primary_condition_name, "primary-new")
+        self.assertEqual(config.bonus_condition_name, "bonus-new")
+        self.assertEqual(config.condition_name, "primary-new")
+        self.assertEqual(config.legacy_condition_name, "bonus-new")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KIWOOM_CONDITION_NAME": "primary-legacy-env",
+                "KIWOOM_LEGACY_CONDITION_NAME": "bonus-legacy-env",
+            },
+            clear=True,
+        ):
+            config = TradeConfig.from_env()
+
+        self.assertEqual(config.primary_condition_name, "primary-legacy-env")
+        self.assertEqual(config.bonus_condition_name, "bonus-legacy-env")
+        self.assertEqual(config.condition_name, "primary-legacy-env")
+        self.assertEqual(config.legacy_condition_name, "bonus-legacy-env")
 
 
 if __name__ == "__main__":

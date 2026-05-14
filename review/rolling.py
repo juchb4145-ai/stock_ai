@@ -55,6 +55,21 @@ CONFIDENCE_MEDIUM_MAX = 40   # 20 ≤ n < 40 → medium
 DEFAULT_CLASSIFIER_VERSION = "v2"
 CANDIDATE_CLASSIFIER_VERSIONS = ("v2",)
 
+CONDITION_COMBO_UNKNOWN = "UNKNOWN"
+CONDITION_COMBO_QUANT_ONLY = "QUANT_ONLY"
+CONDITION_COMBO_QUANT_AND_DANTE = "QUANT_AND_DANTE"
+CONDITION_COMBO_DANTE_ONLY = "DANTE_ONLY"
+CONDITION_COMBO_VALUES = {
+    CONDITION_COMBO_QUANT_ONLY,
+    CONDITION_COMBO_QUANT_AND_DANTE,
+    CONDITION_COMBO_DANTE_ONLY,
+}
+CONDITION_COMBO_MIN_N = 2
+CONDITION_COMBO_AVG_R_DIFF = 0.25
+CONDITION_COMBO_WIN_RATE_DIFF = 0.10
+DANTE_ONLY_SHADOW_STOP_RATE = 0.50
+DANTE_ONLY_SHADOW_REACHED_1R_MAX = 0.25
+
 # === rule candidate 트리거 임계 (review/rules.py 와 동일하게 유지) ===
 FAKE_BREAKOUT_RATIO_BLOCK = 0.30
 A_VS_B_DIFF_R = 0.5
@@ -173,6 +188,32 @@ def _parse_int(value, default: int = 0) -> int:
         return default
 
 
+def _parse_boolish(value) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in ("1", "true", "t", "yes", "y"):
+        return True
+    if text in ("0", "false", "f", "no", "n"):
+        return False
+    return None
+
+
+def _condition_combo(row: Dict[str, object]) -> str:
+    combo = str(row.get("condition_combo") or "").strip().upper()
+    if combo in CONDITION_COMBO_VALUES:
+        return combo
+    quant = _parse_boolish(row.get("quant_detected"))
+    dante = _parse_boolish(row.get("dante_detected"))
+    if quant and dante:
+        return CONDITION_COMBO_QUANT_AND_DANTE
+    if quant:
+        return CONDITION_COMBO_QUANT_ONLY
+    if dante:
+        return CONDITION_COMBO_DANTE_ONLY
+    return CONDITION_COMBO_UNKNOWN
+
+
 _NUMERIC_FIELDS = {
     "realized_return", "r_multiple",
     "mfe", "mae", "mfe_r", "mae_r",
@@ -182,6 +223,9 @@ _NUMERIC_FIELDS = {
     "open_return", "upper_wick_ratio", "px_over_bb55_pct",
     "chejan_strength", "volume_speed", "spread_rate",
     "hold_seconds",
+    "condition_score_bonus", "time_between_conditions_sec",
+    "leader_score", "turnover_speed_per_min", "volume_ratio_1m", "volume_ratio_5m",
+    "trade_value_since_capture", "turnover_rank_market", "turnover_rank_sector",
 }
 
 _INT_FIELDS = {"reached_1r", "reached_2r", "hit_stop", "time_exit", "entry_stage_max"}
@@ -204,7 +248,32 @@ def load_trade_rows(reviews_dir: str, dates: Iterable[str]) -> List[Dict[str, ob
                         row[k] = _parse_int(v)
                     else:
                         row[k] = v
+                row["condition_combo"] = _condition_combo(row)
                 rows.append(row)
+    return rows
+
+
+def load_shadow_condition_rows(path: Optional[str], dates: Iterable[str]) -> List[Dict[str, object]]:
+    if not path or not os.path.exists(path):
+        return []
+    date_set = set(dates)
+    rows: List[Dict[str, object]] = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for raw in csv.DictReader(f):
+            captured = str(raw.get("captured_time") or raw.get("logged_at") or "")
+            date_part = captured[:10]
+            if date_set and date_part not in date_set:
+                continue
+            row: Dict[str, object] = {}
+            for k, v in raw.items():
+                if k in _NUMERIC_FIELDS:
+                    row[k] = _parse_float(v)
+                elif k in _INT_FIELDS:
+                    row[k] = _parse_int(v)
+                else:
+                    row[k] = v
+            row["condition_combo"] = _condition_combo(row)
+            rows.append(row)
     return rows
 
 
@@ -324,6 +393,21 @@ def _filter_candidate_rows(rows: List[Dict[str, object]]) -> List[Dict[str, obje
     return [r for r in rows if _row_classifier_version(r) in CANDIDATE_CLASSIFIER_VERSIONS]
 
 
+def _leader_score_bucket(row: Dict[str, object]) -> str:
+    score = row.get("leader_score")
+    if score is None or score != score:
+        return "UNKNOWN"
+    try:
+        score_f = float(score)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if score_f >= 80.0:
+        return "leader_score >= 80"
+    if score_f >= 60.0:
+        return "60 <= leader_score < 80"
+    return "leader_score < 60"
+
+
 @dataclass
 class WindowStats:
     """단일 윈도우(예: 10영업일)의 누적 통계.
@@ -339,6 +423,10 @@ class WindowStats:
     by_entry: Dict[str, Dict[str, object]] = field(default_factory=dict)
     by_exit: Dict[str, Dict[str, object]] = field(default_factory=dict)
     by_combo: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    by_condition_combo: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    by_condition_combo_entry_class: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    by_condition_combo_exit_class: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    by_leader_score_bucket: Dict[str, Dict[str, object]] = field(default_factory=dict)
     by_classifier: Dict[str, Dict[str, object]] = field(default_factory=dict)
     confidence: str = "low"
 
@@ -353,6 +441,10 @@ class WindowStats:
             "by_entry_class": self.by_entry,
             "by_exit_class": self.by_exit,
             "by_entry_exit": self.by_combo,
+            "by_condition_combo": self.by_condition_combo,
+            "by_condition_combo_entry_class": self.by_condition_combo_entry_class,
+            "by_condition_combo_exit_class": self.by_condition_combo_exit_class,
+            "by_leader_score_bucket": self.by_leader_score_bucket,
             "by_classifier_version": self.by_classifier,
         }
 
@@ -366,18 +458,31 @@ def aggregate_window(
     by_entry: Dict[str, Dict[str, object]] = {}
     by_exit: Dict[str, Dict[str, object]] = {}
     by_combo: Dict[str, Dict[str, object]] = {}
+    by_condition_combo: Dict[str, Dict[str, object]] = {}
+    by_condition_combo_entry_class: Dict[str, Dict[str, object]] = {}
+    by_condition_combo_exit_class: Dict[str, Dict[str, object]] = {}
+    by_leader_score_bucket: Dict[str, Dict[str, object]] = {}
     by_classifier: Dict[str, Dict[str, object]] = {}
 
     grouped_e: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     grouped_x: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     grouped_c: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    grouped_condition: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    grouped_condition_entry: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    grouped_condition_exit: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    grouped_leader: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     grouped_v: Dict[str, List[Dict[str, object]]] = defaultdict(list)
     for row in rows:
         ec = (row.get("entry_class") or "unclassified") or "unclassified"
         xc = (row.get("exit_class") or "unclassified") or "unclassified"
+        cc = _condition_combo(row)
         grouped_e[str(ec)].append(row)
         grouped_x[str(xc)].append(row)
         grouped_c[f"{ec}|{xc}"].append(row)
+        grouped_condition[cc].append(row)
+        grouped_condition_entry[f"{cc}|{ec}"].append(row)
+        grouped_condition_exit[f"{cc}|{xc}"].append(row)
+        grouped_leader[_leader_score_bucket(row)].append(row)
         grouped_v[_row_classifier_version(row)].append(row)
     for k, v in grouped_e.items():
         by_entry[k] = _aggregate_group(v)
@@ -385,6 +490,14 @@ def aggregate_window(
         by_exit[k] = _aggregate_group(v)
     for k, v in grouped_c.items():
         by_combo[k] = _aggregate_group(v)
+    for k, v in grouped_condition.items():
+        by_condition_combo[k] = _aggregate_group(v)
+    for k, v in grouped_condition_entry.items():
+        by_condition_combo_entry_class[k] = _aggregate_group(v)
+    for k, v in grouped_condition_exit.items():
+        by_condition_combo_exit_class[k] = _aggregate_group(v)
+    for k, v in grouped_leader.items():
+        by_leader_score_bucket[k] = _aggregate_group(v)
     for k, v in grouped_v.items():
         by_classifier[k] = _aggregate_group(v)
 
@@ -400,6 +513,10 @@ def aggregate_window(
         by_entry=by_entry,
         by_exit=by_exit,
         by_combo=by_combo,
+        by_condition_combo=by_condition_combo,
+        by_condition_combo_entry_class=by_condition_combo_entry_class,
+        by_condition_combo_exit_class=by_condition_combo_exit_class,
+        by_leader_score_bucket=by_leader_score_bucket,
         by_classifier=by_classifier,
         confidence=_confidence_for_n(n_candidate),
     )
@@ -513,6 +630,117 @@ def _eval_be_cut(rows: List[dict]) -> Optional[dict]:
     return None
 
 
+def _rows_by_condition_combo(rows: List[dict], combo: str) -> List[dict]:
+    return [r for r in rows if _condition_combo(r) == combo]
+
+
+def _eval_prefer_quant_and_dante(rows: List[dict]) -> Optional[dict]:
+    quant = _rows_by_condition_combo(rows, CONDITION_COMBO_QUANT_ONLY)
+    both = _rows_by_condition_combo(rows, CONDITION_COMBO_QUANT_AND_DANTE)
+    if len(quant) < CONDITION_COMBO_MIN_N or len(both) < CONDITION_COMBO_MIN_N:
+        return None
+    q = _aggregate_group(quant)
+    b = _aggregate_group(both)
+    q_avg = q.get("avg_r")
+    b_avg = b.get("avg_r")
+    q_win = q.get("win_rate")
+    b_win = b.get("win_rate")
+    if b_avg is None or q_avg is None or b_win is None or q_win is None:
+        return None
+    if (
+        b_avg - q_avg >= CONDITION_COMBO_AVG_R_DIFF
+        or b_win - q_win >= CONDITION_COMBO_WIN_RATE_DIFF
+    ):
+        return {
+            "n": len(both),
+            "total": len(rows),
+            "ratio": len(both) / max(len(rows), 1),
+            "quant_only": q,
+            "quant_and_dante": b,
+        }
+    return None
+
+
+def _eval_relax_quant_only(rows: List[dict]) -> Optional[dict]:
+    quant = _rows_by_condition_combo(rows, CONDITION_COMBO_QUANT_ONLY)
+    both = _rows_by_condition_combo(rows, CONDITION_COMBO_QUANT_AND_DANTE)
+    if len(quant) < CONDITION_COMBO_MIN_N:
+        return None
+    q = _aggregate_group(quant)
+    b = _aggregate_group(both)
+    q_avg = q.get("avg_r")
+    q_win = q.get("win_rate")
+    if q_avg is None or q_win is None:
+        return None
+    both_avg = b.get("avg_r")
+    materially_worse = both_avg is not None and q_avg + CONDITION_COMBO_AVG_R_DIFF < both_avg
+    if q_avg > 0 and q_win >= 0.5 and not materially_worse:
+        return {
+            "n": len(quant),
+            "total": len(rows),
+            "ratio": len(quant) / max(len(rows), 1),
+            "quant_only": q,
+            "quant_and_dante": b,
+        }
+    return None
+
+
+def _eval_disable_breakout_probe_live(rows: List[dict]) -> Optional[dict]:
+    def text(row: dict) -> str:
+        return " ".join(
+            str(row.get(key) or "")
+            for key in ("reason_code", "plan_source", "entry_class", "reason")
+        ).upper()
+
+    breakout = [
+        r for r in rows
+        if "BREAKOUT_SMALL" in text(r)
+        or "BUY_BREAKOUT_SMALL" in text(r)
+        or "BREAKOUT_PROBE" in text(r)
+    ]
+    pullback = [
+        r for r in rows
+        if "BUY_PULLBACK_RECLAIM" in text(r)
+        or "PULLBACK_RECLAIM" in text(r)
+        or "QUANT_FIRST_PULLBACK_READY" in text(r)
+        or str(r.get("entry_class") or "") == "first_pullback"
+    ]
+    if len(breakout) < CONDITION_COMBO_MIN_N or len(pullback) < CONDITION_COMBO_MIN_N:
+        return None
+    breakout_avg = _aggregate_group(breakout).get("avg_r")
+    pullback_avg = _aggregate_group(pullback).get("avg_r")
+    if breakout_avg is None or pullback_avg is None:
+        return None
+    if breakout_avg < pullback_avg and breakout_avg < 0:
+        return {
+            "n": len(breakout),
+            "total": len(rows),
+            "ratio": len(breakout) / max(len(rows), 1),
+            "breakout_avg_r": breakout_avg,
+            "pullback_avg_r": pullback_avg,
+        }
+    return None
+
+
+def _eval_penalize_dante_only_shadow(shadow_rows: List[dict]) -> Optional[dict]:
+    dante = _rows_by_condition_combo(shadow_rows, CONDITION_COMBO_DANTE_ONLY)
+    if len(dante) < CONDITION_COMBO_MIN_N:
+        return None
+    stats = _aggregate_group(dante)
+    hit_stop_rate = stats.get("hit_stop_rate")
+    reached_1r_rate = stats.get("reached_1r_rate")
+    stop_bad = hit_stop_rate is not None and hit_stop_rate >= DANTE_ONLY_SHADOW_STOP_RATE
+    r1_bad = reached_1r_rate is not None and reached_1r_rate <= DANTE_ONLY_SHADOW_REACHED_1R_MAX
+    if stop_bad or r1_bad:
+        return {
+            "n": len(dante),
+            "total": len(shadow_rows),
+            "ratio": len(dante) / max(len(shadow_rows), 1),
+            "dante_only_shadow": stats,
+        }
+    return None
+
+
 RULE_EVALUATORS = {
     "block_fake_breakout": _eval_block_fake,
     "wait_for_pullback":   _eval_wait_pullback,
@@ -525,6 +753,7 @@ RULE_EVALUATORS = {
 def evaluate_candidates(
     rows_by_window: Dict[int, List[dict]],
     window_total_by_window: Dict[int, int],
+    shadow_rows_by_window: Optional[Dict[int, List[dict]]] = None,
 ) -> List[RuleCandidate]:
     """윈도우별 rows 를 받아 5종 룰 candidate 평가.
 
@@ -574,6 +803,75 @@ def evaluate_candidates(
             evidence=evidence,
             proposed_overrides=proposed,
         ))
+    combo_evaluators = {
+        "prefer_quant_and_dante": _eval_prefer_quant_and_dante,
+        "relax_quant_only": _eval_relax_quant_only,
+        "disable_breakout_probe_live": _eval_disable_breakout_probe_live,
+    }
+    combo_titles = {
+        "prefer_quant_and_dante": "QUANT_AND_DANTE 우선",
+        "relax_quant_only": "QUANT_ONLY 단독 허용 완화",
+        "disable_breakout_probe_live": "돌파 소량 live 비활성 유지",
+    }
+    combo_summaries = {
+        "prefer_quant_and_dante": "QUANT_AND_DANTE가 QUANT_ONLY보다 평균 R 또는 승률이 우위입니다.",
+        "relax_quant_only": "QUANT_ONLY가 단독으로도 충분한 기대값을 보입니다.",
+        "disable_breakout_probe_live": "BREAKOUT_SMALL 계열이 BUY_PULLBACK_RECLAIM보다 부진합니다.",
+    }
+    for rule_id, evaluator in combo_evaluators.items():
+        per_window: Dict[int, dict] = {}
+        for w in windows_sorted:
+            ev = evaluator(rows_by_window[w])
+            if ev is not None:
+                per_window[w] = ev
+        if not per_window:
+            continue
+        triggered = sorted(per_window.keys())
+        consistent = set(triggered) == set(windows_sorted)
+        largest_w = max(triggered)
+        n_trigger = int(per_window[largest_w].get("n", 0))
+        n_window_total = int(window_total_by_window.get(largest_w, 0))
+        confidence = _confidence_for_n(n_window_total)
+        if confidence == "high" and not consistent:
+            confidence = "medium"
+        out.append(RuleCandidate(
+            rule_id=rule_id,
+            title=combo_titles[rule_id],
+            triggered_windows=triggered,
+            confidence=confidence,
+            n_largest_window=n_trigger,
+            consistent_across_windows=consistent,
+            evidence={f"{w}d": per_window[w] for w in triggered},
+            proposed_overrides=[],
+            reason_no_apply=combo_summaries[rule_id],
+        ))
+
+    if shadow_rows_by_window:
+        per_window = {}
+        for w in windows_sorted:
+            ev = _eval_penalize_dante_only_shadow(shadow_rows_by_window.get(w, []))
+            if ev is not None:
+                per_window[w] = ev
+        if per_window:
+            triggered = sorted(per_window.keys())
+            consistent = set(triggered) == set(windows_sorted)
+            largest_w = max(triggered)
+            n_trigger = int(per_window[largest_w].get("n", 0))
+            n_window_total = int(per_window[largest_w].get("total", 0))
+            confidence = _confidence_for_n(n_window_total)
+            if confidence == "high" and not consistent:
+                confidence = "medium"
+            out.append(RuleCandidate(
+                rule_id="penalize_dante_only",
+                title="DANTE_ONLY 매수 금지 유지",
+                triggered_windows=triggered,
+                confidence=confidence,
+                n_largest_window=n_trigger,
+                consistent_across_windows=consistent,
+                evidence={f"{w}d": per_window[w] for w in triggered},
+                proposed_overrides=[],
+                reason_no_apply="DANTE_ONLY shadow 표본의 손절률/1R 도달률이 불리합니다.",
+            ))
     return out
 
 
@@ -668,12 +966,18 @@ def run_rolling(
 
     window_stats: List[WindowStats] = []
     rows_by_window: Dict[int, List[dict]] = {}
+    shadow_rows_by_window: Dict[int, List[dict]] = {}
     overrides_evidence_by_window: Dict[int, List[dict]] = {}
     for w in windows:
         dates = select_window_dates(available, as_of_date, w)
         rows = load_trade_rows(reviews_dir, dates)
+        shadow_rows = load_shadow_condition_rows(
+            shadow_csv or os.path.join("data", "dante_shadow_training.csv"),
+            dates,
+        )
         evidence = load_overrides_evidence(reviews_dir, dates)
         rows_by_window[w] = rows
+        shadow_rows_by_window[w] = shadow_rows
         overrides_evidence_by_window[w] = evidence
         window_stats.append(aggregate_window(w, dates, rows))
 
@@ -683,7 +987,11 @@ def run_rolling(
         w: _filter_candidate_rows(rows_by_window[w]) for w in windows
     }
     window_total_by_window = {w: len(candidate_rows_by_window[w]) for w in windows}
-    candidates = evaluate_candidates(candidate_rows_by_window, window_total_by_window)
+    candidates = evaluate_candidates(
+        candidate_rows_by_window,
+        window_total_by_window,
+        shadow_rows_by_window=shadow_rows_by_window,
+    )
 
     # === shadow 트랙(false-negative) 통합 ===
     # tighten 룰이 같은 target 을 동시에 건드리면 release 후보를 자동으로 무력화한다.

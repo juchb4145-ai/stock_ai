@@ -35,6 +35,7 @@ from typing import Any, Dict, Optional
 import entry_strategy
 import exit_strategy
 import scoring
+from candidate_registry import CONDITION_COMBO_META_FIELDS, LEADER_META_FIELDS
 from market_state import SNAPSHOT_FIELD_NAMES
 from trade_config import TRADE_CONFIG
 
@@ -99,6 +100,7 @@ DANTE_TRAINING_FIELDS = [
     "model_action",
     "model_target",
     "model_threshold",
+    *CONDITION_COMBO_META_FIELDS,
 ] + list(scoring.DANTE_ENTRY_FEATURE_NAMES) + [
     "return_5m",
     "return_10m",
@@ -120,12 +122,36 @@ DANTE_SHADOW_TRAINING_FIELDS = ["decision_status", "reason_code"] + DANTE_TRAINI
 DANTE_CAPTURE_START_HHMMSS = 90500
 DANTE_CAPTURE_END_HHMMSS = 143000
 
+
+def _condition_meta_from_context(ctx: Any) -> Dict[str, Any]:
+    candidate = getattr(ctx, "candidate", None)
+    meta = dict(getattr(candidate, "meta", {}) or {})
+    out = {field: meta.get(field, "") for field in CONDITION_COMBO_META_FIELDS}
+    out["primary_condition_name"] = out.get("primary_condition_name") or getattr(
+        TRADE_CONFIG,
+        "primary_condition_name",
+        TRADE_CONFIG.condition_name,
+    )
+    out["bonus_condition_name"] = out.get("bonus_condition_name") or getattr(
+        TRADE_CONFIG,
+        "bonus_condition_name",
+        TRADE_CONFIG.legacy_condition_name,
+    )
+    return out
+
+
+def _attach_condition_meta(row: Dict[str, Any], ctx: Any) -> None:
+    for field, value in _condition_meta_from_context(ctx).items():
+        row[field] = value
+
 TRADE_LOG_FIELDS = [
     "logged_at",
     "event",
     "strategy_name",
     "rule_version",
     "condition_name",
+    *CONDITION_COMBO_META_FIELDS,
+    *LEADER_META_FIELDS,
     "condition_formula",
     "condition_formula_version",
     "condition_rules",
@@ -155,6 +181,7 @@ TRADE_LOG_FIELDS = [
     "model_threshold",
     "reason_code",
     "reason",
+    "blocked_by",
     "exit_reason_code",
     "exit_type",
     "stop_reason",
@@ -167,6 +194,13 @@ TRADE_LOG_FIELDS = [
     "plan_source",
     "capture_price",
     "pullback_pct",
+    "high_since_capture",
+    "low_after_high",
+    "pullback_from_high_pct",
+    "rebound_from_low_pct",
+    "intraday_vwap",
+    "vwap_support_ok",
+    "first_pullback_ready",
     "chejan_strength",
     "hold_seconds",
     "profit_rate",
@@ -317,6 +351,13 @@ class TrainingRecorderMixin:
             atr_5m_pct=getattr(ctx, "atr_5m_pct", 0.0) or 0.0,
             intraday_vwap=getattr(ctx, "intraday_vwap", 0.0) or 0.0,
             pullback_low_after_high=getattr(ctx, "pullback_low_after_high", 0) or 0,
+            leader_score=getattr(ctx, "leader_score", 0.0) or 0.0,
+            turnover_speed_per_min=getattr(ctx, "turnover_speed_per_min", 0.0) or 0.0,
+            volume_ratio_1m=getattr(ctx, "volume_ratio_1m", 0.0) or 0.0,
+            volume_ratio_5m=getattr(ctx, "volume_ratio_5m", 0.0) or 0.0,
+            trade_value_since_capture=getattr(ctx, "trade_value_since_capture", 0.0) or 0.0,
+            turnover_rank_market=getattr(ctx, "turnover_rank_market", 0) or 0,
+            turnover_rank_sector=getattr(ctx, "turnover_rank_sector", 0) or 0,
         )
 
         sample_id = uuid.uuid4().hex
@@ -335,6 +376,7 @@ class TrainingRecorderMixin:
             "model_target": getattr(decision, "model_target", ""),
             "model_threshold": getattr(decision, "model_threshold", ""),
         }
+        _attach_condition_meta(row, ctx)
         row.update(features)
         for horizon in DANTE_TRAINING_LABEL_HORIZONS:
             row["return_{}m".format(horizon // 60)] = ""
@@ -522,6 +564,13 @@ class TrainingRecorderMixin:
             atr_5m_pct=getattr(ctx, "atr_5m_pct", 0.0) or 0.0,
             intraday_vwap=getattr(ctx, "intraday_vwap", 0.0) or 0.0,
             pullback_low_after_high=getattr(ctx, "pullback_low_after_high", 0) or 0,
+            leader_score=getattr(ctx, "leader_score", 0.0) or 0.0,
+            turnover_speed_per_min=getattr(ctx, "turnover_speed_per_min", 0.0) or 0.0,
+            volume_ratio_1m=getattr(ctx, "volume_ratio_1m", 0.0) or 0.0,
+            volume_ratio_5m=getattr(ctx, "volume_ratio_5m", 0.0) or 0.0,
+            trade_value_since_capture=getattr(ctx, "trade_value_since_capture", 0.0) or 0.0,
+            turnover_rank_market=getattr(ctx, "turnover_rank_market", 0) or 0,
+            turnover_rank_sector=getattr(ctx, "turnover_rank_sector", 0) or 0,
         )
 
         sample_id = uuid.uuid4().hex
@@ -542,6 +591,7 @@ class TrainingRecorderMixin:
             "model_target": getattr(decision, "model_target", ""),
             "model_threshold": getattr(decision, "model_threshold", ""),
         }
+        _attach_condition_meta(row, ctx)
         row.update(features)
         for horizon in DANTE_TRAINING_LABEL_HORIZONS:
             row["return_{}m".format(horizon // 60)] = ""
@@ -632,6 +682,38 @@ class TrainingRecorderMixin:
     # 거래 로그 (모든 매수/매도 이벤트)
     # ------------------------------------------------------------------
 
+    def _fill_trade_log_condition_meta(self, row: Dict[str, Any]) -> None:
+        row["primary_condition_name"] = row.get("primary_condition_name") or getattr(
+            TRADE_CONFIG,
+            "primary_condition_name",
+            TRADE_CONFIG.condition_name,
+        )
+        row["bonus_condition_name"] = row.get("bonus_condition_name") or getattr(
+            TRADE_CONFIG,
+            "bonus_condition_name",
+            TRADE_CONFIG.legacy_condition_name,
+        )
+        code = str(row.get("code", "") or "").strip()
+        if not code:
+            return
+        if hasattr(self, "normalize_code"):
+            code = self.normalize_code(code)
+        registry = getattr(self, "candidate_registry", None)
+        candidate = registry.get(code) if registry is not None and hasattr(registry, "get") else None
+        if candidate is None:
+            return
+        if not row.get("candidate_id"):
+            row["candidate_id"] = getattr(candidate, "candidate_id", "")
+        if not row.get("condition_name"):
+            row["condition_name"] = getattr(candidate, "condition_name", "")
+        meta = getattr(candidate, "meta", {}) or {}
+        for field in CONDITION_COMBO_META_FIELDS:
+            if row.get(field) in ("", None):
+                row[field] = meta.get(field, "")
+        for field in LEADER_META_FIELDS:
+            if row.get(field) in ("", None):
+                row[field] = getattr(candidate, field, meta.get(field, ""))
+
     def ensure_trade_log_file(self) -> None:
         _ensure_csv_header(TRADE_LOG_CSV, TRADE_LOG_FIELDS, log_label="trade_log")
 
@@ -653,6 +735,7 @@ class TrainingRecorderMixin:
                     row[key] = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
                 else:
                     row[key] = value
+        self._fill_trade_log_condition_meta(row)
         with open(TRADE_LOG_CSV, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS)
             writer.writerow(row)

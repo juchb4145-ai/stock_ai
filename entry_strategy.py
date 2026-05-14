@@ -38,7 +38,7 @@ from trade_config import TRADE_CONFIG
 
 
 # === 분할매수 비율 (합 = 1.0) ===
-DANTE_FIRST_ENTRY_RATIO = 0.25
+DANTE_FIRST_ENTRY_RATIO = 0.0
 DANTE_SECOND_ENTRY_RATIO = 0.75
 # B급(1봉전 돌파만) 본진입 비율 — 1차 추격 없이 첫 눌림에서 한 번에 매수
 DANTE_GRADE_B_RATIO = 1.0
@@ -265,6 +265,13 @@ class EntryContext:
     # 직전 고점 형성 후 1분봉 최저가. 0 이면 minute_bars 에서 자동 추출.
     # B급 / Stage2 풀백의 "저점 vs VWAP" 비교 anchor.
     pullback_low_after_high: int = 0
+    trade_value_since_capture: int = 0
+    turnover_speed_per_min: float = 0.0
+    volume_ratio_1m: float = 0.0
+    volume_ratio_5m: float = 0.0
+    turnover_rank_market: int = 0
+    turnover_rank_sector: int = 0
+    leader_score: float = 0.0
 
 
 def turnover_speed_per_min(ctx: EntryContext) -> float:

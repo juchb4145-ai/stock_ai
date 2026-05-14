@@ -10,7 +10,15 @@ from datetime import datetime
 from statistics import mean
 from typing import Dict, Iterable, List, Optional
 
-from .loader import Trade
+from .loader import (
+    CONDITION_COMBO_DANTE_ONLY,
+    CONDITION_COMBO_QUANT_AND_DANTE,
+    CONDITION_COMBO_QUANT_ONLY,
+    CONDITION_COMBO_UNKNOWN,
+    CONDITION_META_FIELDS,
+    Trade,
+    normalize_condition_combo,
+)
 from .rules import RuleRecommendation
 
 
@@ -28,6 +36,8 @@ CSV_COLUMNS = [
     # PR-D 디버그
     "late_chase_score", "late_chase_reasons",
     "breakout_chase_protected", "classifier_version",
+    *CONDITION_META_FIELDS,
+    "condition_meta_source", "dante_only_buy_warning",
     "grade", "entry_stage_max",
     "entry_avg_price", "exit_avg_price",
     "entry_first_time", "exit_last_time", "hold_seconds",
@@ -46,7 +56,9 @@ CSV_COLUMNS = [
     # D 피처 (PR-B)
     "obs_elapsed_sec", "pullback_pct_from_high",
     "entry_after_peak_sec", "high_to_entry_drop_pct", "entry_near_session_high",
-    "entry_vs_vwap_pct", "volume_ratio_1m",
+    "entry_vs_vwap_pct", "vwap_support_ok", "volume_ratio_1m", "volume_ratio_5m",
+    "leader_score", "turnover_speed_per_min", "trade_value_since_capture",
+    "turnover_rank_market", "turnover_rank_sector",
     "breakout_candle_body_pct", "upper_wick_pct",
     "prior_3m_return_pct", "prior_5m_return_pct",
     # 기본 피처
@@ -56,7 +68,7 @@ CSV_COLUMNS = [
     "market_strength",
     "market_kospi_close_return", "market_kosdaq_close_return",
     "market_kospi_intraday_high_return", "market_kosdaq_intraday_high_return",
-    "reason", "exit_reason",
+    "reason_code", "plan_source", "reason", "exit_reason",
 ]
 
 
@@ -87,6 +99,8 @@ def _trade_row(trade: Trade) -> dict:
         "late_chase_reasons": ";".join(trade.late_chase_reasons),
         "breakout_chase_protected": "true" if trade.breakout_chase_protected else "false",
         "classifier_version": trade.classifier_version,
+        "condition_meta_source": trade.condition_meta_source,
+        "dante_only_buy_warning": "true" if trade.dante_only_buy_warning else "false",
         "grade": trade.grade,
         "entry_stage_max": trade.entry_stage_max,
         "entry_avg_price": int(trade.entry_avg_price) if trade.entry_qty else "",
@@ -129,7 +143,14 @@ def _trade_row(trade: Trade) -> dict:
         "high_to_entry_drop_pct": f.get("high_to_entry_drop_pct"),
         "entry_near_session_high": f.get("entry_near_session_high"),
         "entry_vs_vwap_pct": f.get("entry_vs_vwap_pct"),
+        "vwap_support_ok": f.get("vwap_support_ok"),
         "volume_ratio_1m": f.get("volume_ratio_1m"),
+        "volume_ratio_5m": f.get("volume_ratio_5m"),
+        "leader_score": f.get("leader_score"),
+        "turnover_speed_per_min": f.get("turnover_speed_per_min"),
+        "trade_value_since_capture": f.get("trade_value_since_capture"),
+        "turnover_rank_market": f.get("turnover_rank_market"),
+        "turnover_rank_sector": f.get("turnover_rank_sector"),
         "breakout_candle_body_pct": f.get("breakout_candle_body_pct"),
         "upper_wick_pct": f.get("upper_wick_pct"),
         "prior_3m_return_pct": f.get("prior_3m_return_pct"),
@@ -148,9 +169,13 @@ def _trade_row(trade: Trade) -> dict:
         "market_kosdaq_close_return": f.get("market_kosdaq_close_return"),
         "market_kospi_intraday_high_return": f.get("market_kospi_intraday_high_return"),
         "market_kosdaq_intraday_high_return": f.get("market_kosdaq_intraday_high_return"),
+        "reason_code": trade.reason_code,
+        "plan_source": trade.plan_source,
         "reason": trade.reason,
         "exit_reason": trade.exit_reason,
     }
+    for field in CONDITION_META_FIELDS:
+        row[field] = getattr(trade, field, "")
     return {k: _fmt(v) for k, v in row.items()}
 
 
@@ -171,6 +196,8 @@ def write_rule_overrides_json(
     recs: List[RuleRecommendation],
     path: str,
     target_date: str,
+    condition_summary: Optional[Dict[str, Dict[str, object]]] = None,
+    leader_summary: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> None:
     """일자별 룰 추천 → 구조화된 Override 리스트(JSON).
 
@@ -203,6 +230,8 @@ def write_rule_overrides_json(
         "applies_to_next_trading_day": True,
         "auto_apply_globally_disabled": True,
         "schema": "review.overrides.Override v1",
+        "condition_combo_summary": condition_summary or {},
+        "leader_score_summary": leader_summary or {},
         "proposed_overrides": proposed,
         "evidence": evidence,
     }
@@ -235,6 +264,148 @@ def _fmt_dt(value):
 
 def _valid_numbers(values):
     return [value for value in values if value is not None and value == value]
+
+
+def _ratio_from_attr(trades: List[Trade], attr: str) -> Optional[float]:
+    values = [getattr(t, attr) for t in trades if getattr(t, attr) is not None]
+    if not values:
+        return None
+    return sum(1 for value in values if value) / len(values)
+
+
+def condition_combo_summary(trades: List[Trade]) -> Dict[str, Dict[str, object]]:
+    groups: Dict[str, List[Trade]] = {
+        CONDITION_COMBO_QUANT_ONLY: [],
+        CONDITION_COMBO_QUANT_AND_DANTE: [],
+        CONDITION_COMBO_DANTE_ONLY: [],
+    }
+    for trade in trades:
+        combo = normalize_condition_combo(getattr(trade, "condition_combo", ""))
+        groups.setdefault(combo, []).append(trade)
+    if CONDITION_COMBO_UNKNOWN not in groups and any(
+        normalize_condition_combo(getattr(t, "condition_combo", "")) == CONDITION_COMBO_UNKNOWN
+        for t in trades
+    ):
+        groups[CONDITION_COMBO_UNKNOWN] = [
+            t for t in trades
+            if normalize_condition_combo(getattr(t, "condition_combo", "")) == CONDITION_COMBO_UNKNOWN
+        ]
+
+    out: Dict[str, Dict[str, object]] = {}
+    for combo, combo_trades in groups.items():
+        closed = [t for t in combo_trades if t.is_closed]
+        rs = _valid_numbers([t.metrics.get("r_multiple", float("nan")) for t in closed])
+        mfe_rs = _valid_numbers([t.metrics.get("mfe_r", float("nan")) for t in closed])
+        mae_rs = _valid_numbers([t.metrics.get("mae_r", float("nan")) for t in closed])
+        warnings = sum(1 for t in combo_trades if getattr(t, "dante_only_buy_warning", False))
+        out[combo] = {
+            "trades": len(combo_trades),
+            "closed_trades": len(closed),
+            "win_rate": (sum(1 for r in rs if r > 0) / len(rs)) if rs else None,
+            "avg_r": mean(rs) if rs else None,
+            "avg_mfe_r": mean(mfe_rs) if mfe_rs else None,
+            "avg_mae_r": mean(mae_rs) if mae_rs else None,
+            "hit_stop_rate": _ratio_from_attr(closed, "hit_stop"),
+            "reached_1r_rate": _ratio_from_attr(closed, "reached_1r"),
+            "dante_only_buy_warnings": warnings,
+        }
+    return out
+
+
+def _condition_combo_lines(trades: List[Trade]) -> List[str]:
+    summary = condition_combo_summary(trades)
+    lines = [
+        "| condition_combo | trades | win_rate | avg_r | avg_mfe_r | avg_mae_r | hit_stop_rate | reached_1r_rate | warnings |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for combo in (
+        CONDITION_COMBO_QUANT_ONLY,
+        CONDITION_COMBO_QUANT_AND_DANTE,
+        CONDITION_COMBO_DANTE_ONLY,
+        CONDITION_COMBO_UNKNOWN,
+    ):
+        if combo not in summary:
+            continue
+        stats = summary[combo]
+        lines.append(
+            "| {combo} | {trades} | {win} | {avg_r} | {mfe} | {mae} | {stop} | {r1} | {warn} |".format(
+                combo=combo,
+                trades=stats["trades"],
+                win="n/a" if stats["win_rate"] is None else "{:.0%}".format(stats["win_rate"]),
+                avg_r=_fmt_r(stats["avg_r"]),
+                mfe=_fmt_r(stats["avg_mfe_r"]),
+                mae=_fmt_r(stats["avg_mae_r"]),
+                stop="n/a" if stats["hit_stop_rate"] is None else "{:.0%}".format(stats["hit_stop_rate"]),
+                r1="n/a" if stats["reached_1r_rate"] is None else "{:.0%}".format(stats["reached_1r_rate"]),
+                warn=stats["dante_only_buy_warnings"],
+            )
+        )
+    warning_count = sum(
+        int(stats.get("dante_only_buy_warnings") or 0) for stats in summary.values()
+    )
+    if warning_count:
+        lines.append("")
+        lines.append(f"- WARNING: DANTE_ONLY 실제 매수 의심 {warning_count}건. live 차단 경로를 점검하세요.")
+    return lines
+
+
+def _leader_score_bucket(value) -> str:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if score != score:
+        return "UNKNOWN"
+    if score >= 80.0:
+        return "leader_score >= 80"
+    if score >= 60.0:
+        return "60 <= leader_score < 80"
+    return "leader_score < 60"
+
+
+def leader_score_summary(trades: List[Trade]) -> Dict[str, Dict[str, object]]:
+    groups: Dict[str, List[Trade]] = {
+        "leader_score >= 80": [],
+        "60 <= leader_score < 80": [],
+        "leader_score < 60": [],
+        "UNKNOWN": [],
+    }
+    for trade in trades:
+        groups[_leader_score_bucket(trade.features.get("leader_score"))].append(trade)
+    out: Dict[str, Dict[str, object]] = {}
+    for bucket, bucket_trades in groups.items():
+        closed = [t for t in bucket_trades if t.is_closed]
+        rs = _valid_numbers([t.metrics.get("r_multiple", float("nan")) for t in closed])
+        out[bucket] = {
+            "trades": len(bucket_trades),
+            "closed_trades": len(closed),
+            "win_rate": (sum(1 for r in rs if r > 0) / len(rs)) if rs else None,
+            "avg_r": mean(rs) if rs else None,
+            "hit_stop_rate": _ratio_from_attr(closed, "hit_stop"),
+            "reached_1r_rate": _ratio_from_attr(closed, "reached_1r"),
+        }
+    return out
+
+
+def _leader_score_lines(trades: List[Trade]) -> List[str]:
+    summary = leader_score_summary(trades)
+    lines = [
+        "| leader_score_bucket | trades | win_rate | avg_r | hit_stop_rate | reached_1r_rate |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for bucket in ("leader_score >= 80", "60 <= leader_score < 80", "leader_score < 60", "UNKNOWN"):
+        stats = summary[bucket]
+        lines.append(
+            "| {bucket} | {trades} | {win} | {avg_r} | {stop} | {r1} |".format(
+                bucket=bucket,
+                trades=stats["trades"],
+                win="n/a" if stats["win_rate"] is None else "{:.0%}".format(stats["win_rate"]),
+                avg_r=_fmt_r(stats["avg_r"]),
+                stop="n/a" if stats["hit_stop_rate"] is None else "{:.0%}".format(stats["hit_stop_rate"]),
+                r1="n/a" if stats["reached_1r_rate"] is None else "{:.0%}".format(stats["reached_1r_rate"]),
+            )
+        )
+    return lines
 
 
 def _profit_factor_from_r(rs: List[float]):
@@ -378,6 +549,12 @@ def write_markdown(
     out.append("## 1분봉 데이터 소스")
     out.extend(_intraday_lines(intraday_summary))
     out.append("")
+    out.append("## 조건식 조합별 성과")
+    out.extend(_condition_combo_lines(trades))
+    out.append("")
+    out.append("## leader_score bucket performance")
+    out.extend(_leader_score_lines(trades))
+    out.append("")
     out.append("## 손실 큰 거래 Top 3")
     out.extend(_worst_trades_table(trades))
     out.append("")
@@ -453,5 +630,11 @@ def write_reports(
     write_markdown(trades, recs, md_path, target_date,
                    intraday_summary=intraday_summary,
                    shadow_diagnostics_section=shadow_section)
-    write_rule_overrides_json(recs, json_path, target_date)
+    write_rule_overrides_json(
+        recs,
+        json_path,
+        target_date,
+        condition_summary=condition_combo_summary(trades),
+        leader_summary=leader_score_summary(trades),
+    )
     return {"csv": csv_path, "md": md_path, "json": json_path, **shadow_paths}

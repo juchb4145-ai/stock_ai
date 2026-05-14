@@ -13,6 +13,47 @@ from trade_config import TradeConfig
 
 logger = logging.getLogger(__name__)
 
+LIVE_BREAKOUT_BLOCKED_BY = "live_breakout_probe_disabled"
+LIVE_BREAKOUT_BLOCK_REASON_CODE = "BLOCK_LIVE_BREAKOUT_SMALL"
+PAPER_ONLY_BREAKOUT_PLAN_SOURCE = "paper_only_breakout_probe"
+LIVE_ANALYSIS_ONLY_BLOCKED_BY = "analysis_only_candidate"
+LIVE_ANALYSIS_ONLY_REASON_CODE = "BLOCK_LIVE_ANALYSIS_ONLY_CANDIDATE"
+_LIVE_BLOCKED_BREAKOUT_VALUES = {
+    "BREAKOUT_SMALL",
+    "BUY_BREAKOUT_SMALL",
+    "READY_AGRADE_FIRST",
+    "FINAL_PAPER_ONLY_BREAKOUT_PROBE",
+    "PAPER_ONLY_BREAKOUT_PROBE",
+}
+
+
+def _context_value(context: Dict[str, object], key: str) -> str:
+    value = context.get(key, "")
+    return str(value or "")
+
+
+def is_live_breakout_probe_context(context: Dict[str, object]) -> bool:
+    context = context or {}
+    trace = context.get("decision_trace", {})
+    if isinstance(trace, dict) and trace.get("paper_only_breakout_probe"):
+        return True
+    for key in ("entry_type", "reason_code", "momentum_reason_code", "final_reason_code"):
+        if _context_value(context, key).upper() in _LIVE_BLOCKED_BREAKOUT_VALUES:
+            return True
+    for key in ("plan_source", "entry_plan_reason", "reason"):
+        value = _context_value(context, key).lower()
+        if "breakout_probe" in value or "breakout_small" in value:
+            return True
+    return False
+
+
+def is_analysis_only_candidate_context(context: Dict[str, object]) -> bool:
+    context = context or {}
+    return (
+        _context_value(context, "condition_combo").upper() == "DANTE_ONLY"
+        or _context_value(context, "candidate_role").lower() == "analysis_only"
+    )
+
 
 @dataclass(frozen=True)
 class OrderRequest:
@@ -708,6 +749,28 @@ class OrderGuard:
                     risk_state=risk_state,
                     requested_amount=requested_amount,
                     blocked_by="final_entry_decision",
+                    time_decision=time_decision,
+                )
+            if mode == "live" and is_analysis_only_candidate_context(request.context):
+                return self._decision(
+                    allowed=False,
+                    mode=mode,
+                    reason=LIVE_ANALYSIS_ONLY_REASON_CODE,
+                    request=request,
+                    risk_state=risk_state,
+                    requested_amount=requested_amount,
+                    blocked_by=LIVE_ANALYSIS_ONLY_BLOCKED_BY,
+                    time_decision=time_decision,
+                )
+            if mode == "live" and is_live_breakout_probe_context(request.context):
+                return self._decision(
+                    allowed=False,
+                    mode=mode,
+                    reason=LIVE_BREAKOUT_BLOCK_REASON_CODE,
+                    request=request,
+                    risk_state=risk_state,
+                    requested_amount=requested_amount,
+                    blocked_by=LIVE_BREAKOUT_BLOCKED_BY,
                     time_decision=time_decision,
                 )
             if request.code in risk_state.open_positions:

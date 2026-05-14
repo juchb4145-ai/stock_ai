@@ -64,14 +64,16 @@ def _env_str(name: str, default: str) -> str:
 
 
 DEFAULT_CONDITION_FORMULA = """((A and B) or (C and D) or (E and F) or (G and H)) and I and J and N and O and T"""
-DEFAULT_ENTRY_STRATEGY_VERSION = "momentum_v2_selective_relief_v1"
+DEFAULT_ENTRY_STRATEGY_VERSION = "quant_first_pullback_v1"
 
 
 @dataclass(frozen=True)
 class TradeConfig:
     strategy_name: str = "퀀트조건식"
+    primary_condition_name: str = "단테떡상이_수정"
+    bonus_condition_name: str = "단테떡상이"
     condition_name: str = "단테떡상이_수정"
-    legacy_condition_name: str = "단테떡상이_수정"
+    legacy_condition_name: str = "단테떡상이"
     condition_formula: str = DEFAULT_CONDITION_FORMULA
     condition_formula_version: str = "quant_condition_formula_v2"
     signal_source: str = "HTS_CONDITION_SEARCH"
@@ -127,6 +129,16 @@ class TradeConfig:
     strong_trade_strength_min_volume_ratio: float = 0.3
     require_turnover_speed: bool = True
     min_turnover_speed_per_min: float = 50_000_000.0
+    leader_score_enabled: bool = True
+    min_leader_score: float = 60.0
+    opening_min_leader_score: float = 70.0
+    post_opening_min_leader_score: float = 60.0
+    opening_leader_start: str = "09:03:00"
+    opening_leader_end: str = "09:30:00"
+    leader_score_turnover_speed_full: float = 200_000_000.0
+    leader_score_trade_value_full: float = 500_000_000.0
+    leader_score_volume_ratio_full: float = 2.0
+    leader_score_chejan_full: float = 200.0
     reject_missing_market_data: bool = True
     max_chase_distance_pct: float = 0.04
     max_chase_risk_score: float = 60.0
@@ -149,8 +161,8 @@ class TradeConfig:
     min_pullback_after_signal_pct: float = 0.003
     high_distance_lookback_bars: int = 5
     exclude_current_bar_from_high_distance: bool = True
-    allow_breakout_probe_entry: bool = True
-    breakout_probe_entry_ratio: float = 0.25
+    allow_breakout_probe_entry: bool = False
+    breakout_probe_entry_ratio: float = 0.0
     legacy_filter_enabled: bool = True
     legacy_filter_veto_breakout_small: bool = False
 
@@ -228,11 +240,21 @@ class TradeConfig:
 
     @classmethod
     def from_env(cls) -> "TradeConfig":
+        primary_condition_name = os.environ.get(
+            "KIWOOM_PRIMARY_CONDITION_NAME",
+            os.environ.get("KIWOOM_CONDITION_NAME", cls.primary_condition_name),
+        )
+        bonus_condition_name = os.environ.get(
+            "KIWOOM_BONUS_CONDITION_NAME",
+            os.environ.get("KIWOOM_LEGACY_CONDITION_NAME", cls.bonus_condition_name),
+        )
         return cls(
             strategy_name=os.environ.get("KIWOOM_STRATEGY_NAME", cls.strategy_name),
-            condition_name=os.environ.get("KIWOOM_CONDITION_NAME", cls.condition_name),
+            primary_condition_name=primary_condition_name,
+            bonus_condition_name=bonus_condition_name,
+            condition_name=os.environ.get("KIWOOM_CONDITION_NAME", primary_condition_name),
             legacy_condition_name=os.environ.get(
-                "KIWOOM_LEGACY_CONDITION_NAME", cls.legacy_condition_name
+                "KIWOOM_LEGACY_CONDITION_NAME", bonus_condition_name
             ),
             condition_formula=os.environ.get(
                 "KIWOOM_CONDITION_FORMULA", cls.condition_formula
@@ -438,6 +460,46 @@ class TradeConfig:
             min_turnover_speed_per_min=_env_float(
                 "KIWOOM_MIN_TURNOVER_SPEED_PER_MIN",
                 cls.min_turnover_speed_per_min,
+            ),
+            leader_score_enabled=_env_bool(
+                "KIWOOM_LEADER_SCORE_ENABLED",
+                cls.leader_score_enabled,
+            ),
+            min_leader_score=_env_float(
+                "KIWOOM_MIN_LEADER_SCORE",
+                cls.min_leader_score,
+            ),
+            opening_min_leader_score=_env_float(
+                "KIWOOM_OPENING_MIN_LEADER_SCORE",
+                cls.opening_min_leader_score,
+            ),
+            post_opening_min_leader_score=_env_float(
+                "KIWOOM_POST_OPENING_MIN_LEADER_SCORE",
+                cls.post_opening_min_leader_score,
+            ),
+            opening_leader_start=os.environ.get(
+                "KIWOOM_OPENING_LEADER_START",
+                cls.opening_leader_start,
+            ),
+            opening_leader_end=os.environ.get(
+                "KIWOOM_OPENING_LEADER_END",
+                cls.opening_leader_end,
+            ),
+            leader_score_turnover_speed_full=_env_float(
+                "KIWOOM_LEADER_SCORE_TURNOVER_SPEED_FULL",
+                cls.leader_score_turnover_speed_full,
+            ),
+            leader_score_trade_value_full=_env_float(
+                "KIWOOM_LEADER_SCORE_TRADE_VALUE_FULL",
+                cls.leader_score_trade_value_full,
+            ),
+            leader_score_volume_ratio_full=_env_float(
+                "KIWOOM_LEADER_SCORE_VOLUME_RATIO_FULL",
+                cls.leader_score_volume_ratio_full,
+            ),
+            leader_score_chejan_full=_env_float(
+                "KIWOOM_LEADER_SCORE_CHEJAN_FULL",
+                cls.leader_score_chejan_full,
             ),
             reject_missing_market_data=_env_bool(
                 "KIWOOM_REJECT_MISSING_MARKET_DATA",

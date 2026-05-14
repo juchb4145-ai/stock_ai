@@ -5,7 +5,11 @@ import types
 import unittest
 from unittest import mock
 
-from final_entry_decision import build_final_entry_decision
+from final_entry_decision import (
+    FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+    LIVE_BREAKOUT_BLOCK_REASON_CODE,
+    build_final_entry_decision,
+)
 from momentum_breakout_strategy import EntryDecision, MomentumDecision
 from quant_condition_strategy import QuantEntryDecision
 
@@ -56,6 +60,8 @@ def _final_from(momentum: MomentumDecision, legacy: QuantEntryDecision):
         legacy_reason=legacy.reason,
         strategy_version="test_strategy",
         legacy_filter_enabled=True,
+        entry_type=momentum.entry_type,
+        position_size_multiplier=momentum.position_size_multiplier,
     )
 
 
@@ -121,9 +127,10 @@ class FinalEntryDecisionTests(unittest.TestCase):
         momentum = MomentumDecision(
             EntryDecision.BUY,
             "pullback confirmed",
-            "BUY_PULLBACK_CONFIRMED",
+            "BUY_PULLBACK_RECLAIM",
             chase_risk_score=10.0,
             entry_ratio=1.0,
+            entry_type="PULLBACK_RECLAIM",
         )
         final = _final_from(momentum, _legacy("ready"))
 
@@ -131,6 +138,49 @@ class FinalEntryDecisionTests(unittest.TestCase):
         self.assertEqual(final.reason_code, "FINAL_BUY_READY")
         self.assertEqual(final.decision_trace["momentum_decision"]["action"], "BUY")
         self.assertEqual(final.decision_trace["legacy_decision"]["status"], "ready")
+        self.assertFalse(final.decision_trace["paper_only_breakout_probe"])
+
+    def test_breakout_small_legacy_veto_is_not_ignored(self):
+        final = build_final_entry_decision(
+            momentum_action="BUY",
+            momentum_reason_code="BUY_BREAKOUT_SMALL",
+            momentum_reason="breakout probe",
+            momentum_chase_risk_score=12.0,
+            legacy_status="blocked",
+            legacy_reason_code="LEGACY_BLOCK_PULLBACK",
+            legacy_reason="pullback not ready",
+            strategy_version="test_strategy",
+            legacy_filter_enabled=True,
+            entry_type="BREAKOUT_SMALL",
+            position_size_multiplier=0.25,
+            legacy_filter_veto_breakout_small=False,
+        )
+
+        self.assertFalse(final.allowed)
+        self.assertEqual(final.blocked_by, "legacy_veto")
+        self.assertFalse(final.legacy_veto_ignored)
+        self.assertTrue(final.decision_trace["paper_only_breakout_probe"])
+        self.assertTrue(final.decision_trace["breakout_probe_veto_ignore_removed"])
+
+    def test_breakout_small_ready_is_marked_paper_only(self):
+        final = build_final_entry_decision(
+            momentum_action="BUY",
+            momentum_reason_code="BUY_BREAKOUT_SMALL",
+            momentum_reason="breakout probe",
+            momentum_chase_risk_score=12.0,
+            legacy_status="ready",
+            legacy_reason_code="LEGACY_READY",
+            legacy_reason="legacy ready",
+            strategy_version="test_strategy",
+            legacy_filter_enabled=True,
+            entry_type="BREAKOUT_SMALL",
+            position_size_multiplier=0.25,
+        )
+
+        self.assertTrue(final.allowed)
+        self.assertEqual(final.reason_code, FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE)
+        self.assertEqual(final.decision_trace["live_block_reason_code"], LIVE_BREAKOUT_BLOCK_REASON_CODE)
+        self.assertTrue(final.decision_trace["blocked_live_breakout_probe"])
 
     def test_place_buy_order_blocks_missing_final_entry_approval(self):
         class Stub:

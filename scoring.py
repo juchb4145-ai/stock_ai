@@ -259,7 +259,13 @@ DANTE_ENTRY_FEATURE_NAMES = (
     "px_over_env13_pct",       # (현재가 / Envelope(13,2.5) 상단) - 1
     "px_over_bb55_pct",        # (현재가 / BB(55,2) 상단) - 1
     "five_min_closes_count",   # 5분봉 캐시 종가 개수(부족하면 추세필터 신뢰도 낮음)
+    "high_since_capture",      # 조건 편입 후 확인된 최고가(없으면 0)
+    "low_after_high",          # high_since_capture 형성 이후 최저가(없으면 0)
     "pullback_pct_from_high",  # (breakout_high - 현재가) / breakout_high (1차 후 갱신된 고점 대비)
+    "pullback_from_high_pct",  # quant 첫 눌림 판단용 고점 대비 눌림률(alias)
+    "rebound_from_low_pct",    # high 이후 저점 대비 반등률
+    "vwap_support_ok",         # VWAP 지지/재돌파 확인 여부
+    "first_pullback_ready",    # 첫 눌림 품질 조건 충족 여부
     "neg_bars_streak",         # 진행봉 직전부터 연속된 1분 음봉 개수
     "cur_bar_is_positive",     # 진행봉이 양봉이면 1, 아니면 0
     # === 단테 등급/가짜돌파/과열 보강(이 헤더는 학습 코드와의 단일 source of truth) ===
@@ -280,6 +286,21 @@ DANTE_ENTRY_FEATURE_NAMES = (
     "rsi_overbought_80",       # rsi_14 >= 80 이면 1. 추격 과열 후보.
     "rsi_oversold_30",         # rsi_14 <= 30 이면 1. 낙폭 과대 후보.
     "rsi_rebound_from_50",     # rsi_14 가 50선을 회복하면 1.
+)
+
+DANTE_ENTRY_FEATURE_NAMES = DANTE_ENTRY_FEATURE_NAMES + tuple(
+    field
+    for field in (
+        "vwap_support_ok",
+        "leader_score",
+        "turnover_speed_per_min",
+        "volume_ratio_1m",
+        "volume_ratio_5m",
+        "trade_value_since_capture",
+        "turnover_rank_market",
+        "turnover_rank_sector",
+    )
+    if field not in DANTE_ENTRY_FEATURE_NAMES
 )
 
 
@@ -327,6 +348,13 @@ def build_dante_entry_features(
     atr_5m_pct: float = 0.0,
     intraday_vwap: float = 0.0,
     pullback_low_after_high: int = 0,
+    leader_score: float = 0.0,
+    turnover_speed_per_min: float = 0.0,
+    volume_ratio_1m: float = 0.0,
+    volume_ratio_5m: float = 0.0,
+    trade_value_since_capture: float = 0.0,
+    turnover_rank_market: int = 0,
+    turnover_rank_sector: int = 0,
 ) -> Dict[str, float]:
     """단테 학습 트랙용 단일 샘플 피처를 만든다.
 
@@ -349,6 +377,11 @@ def build_dante_entry_features(
         pullback_pct = (breakout_high - current_price) / breakout_high
     else:
         pullback_pct = 0.0
+    rebound_from_low_pct = (
+        current_price / pullback_low_after_high - 1
+        if current_price > 0 and pullback_low_after_high and pullback_low_after_high > 0
+        else 0.0
+    )
 
     neg_streak = 0
     cur_positive = 0
@@ -407,6 +440,16 @@ def build_dante_entry_features(
             pullback_below_vwap = 0.0
     else:
         pullback_below_vwap = 0.0
+    vwap_support_ok = 1.0 if not intraday_vwap or intraday_vwap <= 0 or current_price >= intraday_vwap else 0.0
+    first_pullback_ready = (
+        1.0
+        if breakout_high > 0
+        and pullback_low_after_high > 0
+        and pullback_pct >= 0.0
+        and rebound_from_low_pct > 0.0
+        and vwap_support_ok > 0.0
+        else 0.0
+    )
 
     return {
         "chejan_strength": float(chejan_strength or 0.0),
@@ -416,7 +459,20 @@ def build_dante_entry_features(
         "px_over_env13_pct": float(px_over_env13),
         "px_over_bb55_pct": float(px_over_bb55),
         "five_min_closes_count": float(int(five_min_closes_count or 0)),
+        "high_since_capture": float(int(breakout_high or 0)),
+        "low_after_high": float(int(pullback_low_after_high or 0)),
         "pullback_pct_from_high": float(pullback_pct),
+        "pullback_from_high_pct": float(pullback_pct),
+        "rebound_from_low_pct": float(rebound_from_low_pct),
+        "vwap_support_ok": float(vwap_support_ok),
+        "first_pullback_ready": float(first_pullback_ready),
+        "leader_score": float(max(0.0, min(100.0, leader_score or 0.0))),
+        "turnover_speed_per_min": float(max(0.0, turnover_speed_per_min or 0.0)),
+        "volume_ratio_1m": float(max(0.0, volume_ratio_1m or 0.0)),
+        "volume_ratio_5m": float(max(0.0, volume_ratio_5m or 0.0)),
+        "trade_value_since_capture": float(max(0.0, trade_value_since_capture or 0.0)),
+        "turnover_rank_market": float(max(0, int(turnover_rank_market or 0))),
+        "turnover_rank_sector": float(max(0, int(turnover_rank_sector or 0))),
         "neg_bars_streak": float(neg_streak),
         "cur_bar_is_positive": float(cur_positive),
         "breakout_grade_a": grade_a_flag,

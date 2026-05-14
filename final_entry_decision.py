@@ -4,8 +4,22 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
-FINAL_ENTRY_STRATEGY_VERSION = "momentum_v2_selective_relief_v1"
+FINAL_ENTRY_STRATEGY_VERSION = "quant_first_pullback_v1"
 ENTRY_TYPE_BREAKOUT_SMALL = "BREAKOUT_SMALL"
+MOMENTUM_REASON_BUY_BREAKOUT_SMALL = "BUY_BREAKOUT_SMALL"
+FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE = "FINAL_PAPER_ONLY_BREAKOUT_PROBE"
+LIVE_BREAKOUT_BLOCK_REASON_CODE = "BLOCK_LIVE_BREAKOUT_SMALL"
+LIVE_BREAKOUT_BLOCKED_BY = "live_breakout_probe_disabled"
+PAPER_ONLY_BREAKOUT_PLAN_SOURCE = "paper_only_breakout_probe"
+
+
+def is_breakout_probe_entry(*, entry_type: str = "", reason_code: str = "") -> bool:
+    entry_type_norm = str(entry_type or "").upper()
+    reason_norm = str(reason_code or "").upper()
+    return entry_type_norm == ENTRY_TYPE_BREAKOUT_SMALL or reason_norm in {
+        ENTRY_TYPE_BREAKOUT_SMALL,
+        MOMENTUM_REASON_BUY_BREAKOUT_SMALL,
+    }
 
 
 @dataclass(frozen=True)
@@ -52,11 +66,21 @@ def build_final_entry_decision(
     entry_type = str(entry_type or "")
     position_size_multiplier = float(position_size_multiplier or 0.0)
 
+    is_breakout_probe = is_breakout_probe_entry(
+        entry_type=entry_type,
+        reason_code=momentum_reason_code,
+    )
     trace: Dict[str, Any] = {
         "strategy_version": strategy_version,
         "legacy_filter_enabled": bool(legacy_filter_enabled),
         "entry_type": entry_type,
         "position_size_multiplier": position_size_multiplier,
+        "paper_only_breakout_probe": bool(is_breakout_probe),
+        "blocked_live_breakout_probe": bool(is_breakout_probe),
+        "live_block_reason_code": LIVE_BREAKOUT_BLOCK_REASON_CODE
+        if is_breakout_probe
+        else "",
+        "live_blocked_by": LIVE_BREAKOUT_BLOCKED_BY if is_breakout_probe else "",
         "momentum_decision": {
             "action": momentum_action,
             "reason_code": momentum_reason_code,
@@ -98,22 +122,20 @@ def build_final_entry_decision(
         )
 
     legacy_veto_applied = bool(legacy_filter_enabled and legacy_status != "ready")
-    legacy_veto_ignored = bool(
-        legacy_veto_applied
-        and entry_type == ENTRY_TYPE_BREAKOUT_SMALL
-        and not legacy_filter_veto_breakout_small
-    )
+    legacy_veto_ignored = False
+    if legacy_veto_applied and is_breakout_probe and not legacy_filter_veto_breakout_small:
+        trace["breakout_probe_veto_ignore_removed"] = True
     trace["legacy_veto_applied"] = legacy_veto_applied
     trace["legacy_veto_ignored"] = legacy_veto_ignored
 
-    if legacy_veto_applied and not legacy_veto_ignored:
+    if legacy_veto_applied:
         status = "blocked" if legacy_status == "blocked" else "wait"
         reason_code = "FINAL_LEGACY_VETO_{}".format(legacy_reason_code or legacy_status or "NOT_READY")
         return FinalEntryDecision(
             allowed=False,
             status=status,
             reason_code=reason_code,
-            final_reason="Legacy/Dante veto: {} {}".format(
+            final_reason="Pullback/strength filter veto: {} {}".format(
                 legacy_status or "not_ready",
                 legacy_reason or legacy_reason_code,
             ).strip(),
@@ -130,15 +152,33 @@ def build_final_entry_decision(
             decision_trace=trace,
         )
 
+    if is_breakout_probe:
+        return FinalEntryDecision(
+            allowed=True,
+            status="ready",
+            reason_code=FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+            final_reason=(
+                "Momentum breakout probe is paper-only; live orders are blocked"
+            ),
+            strategy_version=strategy_version,
+            legacy_filter_enabled=bool(legacy_filter_enabled),
+            momentum_decision=momentum_action,
+            momentum_reason_code=momentum_reason_code,
+            legacy_decision=legacy_status or "ready",
+            legacy_reason_code=legacy_reason_code,
+            blocked_by="",
+            entry_type=entry_type,
+            position_size_multiplier=position_size_multiplier,
+            legacy_veto_applied=legacy_veto_applied,
+            legacy_veto_ignored=False,
+            decision_trace=trace,
+        )
+
     return FinalEntryDecision(
         allowed=True,
         status="ready",
         reason_code="FINAL_BUY_READY",
-        final_reason=(
-            "Momentum BUY; legacy/Dante veto ignored for BREAKOUT_SMALL"
-            if legacy_veto_ignored
-            else "Momentum BUY and legacy/Dante veto filters passed"
-        ),
+        final_reason="Momentum BUY and pullback/strength filters passed",
         strategy_version=strategy_version,
         legacy_filter_enabled=bool(legacy_filter_enabled),
         momentum_decision=momentum_action,

@@ -428,6 +428,29 @@ CLI 출력 파일명은 mode suffix를 사용합니다.
 | `hold_seconds`, `profit_rate`, `message` | 보유시간/손익률/메시지 |
 | `market_regime`, `market_gate_action`, `market_gate_reason` | 시장 상태 메타 |
 
+#### 조건식 조합 메타
+
+`trade_log.csv`, `condition_captures.csv`, `dante_entry_training.csv`, `dante_shadow_training.csv`는 같은 조건식 조합 필드를 공유한다.
+
+| 필드 | 의미 |
+|---|---|
+| `primary_condition_name` | 퀀트조건식 이름. 기본값 `단테떡상이_수정` |
+| `bonus_condition_name` | 단테조건식 이름. 기본값 `단테떡상이` |
+| `quant_detected` | 퀀트조건식 편입 여부 |
+| `dante_detected` | 단테조건식 편입 여부 |
+| `condition_combo` | `QUANT_ONLY`, `QUANT_AND_DANTE`, `DANTE_ONLY`, 누락 시 `UNKNOWN` |
+| `condition_score_bonus` | 단테조건식 동시 만족 시 강도 가점 |
+| `first_condition_name`, `last_condition_name` | 처음/마지막으로 편입된 조건식 |
+| `first_condition_detected_at`, `bonus_condition_detected_at` | 조건식 편입 시각 |
+| `time_between_conditions_sec` | 두 조건식 편입 간격 |
+
+`daily_review_YYYY-MM-DD.md`의 **조건식 조합별 성과** 표는 다음 질문을 답하기 위한 표다.
+
+- `QUANT_ONLY`가 양수 기대값이면 퀀트조건식만으로도 후보 품질이 충분한지 본다.
+- `QUANT_AND_DANTE`의 승률/평균 R이 `QUANT_ONLY`보다 높으면 단테조건식은 매수 신호가 아니라 강도 가점으로 유효하다.
+- `DANTE_ONLY`는 live 매수 금지, analysis/shadow 전용이다. trade_review에 `dante_only_buy_warning=true`가 보이면 주문 차단 경로를 즉시 점검한다.
+- `disable_breakout_probe_live` 후보가 나오면 `BREAKOUT_SMALL` 계열이 `BUY_PULLBACK_RECLAIM`보다 부진하다는 뜻이므로 돌파 소량 live 차단을 유지한다.
+
 mode별 해석:
 
 | mode | 매매 판단 기준 |
@@ -861,3 +884,22 @@ missing 값은 0으로 채우지 말고 CSV 빈 셀, JSON null, Markdown missing
 paper와 live는 반드시 분리 분석하고,
 매매하지 않은 조건 포착 종목도 반드시 리포트에 포함하세요.
 ```
+## Condition Combo And Leader Score
+
+Daily review separates the candidate source and the turnover-leader quality.
+
+| group | interpretation | operating question |
+|---|---|---|
+| `QUANT_ONLY` | `단테떡상이_수정` only | Is the primary quant condition good enough by itself? |
+| `QUANT_AND_DANTE` | primary quant condition, then `단테떡상이` bonus strength | Does the Dante strength bonus improve win rate or average R? |
+| `DANTE_ONLY` | `단테떡상이` only, analysis/shadow only | Should this remain blocked from live buy? |
+| `leader_score >= 80` | strong turnover leader | Are early turnover leaders producing better pullback entries? |
+| `60 <= leader_score < 80` | usable but weaker leader | Does this bucket need stricter VWAP/strength filters? |
+| `leader_score < 60` | weak leader | Should live entries keep waiting or block? |
+
+Use the condition_combo summary together with the leader_score bucket table to answer:
+
+- 퀀트조건식만으로도 충분한가?
+- 단테조건식이 붙은 후보의 승률이 더 좋은가?
+- 단테조건식 단독 후보는 매수 금지로 유지해야 하는가?
+- 첫 눌림 진입이 돌파 소량 진입보다 나은가?

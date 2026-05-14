@@ -57,6 +57,12 @@ def _ctx(**overrides):
         "spread_rate": 0.001,
         "volume_ratio": 1.5,
         "turnover_speed_per_min": 80_000_000,
+        "trade_value_since_capture": 400_000_000,
+        "volume_ratio_1m": 1.5,
+        "volume_ratio_5m": 1.5,
+        "turnover_rank_market": 1,
+        "turnover_rank_sector": 0,
+        "leader_score": 85.0,
         "intraday_vwap": 9_800,
         "minute_bars": _bars(),
         "prior_high": 10_080,
@@ -100,6 +106,23 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
 
         self.assertEqual(decision.action, EntryDecision.WAIT_PULLBACK)
 
+    def test_default_config_does_not_buy_breakout_probe_at_capture_or_above(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig())
+
+        decision = strategy.evaluate(
+            _ctx(
+                current_price=10_010,
+                high_since_capture=10_010,
+                intraday_vwap=9_980,
+                short_ma=9_990,
+                recent_low_to_current_pct=0.0,
+            )
+        )
+
+        self.assertNotEqual(decision.reason_code, "BUY_BREAKOUT_SMALL")
+        self.assertNotEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "WAIT_PULLBACK")
+
     def test_blocks_chase_when_too_far_from_capture(self):
         strategy = MomentumBreakoutStrategy(TradeConfig(max_chase_distance_pct=0.03))
 
@@ -139,6 +162,26 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
 
         self.assertEqual(decision.action, EntryDecision.WAIT_DATA)
         self.assertEqual(decision.reason_code, "MISSING_TURNOVER_SPEED")
+
+    def test_waits_when_leader_score_is_too_weak(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(opening_min_leader_score=70.0, candidate_expiry_seconds=10_000_000_000)
+        )
+
+        decision = strategy.evaluate(_ctx(leader_score=40.0, now_ts=_ts("09:10:00")))
+
+        self.assertEqual(decision.action, EntryDecision.WAIT_PULLBACK)
+        self.assertEqual(decision.reason_code, "WAIT_LEADER_SCORE")
+
+    def test_blocks_weak_leader_after_opening_phase(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(post_opening_min_leader_score=60.0, candidate_expiry_seconds=10_000_000_000)
+        )
+
+        decision = strategy.evaluate(_ctx(leader_score=40.0, now_ts=_ts("09:45:00")))
+
+        self.assertEqual(decision.action, EntryDecision.BLOCK_CHASE)
+        self.assertEqual(decision.reason_code, "BLOCK_WEAK_LEADER")
 
     def test_missing_vwap_forbids_buy(self):
         strategy = MomentumBreakoutStrategy(TradeConfig(require_vwap_filter=True))

@@ -49,6 +49,12 @@ class MomentumContext:
     spread_rate: Optional[float] = None
     volume_ratio: Optional[float] = None
     turnover_speed_per_min: Optional[float] = None
+    trade_value_since_capture: int = 0
+    volume_ratio_1m: Optional[float] = None
+    volume_ratio_5m: Optional[float] = None
+    turnover_rank_market: int = 0
+    turnover_rank_sector: int = 0
+    leader_score: float = 0.0
     intraday_vwap: Optional[float] = None
     minute_bars: Sequence[MinuteBar] = ()
     prior_high: Optional[int] = None
@@ -57,6 +63,10 @@ class MomentumContext:
     realtime_day_high: int = 0
     rolling_high_since_capture: int = 0
     high_since_capture: int = 0
+    low_after_high: int = 0
+    pullback_from_high_pct: float = 0.0
+    rebound_from_low_pct: float = 0.0
+    one_min_reversal: Optional[bool] = None
     upper_wick_ratio: Optional[float] = None
     signal_candle_range_pct: Optional[float] = None
     position_in_signal_candle_pct: Optional[float] = None
@@ -186,6 +196,10 @@ class MomentumBreakoutStrategy:
         if data_decision is not None:
             return data_decision
 
+        leader_decision = self._leader_score_decision(ctx, metrics)
+        if leader_decision is not None:
+            return leader_decision
+
         spread_rate = float(ctx.spread_rate or 0.0)
         volume_ratio = float(ctx.volume_ratio or 0.0)
         turnover_speed = float(ctx.turnover_speed_per_min or 0.0)
@@ -265,9 +279,12 @@ class MomentumBreakoutStrategy:
 
         pullback_pct = metrics["pullback_pct"]
         if self._breakout_small_ready(ctx, metrics, bullish_reversal):
+            probe_metrics = dict(metrics)
+            probe_metrics["paper_only_breakout_probe"] = 1.0
+            probe_metrics["orderable_live"] = 0.0
             ratio = self._entry_size_multiplier(
                 metrics,
-                float(getattr(self.config, "breakout_probe_entry_ratio", 0.25) or 0.25),
+                self._breakout_probe_entry_ratio(),
             )
             return MomentumDecision(
                 EntryDecision.BUY,
@@ -275,11 +292,11 @@ class MomentumBreakoutStrategy:
                     ctx.chejan_strength, volume_ratio
                 ),
                 "BUY_BREAKOUT_SMALL",
-                chase_risk_score=metrics["chase_risk_score"],
+                chase_risk_score=probe_metrics["chase_risk_score"],
                 entry_ratio=ratio,
                 entry_type=ENTRY_TYPE_BREAKOUT_SMALL,
                 position_size_multiplier=ratio,
-                metrics=metrics,
+                metrics=probe_metrics,
             )
 
         effective_pullback_pct = float(metrics.get("effective_pullback_entry_pct", self.config.pullback_entry_pct))
@@ -324,23 +341,24 @@ class MomentumBreakoutStrategy:
             and bullish_reversal
             and metrics["chase_risk_score"] <= self.config.max_chase_risk_score * 0.7
         ):
+            probe_metrics = dict(metrics)
+            probe_metrics["paper_only_breakout_probe"] = 1.0
+            probe_metrics["orderable_live"] = 0.0
+            ratio = self._entry_size_multiplier(
+                probe_metrics,
+                self._breakout_probe_entry_ratio(),
+            )
             return MomentumDecision(
                 EntryDecision.BUY,
                 "breakout continuation probe strength={:.1f} volume_ratio={:.2f}".format(
                     ctx.chejan_strength, volume_ratio
                 ),
                 "BUY_BREAKOUT_SMALL",
-                chase_risk_score=metrics["chase_risk_score"],
-                entry_ratio=self._entry_size_multiplier(
-                    metrics,
-                    self.config.breakout_probe_entry_ratio,
-                ),
+                chase_risk_score=probe_metrics["chase_risk_score"],
+                entry_ratio=ratio,
                 entry_type=ENTRY_TYPE_BREAKOUT_SMALL,
-                position_size_multiplier=self._entry_size_multiplier(
-                    metrics,
-                    self.config.breakout_probe_entry_ratio,
-                ),
-                metrics=metrics,
+                position_size_multiplier=ratio,
+                metrics=probe_metrics,
             )
 
         return MomentumDecision(
@@ -816,6 +834,16 @@ class MomentumBreakoutStrategy:
             if not self._missing_number(ctx.volume_ratio)
             else 0.0
         )
+        volume_ratio_1m = (
+            float(ctx.volume_ratio_1m)
+            if not self._missing_number(ctx.volume_ratio_1m)
+            else 0.0
+        )
+        volume_ratio_5m = (
+            float(ctx.volume_ratio_5m)
+            if not self._missing_number(ctx.volume_ratio_5m)
+            else volume_ratio
+        )
         turnover_speed = (
             float(ctx.turnover_speed_per_min)
             if not self._missing_number(ctx.turnover_speed_per_min)
@@ -856,8 +884,21 @@ class MomentumBreakoutStrategy:
         if prior_high_source not in {"candle"}:
             risk += 8.0 if prior_high_source in {"rolling_since_capture", "realtime_day_high"} else 14.0
 
+        condition_meta = c.meta or {}
+        condition_score_bonus = float(condition_meta.get("condition_score_bonus", 0.0) or 0.0)
         return {
             "age_seconds": age,
+            "primary_condition_name": condition_meta.get("primary_condition_name", ""),
+            "bonus_condition_name": condition_meta.get("bonus_condition_name", ""),
+            "quant_detected": 1.0 if bool(condition_meta.get("quant_detected", False)) else 0.0,
+            "dante_detected": 1.0 if bool(condition_meta.get("dante_detected", False)) else 0.0,
+            "condition_combo": condition_meta.get("condition_combo", ""),
+            "condition_score_bonus": condition_score_bonus,
+            "first_condition_name": condition_meta.get("first_condition_name", ""),
+            "last_condition_name": condition_meta.get("last_condition_name", ""),
+            "first_condition_detected_at": condition_meta.get("first_condition_detected_at", ""),
+            "bonus_condition_detected_at": condition_meta.get("bonus_condition_detected_at", ""),
+            "time_between_conditions_sec": condition_meta.get("time_between_conditions_sec", ""),
             "pullback_pct": pullback_pct,
             "chase_distance_pct": max(capture_chase_pct, prior_high_chase_pct),
             "capture_chase_pct": capture_chase_pct,
@@ -867,7 +908,13 @@ class MomentumBreakoutStrategy:
             "prior_low": float(prior_low),
             "spread_rate": spread_rate,
             "volume_ratio": volume_ratio,
+            "volume_ratio_1m": volume_ratio_1m,
+            "volume_ratio_5m": volume_ratio_5m,
             "turnover_speed_per_min": turnover_speed,
+            "trade_value_since_capture": float(ctx.trade_value_since_capture or 0),
+            "turnover_rank_market": float(ctx.turnover_rank_market or 0),
+            "turnover_rank_sector": float(ctx.turnover_rank_sector or 0),
+            "leader_score": float(ctx.leader_score or 0.0),
             "is_above_vwap": is_above_vwap,
             "upper_wick_ratio": upper_wick_ratio,
             "signal_candle_range_pct": signal_candle_range_pct,
@@ -883,6 +930,83 @@ class MomentumBreakoutStrategy:
             "short_reclaim_high": float(ctx.short_reclaim_high or 0),
             "prior_high_fallback_used": 0.0 if prior_high_source == "candle" else 1.0,
         }
+
+    @staticmethod
+    def _hhmmss_value(value: str, default: int) -> int:
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        if not digits:
+            return default
+        try:
+            return int(digits[:6].ljust(6, "0"))
+        except ValueError:
+            return default
+
+    def _leader_phase(self, now_ts: float) -> str:
+        local = time.localtime(now_ts or time.time())
+        hhmmss = local.tm_hour * 10000 + local.tm_min * 100 + local.tm_sec
+        start = self._hhmmss_value(getattr(self.config, "opening_leader_start", ""), 90300)
+        end = self._hhmmss_value(getattr(self.config, "opening_leader_end", ""), 93000)
+        return "opening" if start <= hhmmss <= end else "post_opening"
+
+    def _leader_score_threshold(self, now_ts: float) -> float:
+        phase = self._leader_phase(now_ts)
+        if phase == "opening":
+            return float(
+                getattr(
+                    self.config,
+                    "opening_min_leader_score",
+                    getattr(self.config, "min_leader_score", 60.0),
+                )
+                or 0.0
+            )
+        return float(
+            getattr(
+                self.config,
+                "post_opening_min_leader_score",
+                getattr(self.config, "min_leader_score", 60.0),
+            )
+            or 0.0
+        )
+
+    def _leader_score_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+    ) -> Optional[MomentumDecision]:
+        if not bool(getattr(self.config, "leader_score_enabled", True)):
+            return None
+        phase = self._leader_phase(ctx.now_ts or time.time())
+        threshold = self._leader_score_threshold(ctx.now_ts or time.time())
+        score = float(ctx.leader_score or metrics.get("leader_score", 0.0) or 0.0)
+        metrics["leader_score_phase"] = phase
+        metrics["leader_score_min"] = threshold
+        if threshold <= 0:
+            return None
+        if score <= 0:
+            return MomentumDecision(
+                EntryDecision.WAIT_DATA,
+                "leader score missing",
+                "WAIT_LEADER_SCORE",
+                chase_risk_score=metrics.get("chase_risk_score", 0.0),
+                metrics=metrics,
+            )
+        if score < threshold:
+            if phase == "opening":
+                action = EntryDecision.WAIT_PULLBACK
+                reason_code = "WAIT_LEADER_SCORE"
+                reason = "leader score wait {:.1f} < {:.1f}".format(score, threshold)
+            else:
+                action = EntryDecision.BLOCK_CHASE
+                reason_code = "BLOCK_WEAK_LEADER"
+                reason = "leader score weak {:.1f} < {:.1f}".format(score, threshold)
+            return MomentumDecision(
+                action,
+                reason,
+                reason_code,
+                chase_risk_score=metrics.get("chase_risk_score", 0.0),
+                metrics=metrics,
+            )
+        return None
 
     @staticmethod
     def _wait_data(
@@ -989,6 +1113,9 @@ class MomentumBreakoutStrategy:
             return False
         return self._breakout_small_ready(ctx, metrics, self._bullish_reversal(ctx.minute_bars))
 
+    def _breakout_probe_entry_ratio(self) -> float:
+        return max(float(getattr(self.config, "breakout_probe_entry_ratio", 0.0) or 0.0), 0.0)
+
     def _breakout_small_ready(
         self,
         ctx: MomentumContext,
@@ -1030,6 +1157,19 @@ class MomentumBreakoutStrategy:
             "symbol_name": c.name,
             "candidate_id": getattr(c, "candidate_id", ""),
             "condition_name": c.condition_name,
+            "primary_condition_name": metrics.get("primary_condition_name"),
+            "bonus_condition_name": metrics.get("bonus_condition_name"),
+            "quant_detected": bool(metrics.get("quant_detected", 0.0)),
+            "dante_detected": bool(metrics.get("dante_detected", 0.0)),
+            "condition_combo": metrics.get("condition_combo"),
+            "condition_score_bonus": self._optional_number(metrics.get("condition_score_bonus")),
+            "first_condition_name": metrics.get("first_condition_name"),
+            "last_condition_name": metrics.get("last_condition_name"),
+            "first_condition_detected_at": metrics.get("first_condition_detected_at"),
+            "bonus_condition_detected_at": metrics.get("bonus_condition_detected_at"),
+            "time_between_conditions_sec": self._optional_number(
+                metrics.get("time_between_conditions_sec")
+            ),
             "strategy_name": self.config.strategy_name,
             "decision": decision.action.value,
             "reason_code": decision.reason_code.lower(),

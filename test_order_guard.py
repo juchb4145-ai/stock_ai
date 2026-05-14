@@ -2,7 +2,17 @@ import time
 import unittest
 from datetime import datetime
 
-from order_guard import GuardDecision, OrderGuard, OrderRequest, PaperPortfolio, RiskState
+from order_guard import (
+    LIVE_ANALYSIS_ONLY_BLOCKED_BY,
+    LIVE_ANALYSIS_ONLY_REASON_CODE,
+    LIVE_BREAKOUT_BLOCKED_BY,
+    LIVE_BREAKOUT_BLOCK_REASON_CODE,
+    GuardDecision,
+    OrderGuard,
+    OrderRequest,
+    PaperPortfolio,
+    RiskState,
+)
 from time_policy import load_timezone
 from trade_config import TradeConfig
 
@@ -138,6 +148,117 @@ class OrderGuardTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertTrue(decision.live)
         self.assertGreater(decision.throttle_seconds, 0)
+
+    def test_live_blocks_breakout_small_even_when_final_entry_allowed(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+            allow_breakout_probe_entry=False,
+        )
+        guard = OrderGuard(config)
+        request = _buy_request()
+        request.context.update(
+            {
+                "reason_code": "BUY_BREAKOUT_SMALL",
+                "momentum_reason_code": "BUY_BREAKOUT_SMALL",
+                "entry_type": "BREAKOUT_SMALL",
+                "final_reason_code": "FINAL_PAPER_ONLY_BREAKOUT_PROBE",
+            }
+        )
+
+        decision = guard.validate(
+            request,
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+            ),
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertFalse(decision.live)
+        self.assertEqual(decision.reason, LIVE_BREAKOUT_BLOCK_REASON_CODE)
+        self.assertEqual(decision.blocked_by, LIVE_BREAKOUT_BLOCKED_BY)
+
+    def test_dry_run_keeps_breakout_probe_for_analysis(self):
+        config = TradeConfig(dry_run=True, paper_portfolio_enabled=True)
+        paper = PaperPortfolio(initial_cash=1_000_000)
+        guard = OrderGuard(config, paper)
+        request = _buy_request()
+        request.context.update(
+            {
+                "reason_code": "BUY_BREAKOUT_SMALL",
+                "momentum_reason_code": "BUY_BREAKOUT_SMALL",
+                "entry_type": "BREAKOUT_SMALL",
+            }
+        )
+
+        decision = guard.validate(request, now=ALLOWED_TS)
+
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.live)
+        self.assertTrue(decision.paper)
+
+    def test_live_allows_pullback_reclaim_when_other_gates_pass(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+        )
+        guard = OrderGuard(config)
+        request = _buy_request()
+        request.context.update(
+            {
+                "reason_code": "BUY_PULLBACK_RECLAIM",
+                "momentum_reason_code": "BUY_PULLBACK_RECLAIM",
+                "entry_type": "PULLBACK_RECLAIM",
+            }
+        )
+
+        decision = guard.validate(
+            request,
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+            ),
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertTrue(decision.live)
+
+    def test_live_blocks_dante_only_analysis_candidate(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+        )
+        guard = OrderGuard(config)
+        request = _buy_request()
+        request.context.update(
+            {
+                "condition_combo": "DANTE_ONLY",
+                "candidate_role": "analysis_only",
+                "reason_code": "BUY_PULLBACK_RECLAIM",
+            }
+        )
+
+        decision = guard.validate(
+            request,
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+            ),
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, LIVE_ANALYSIS_ONLY_REASON_CODE)
+        self.assertEqual(decision.blocked_by, LIVE_ANALYSIS_ONLY_BLOCKED_BY)
 
     def test_blocks_position_size_over_config_limit(self):
         config = TradeConfig(

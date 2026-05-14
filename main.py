@@ -16,7 +16,17 @@ import scoring
 import entry_strategy
 import exit_strategy
 from bars import FiveMinIndicatorCache, MinuteBarAggregator
-from candidate_registry import CandidateRegistry
+from candidate_registry import (
+    CONDITION_COMBO_DANTE_ONLY,
+    CONDITION_COMBO_META_FIELDS,
+    CONDITION_COMBO_QUANT_AND_DANTE,
+    CONDITION_COMBO_QUANT_ONLY,
+    CONDITION_SCORE_BONUS_VALUE,
+    LEADER_META_FIELDS,
+    CandidateRegistry,
+    calculate_leader_score,
+    candidate_leader_priority,
+)
 from condition_capture_logger import CONDITION_CAPTURE_CSV, ConditionCaptureLogger
 from final_entry_decision import (
     build_final_entry_decision,
@@ -28,7 +38,18 @@ from momentum_breakout_strategy import (
     MomentumBreakoutStrategy,
     MomentumContext,
 )
-from order_guard import GuardDecision, OrderGuard, OrderRequest, PaperPortfolio, RiskState
+from order_guard import (
+    LIVE_ANALYSIS_ONLY_BLOCKED_BY,
+    LIVE_ANALYSIS_ONLY_REASON_CODE,
+    LIVE_BREAKOUT_BLOCKED_BY,
+    LIVE_BREAKOUT_BLOCK_REASON_CODE,
+    PAPER_ONLY_BREAKOUT_PLAN_SOURCE,
+    GuardDecision,
+    OrderGuard,
+    OrderRequest,
+    PaperPortfolio,
+    RiskState,
+)
 from portfolio import LoadedPortfolioState, Position, PortfolioState
 from logging_setup import setup_logging
 from fid_codes import FID_CODES, FID_NAME_TO_CODE, get_fid
@@ -68,7 +89,10 @@ logger = setup_logging()
 # -1.5% 눌림 + 체결강도 100% 이상만 진입 트리거로 확인한다.
 CONDITION_NAME = TRADE_CONFIG.condition_name
 LEGACY_CONDITION_NAME = TRADE_CONFIG.legacy_condition_name
+PRIMARY_CONDITION_NAME = TRADE_CONFIG.primary_condition_name
+BONUS_CONDITION_NAME = TRADE_CONFIG.bonus_condition_name
 CONDITION_SCREEN_NO = "0150"
+BONUS_CONDITION_SCREEN_NO = "0151"
 REALTIME_SCREEN_NO = "0160"
 # KOSPI/KOSDAQ 업종지수 실시간용 별도 스크린(종목 실시간과 충돌 방지).
 INDEX_REALTIME_SCREEN_NO = "0170"
@@ -243,6 +267,26 @@ AI_SERVER_COOLDOWN_SECONDS = 30
 # 는 training_recorder.py 로 이전. 본 파일 상단 import 에서 re-export 한다.
 
 
+def _first_pullback_log_fields(prediction):
+    prediction = prediction or {}
+    return {
+        "high_since_capture": prediction.get("high_since_capture", ""),
+        "low_after_high": prediction.get("low_after_high", ""),
+        "pullback_from_high_pct": prediction.get("pullback_from_high_pct", ""),
+        "rebound_from_low_pct": prediction.get("rebound_from_low_pct", ""),
+        "intraday_vwap": prediction.get("intraday_vwap", ""),
+        "vwap_support_ok": prediction.get("vwap_support_ok", ""),
+        "first_pullback_ready": prediction.get("first_pullback_ready", ""),
+        "leader_score": prediction.get("leader_score", ""),
+        "trade_value_since_capture": prediction.get("trade_value_since_capture", ""),
+        "turnover_speed_per_min": prediction.get("turnover_speed_per_min", prediction.get("volume_speed", "")),
+        "volume_ratio_1m": prediction.get("volume_ratio_1m", ""),
+        "volume_ratio_5m": prediction.get("volume_ratio_5m", ""),
+        "turnover_rank_market": prediction.get("turnover_rank_market", ""),
+        "turnover_rank_sector": prediction.get("turnover_rank_sector", ""),
+    }
+
+
 class Kiwoom(TrainingRecorderMixin, QAxWidget):
     def __init__(self):
         super().__init__()
@@ -280,6 +324,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.candidate_registry = CandidateRegistry(
             signal_source=TRADE_CONFIG.signal_source,
             candidate_expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+            primary_condition_name=PRIMARY_CONDITION_NAME,
+            bonus_condition_name=BONUS_CONDITION_NAME,
         )
         self.quant_strategy = QuantConditionStrategy(QUANT_STRATEGY_CONFIG)
         self.time_policy = TimePolicy(TRADE_CONFIG)
@@ -912,7 +958,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
 
         return self.selected_condition
 
-    def start_realtime_condition(self, condition_name=CONDITION_NAME):
+    def start_realtime_condition(self, condition_name=CONDITION_NAME, screen_no=CONDITION_SCREEN_NO):
         selected = self.select_condition(condition_name)
         if selected is None:
             return False
@@ -921,16 +967,27 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.wait_for_tr_slot()
         result = self.dynamicCall(
             "SendCondition(QString, QString, int, int)",
-            CONDITION_SCREEN_NO,
+            screen_no,
             name,
             index,
             1,
         )
-        logger.info("실시간 조건검색 시작: %s(%s) 결과: %s", name, index, result)
+        logger.info("실시간 조건검색 시작: %s(%s) screen=%s 결과: %s", name, index, screen_no, result)
         if result == 1:
             self.condition_timer.start(CONDITION_PROCESS_INTERVAL_MS)
             return True
         return False
+
+    def start_realtime_conditions(self):
+        if not self.start_realtime_condition(PRIMARY_CONDITION_NAME, CONDITION_SCREEN_NO):
+            return False
+        if BONUS_CONDITION_NAME and BONUS_CONDITION_NAME != PRIMARY_CONDITION_NAME:
+            if not self.start_realtime_condition(BONUS_CONDITION_NAME, BONUS_CONDITION_SCREEN_NO):
+                logger.warning(
+                    "보조 조건검색을 시작하지 못했습니다: %s. primary 조건식 운용은 계속합니다.",
+                    BONUS_CONDITION_NAME,
+                )
+        return True
 
     def _market_bootstrap_delay_ms(self, next_allowed_time=""):
         delay_ms = MARKET_BOOTSTRAP_RETRY_INTERVAL_MS
@@ -990,10 +1047,52 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 — 조건검색 시작 전에 1회 등록.
         self.register_realtime_indices()
 
-        if not self.start_realtime_condition(CONDITION_NAME):
+        if not self.start_realtime_conditions():
             logger.error("실시간 조건검색을 시작하지 못했습니다. 조건식 설정을 확인해주세요.")
             return False
         return True
+
+    def _condition_event_meta(self, condition_name, detected_at):
+        registry = getattr(self, "candidate_registry", None)
+        if registry is None:
+            registry = CandidateRegistry(
+                signal_source=TRADE_CONFIG.signal_source,
+                candidate_expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+                primary_condition_name=PRIMARY_CONDITION_NAME,
+                bonus_condition_name=BONUS_CONDITION_NAME,
+            )
+            self.candidate_registry = registry
+        is_primary = registry.is_primary_condition(condition_name)
+        is_bonus = registry.is_bonus_condition(condition_name)
+        if is_primary and is_bonus:
+            combo = CONDITION_COMBO_QUANT_AND_DANTE
+        elif is_primary:
+            combo = CONDITION_COMBO_QUANT_ONLY
+        elif is_bonus:
+            combo = CONDITION_COMBO_DANTE_ONLY
+        else:
+            combo = ""
+        return {
+            "primary_condition_name": PRIMARY_CONDITION_NAME,
+            "bonus_condition_name": BONUS_CONDITION_NAME,
+            "quant_detected": bool(is_primary),
+            "dante_detected": bool(is_bonus),
+            "condition_combo": combo,
+            "condition_score_bonus": CONDITION_SCORE_BONUS_VALUE if is_bonus else 0.0,
+            "first_condition_name": condition_name,
+            "last_condition_name": condition_name,
+            "first_condition_detected_at": detected_at,
+            "bonus_condition_detected_at": detected_at if is_bonus else "",
+            "time_between_conditions_sec": 0.0,
+        }
+
+    def _condition_log_meta(self, candidate=None, fallback=None):
+        meta = dict(fallback or {})
+        if candidate is not None:
+            meta.update(getattr(candidate, "meta", {}) or {})
+        meta.setdefault("primary_condition_name", PRIMARY_CONDITION_NAME)
+        meta.setdefault("bonus_condition_name", BONUS_CONDITION_NAME)
+        return {field: meta.get(field, "") for field in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)}
 
     def register_condition_detected_stock(
         self,
@@ -1004,7 +1103,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         condition_index="",
         screen_no="",
     ):
-        """조건식 포착 직후 실시간 등록과 감시 큐 등록을 한 번에 수행한다."""
+        """조건식 포착 직후 역할에 맞춰 trading 후보 또는 analysis 후보로 분리한다."""
         code = self.normalize_code(code)
         if not code:
             return
@@ -1012,20 +1111,130 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         hts_condition_name = condition_name or CONDITION_NAME
         if not hasattr(self, "time_policy"):
             self.time_policy = TimePolicy(TRADE_CONFIG)
-        capture_decision = self.time_policy.evaluate_trading_candidate_capture(
-            min_observation_sec=getattr(TRADE_CONFIG, "min_candidate_age_seconds", 30),
-            log=True,
-            context={
-                "symbol": code,
-                "condition_name": hts_condition_name,
-                "condition_index": str(condition_index or ""),
-                "event_type": event_type,
-                "source": "condition_detected",
-            },
+        if not hasattr(self, "candidate_registry"):
+            self.candidate_registry = CandidateRegistry(
+                signal_source=TRADE_CONFIG.signal_source,
+                candidate_expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+                primary_condition_name=PRIMARY_CONDITION_NAME,
+                bonus_condition_name=BONUS_CONDITION_NAME,
+            )
+        registry = self.candidate_registry
+        existing_candidate = registry.get(code)
+        existing_quant = bool(
+            existing_candidate is not None
+            and not existing_candidate.is_expired(
+                now=detected_at,
+                expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+            )
+            and (existing_candidate.meta or {}).get("quant_detected", False)
         )
-        if not capture_decision.allowed:
-            code_name = self.get_code_name(code)
-            detected_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detected_at))
+        is_primary_condition = registry.is_primary_condition(hts_condition_name)
+        is_bonus_condition = registry.is_bonus_condition(hts_condition_name)
+        is_bonus_after_primary = bool(is_bonus_condition and not is_primary_condition and existing_quant)
+        is_dante_only = bool(is_bonus_condition and not is_primary_condition and not existing_quant)
+        code_name = self.get_code_name(code)
+        detected_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detected_at))
+        time_context = {
+            "symbol": code,
+            "condition_name": hts_condition_name,
+            "condition_index": str(condition_index or ""),
+            "event_type": event_type,
+            "source": "condition_detected",
+            "condition_role": (
+                "bonus" if is_bonus_condition and not is_primary_condition else "primary"
+            ),
+        }
+
+        if is_dante_only:
+            capture_decision = self.time_policy.evaluate_candidate_capture(
+                log=True,
+                context=dict(time_context, candidate_role="analysis_only"),
+            )
+            if not capture_decision.capture_allowed:
+                logger.info(
+                    "[DANTE_ONLY 분석 제외] %s condition=%s reason=%s session=%s",
+                    code,
+                    hts_condition_name,
+                    capture_decision.reason_code,
+                    capture_decision.session,
+                )
+                return
+            candidate = registry.register_detection(
+                code=code,
+                name=code_name,
+                condition_name=hts_condition_name,
+                condition_index=str(condition_index or ""),
+                event_type=event_type,
+                detected_at=detected_at,
+                meta={
+                    "strategy_name": TRADE_CONFIG.strategy_name,
+                    "condition_formula": TRADE_LOG_CONDITION_FORMULA,
+                    "condition_formula_version": TRADE_LOG_CONDITION_FORMULA_VERSION,
+                    "signal_source": TRADE_LOG_SIGNAL_SOURCE,
+                    "candidate_role": "analysis_only",
+                    "time_policy_reason": capture_decision.reason_code,
+                    "entry_allowed": False,
+                    "capture_allowed": capture_decision.capture_allowed,
+                    "manage_allowed": capture_decision.manage_allowed,
+                    "analysis_allowed": getattr(capture_decision, "analysis_allowed", True),
+                },
+            )
+            condition_meta = self._condition_log_meta(candidate)
+            try:
+                self.condition_capture_logger.append_detection(
+                    code=code,
+                    candidate_id=candidate.candidate_id,
+                    name=code_name,
+                    condition_name=hts_condition_name,
+                    strategy_name=TRADE_CONFIG.strategy_name,
+                    condition_index=condition_index,
+                    event_type=event_type,
+                    screen_no=screen_no or BONUS_CONDITION_SCREEN_NO,
+                    signal_source=TRADE_LOG_SIGNAL_SOURCE,
+                    detected_at=detected_at_text,
+                    candidate_role="analysis_only",
+                    time_policy_reason=capture_decision.reason_code,
+                    entry_allowed=False,
+                    capture_allowed=capture_decision.capture_allowed,
+                    manage_allowed=capture_decision.manage_allowed,
+                    analysis_allowed=getattr(capture_decision, "analysis_allowed", True),
+                    condition_meta=condition_meta,
+                )
+            except Exception as exc:
+                logger.warning("[DANTE_ONLY 분석 로그 실패] %s %s", code, exc)
+            if code not in self.realtime_registered_codes:
+                self.register_realtime_stock(code)
+                self.condition_registered_at[code] = detected_at
+            else:
+                self.condition_registered_at.setdefault(code, detected_at)
+            logger.info(
+                "[DANTE_ONLY 분석 후보] %s %s - live 매수 후보 제외, shadow 관찰만 수행",
+                code,
+                hts_condition_name,
+            )
+            return
+
+        if is_bonus_after_primary:
+            capture_decision = self.time_policy.evaluate_candidate_capture(
+                log=True,
+                context=dict(time_context, candidate_role="trading_bonus"),
+            )
+            capture_allowed = True
+            entry_allowed = bool(getattr(existing_candidate, "meta", {}).get("entry_allowed", True))
+            candidate_role = str((existing_candidate.meta or {}).get("candidate_role", "trading") or "trading")
+            time_policy_reason = "BONUS_CONDITION_AFTER_PRIMARY"
+        else:
+            capture_decision = self.time_policy.evaluate_trading_candidate_capture(
+                min_observation_sec=getattr(TRADE_CONFIG, "min_candidate_age_seconds", 30),
+                log=True,
+                context=time_context,
+            )
+            capture_allowed = bool(capture_decision.allowed)
+            entry_allowed = capture_decision.entry_allowed
+            candidate_role = capture_decision.candidate_role or "trading"
+            time_policy_reason = capture_decision.reason_code
+        if not capture_allowed:
+            condition_meta = self._condition_event_meta(hts_condition_name, detected_at)
             if getattr(capture_decision, "capture_allowed", False):
                 try:
                     self.condition_capture_logger.append_detection(
@@ -1045,6 +1254,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                         capture_allowed=capture_decision.capture_allowed,
                         manage_allowed=capture_decision.manage_allowed,
                         analysis_allowed=getattr(capture_decision, "analysis_allowed", ""),
+                        condition_meta=condition_meta,
                     )
                 except Exception as exc:
                     logger.warning("[condition analysis log failed] %s %s", code, exc)
@@ -1058,8 +1268,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 capture_decision.candidate_role,
             )
             return
-        code_name = self.get_code_name(code)
-        detected_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detected_at))
         candidate = self.candidate_registry.register_detection(
             code=code,
             name=code_name,
@@ -1072,17 +1280,20 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 "condition_formula": TRADE_LOG_CONDITION_FORMULA,
                 "condition_formula_version": TRADE_LOG_CONDITION_FORMULA_VERSION,
                 "signal_source": TRADE_LOG_SIGNAL_SOURCE,
-                "candidate_role": capture_decision.candidate_role or "trading",
-                "time_policy_reason": capture_decision.reason_code,
-                "entry_allowed": capture_decision.entry_allowed,
-                "capture_allowed": capture_decision.capture_allowed,
+                "candidate_role": candidate_role,
+                "time_policy_reason": time_policy_reason,
+                "entry_allowed": entry_allowed,
+                "capture_allowed": capture_allowed,
                 "manage_allowed": capture_decision.manage_allowed,
                 "analysis_allowed": getattr(capture_decision, "analysis_allowed", ""),
             },
         )
+        condition_meta = self._condition_log_meta(candidate)
         watch = self.ensure_monitoring_stock(code)
         watch["candidate_id"] = candidate.candidate_id
-        watch["condition_name"] = hts_condition_name
+        if is_primary_condition or not watch.get("condition_name"):
+            watch["condition_name"] = hts_condition_name
+        watch["last_condition_name"] = hts_condition_name
         watch["condition_event_type"] = event_type
         watch["condition_index"] = condition_index
         watch["strategy_name"] = TRADE_CONFIG.strategy_name
@@ -1090,6 +1301,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         watch["condition_formula_version"] = TRADE_LOG_CONDITION_FORMULA_VERSION
         watch["detected_at"] = detected_at
         watch["signal_source"] = TRADE_LOG_SIGNAL_SOURCE
+        watch["candidate_role"] = candidate_role
+        watch["time_policy_reason"] = time_policy_reason
+        watch["entry_allowed"] = entry_allowed
+        watch["capture_allowed"] = capture_allowed
+        watch["manage_allowed"] = capture_decision.manage_allowed
+        watch["analysis_allowed"] = getattr(capture_decision, "analysis_allowed", "")
+        for key, value in condition_meta.items():
+            watch[key] = value
         try:
             self.condition_capture_logger.append_detection(
                 code=code,
@@ -1102,12 +1321,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 screen_no=screen_no or CONDITION_SCREEN_NO,
                 signal_source=TRADE_LOG_SIGNAL_SOURCE,
                 detected_at=detected_at_text,
-                candidate_role=capture_decision.candidate_role or "trading",
-                time_policy_reason=capture_decision.reason_code,
-                entry_allowed=capture_decision.entry_allowed,
-                capture_allowed=capture_decision.capture_allowed,
+                candidate_role=candidate_role,
+                time_policy_reason=time_policy_reason,
+                entry_allowed=entry_allowed,
+                capture_allowed=capture_allowed,
                 manage_allowed=capture_decision.manage_allowed,
                 analysis_allowed=getattr(capture_decision, "analysis_allowed", ""),
+                condition_meta=condition_meta,
             )
         except Exception as exc:
             logger.warning("[조건검색 포착 로그 실패] %s %s", code, exc)
@@ -1124,6 +1344,16 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         else:
             self.condition_registered_at.setdefault(code, time.time())
         self.enqueue_condition_stock(code, condition_name, event_type)
+        logger.info(
+            "[조건식 조합] %s combo=%s quant=%s dante=%s first=%s last=%s role=%s",
+            code,
+            condition_meta.get("condition_combo", ""),
+            condition_meta.get("quant_detected", ""),
+            condition_meta.get("dante_detected", ""),
+            condition_meta.get("first_condition_name", ""),
+            condition_meta.get("last_condition_name", ""),
+            candidate_role,
+        )
 
     def enqueue_condition_stock(self, code, condition_name="", event_type="I"):
         code = self.normalize_code(code)
@@ -1749,6 +1979,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if watch is not None and close > 0:
             watch["breakout_high"] = max(self.parse_int(watch.get("breakout_high", 0)), int(close))
         self.update_monitoring_tick(code, tick)
+        self.update_analysis_candidate_tick(code, tick)
         self.update_reentry_watch(code, close)
 
         self.update_dante_training_labels(code, close, received_at)
@@ -1796,6 +2027,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if self.processing_condition or not self.pending_condition_codes:
             return
 
+        if hasattr(self, "candidate_registry"):
+            self.pending_condition_codes.sort(
+                key=lambda item: candidate_leader_priority(
+                    self.candidate_registry.get(self.normalize_code(item))
+                )
+                if self.candidate_registry.get(self.normalize_code(item)) is not None
+                else (3, 0.0, 999_999, 0.0)
+            )
         code = self.pending_condition_codes.pop(0)
         self.processing_condition = True
         try:
@@ -2551,6 +2790,40 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return 0
         return sum(max(self.parse_int(getattr(bar, "volume", 0)), 0) for bar in bars[-5:])
 
+    def monitoring_volume_window(self, code, seconds):
+        code = self.normalize_code(code)
+        ticks = self.realtime_ticks.get(code, [])
+        if len(ticks) < 2:
+            return 0
+        last_ts = float(ticks[-1].get("received_at", time.time()) or time.time())
+        cutoff = last_ts - max(float(seconds or 0), 1.0)
+        window_ticks = [tick for tick in ticks if float(tick.get("received_at", last_ts) or last_ts) >= cutoff]
+        if len(window_ticks) < 2:
+            window_ticks = ticks[-2:]
+        start_volume = self.parse_int(window_ticks[0].get("accum_volume", 0))
+        end_volume = self.parse_int(window_ticks[-1].get("accum_volume", 0))
+        return max(end_volume - start_volume, 0)
+
+    def monitoring_volume_1m(self, code):
+        return self.monitoring_volume_window(code, 60)
+
+    @staticmethod
+    def _hhmmss_value(value, default=0):
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        if not digits:
+            return int(default or 0)
+        try:
+            return int(digits[:6].ljust(6, "0"))
+        except ValueError:
+            return int(default or 0)
+
+    def is_opening_leader_phase(self, now_ts=None):
+        local = time.localtime(now_ts or time.time())
+        hhmmss = local.tm_hour * 10000 + local.tm_min * 100 + local.tm_sec
+        start = self._hhmmss_value(getattr(TRADE_CONFIG, "opening_leader_start", ""), 90300)
+        end = self._hhmmss_value(getattr(TRADE_CONFIG, "opening_leader_end", ""), 93000)
+        return start <= hhmmss <= end
+
     def update_orderbook_snapshot(self, code):
         code = self.normalize_code(code)
         ask_total = self.get_real_int(code, "매도호가 총잔량")
@@ -2626,6 +2899,62 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return True, "매도벽 흡수 bid/ask {:.2f}".format(bid_total / ask_total if ask_total > 0 else 0)
         return False, "호가 흡수 미확인 ask/bid {:.2f}".format(ratio)
 
+    def update_analysis_candidate_tick(self, code, tick):
+        code = self.normalize_code(code)
+        if not code or code in self.monitoring_dict:
+            return
+        registry = getattr(self, "candidate_registry", None)
+        if registry is None:
+            return
+        candidate = registry.get(code)
+        if candidate is None:
+            return
+        meta = candidate.meta or {}
+        if meta.get("candidate_role") != "analysis_only" and meta.get("condition_combo") != CONDITION_COMBO_DANTE_ONLY:
+            return
+        close = self.parse_int(tick.get("close", 0))
+        if close <= 0:
+            return
+        first_capture = registry.on_tick(
+            code,
+            price=close,
+            chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
+            accum_volume=self.parse_int(tick.get("accum_volume", 0)),
+            volume_delta=self.parse_int(tick.get("volume_delta", 0)),
+            trade_value=self.parse_int(tick.get("volume_delta", 0)) * close,
+            entry_trigger_price=0,
+        )
+        if not first_capture:
+            return
+        detected_at = float(candidate.detected_at or candidate.first_detected_at or time.time())
+        detected_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detected_at))
+        try:
+            self.condition_capture_logger.append_capture_price(
+                code=code,
+                candidate_id=candidate.candidate_id,
+                name=candidate.name or self.get_code_name(code),
+                condition_name=candidate.last_condition_name or candidate.condition_name,
+                strategy_name=TRADE_CONFIG.strategy_name,
+                condition_index=candidate.condition_index,
+                event_type=candidate.event_type,
+                screen_no=self.realtime_code_screens.get(code, REALTIME_SCREEN_NO),
+                capture_price=close,
+                entry_trigger_price=0,
+                chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
+                accum_volume=self.parse_int(tick.get("accum_volume", 0)),
+                signal_source=candidate.signal_source,
+                detected_at=detected_at_text,
+                candidate_role="analysis_only",
+                time_policy_reason=meta.get("time_policy_reason", ""),
+                entry_allowed=False,
+                capture_allowed=meta.get("capture_allowed", ""),
+                manage_allowed=meta.get("manage_allowed", ""),
+                analysis_allowed=meta.get("analysis_allowed", ""),
+                condition_meta=self._condition_log_meta(candidate),
+            )
+        except Exception as exc:
+            logger.warning("[DANTE_ONLY 포착가 로그 실패] %s %s", code, exc)
+
     def update_monitoring_tick(self, code, tick):
         code = self.normalize_code(code)
         watch = self.monitoring_dict.get(code)
@@ -2651,6 +2980,21 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 trade_value=volume_delta * close,
                 entry_trigger_price=registry_trigger_price,
             )
+            candidate = self.candidate_registry.get(code)
+            if candidate is not None:
+                watch["high_since_capture"] = self.parse_int(
+                    getattr(candidate, "high_since_capture", 0)
+                    or getattr(candidate, "max_price_after_capture", 0)
+                )
+                watch["low_after_high"] = self.parse_int(getattr(candidate, "low_after_high", 0))
+                watch["pullback_from_high_pct"] = self.parse_float(
+                    getattr(candidate, "pullback_from_high_pct", 0.0),
+                    0.0,
+                )
+                watch["rebound_from_low_pct"] = self.parse_float(
+                    getattr(candidate, "rebound_from_low_pct", 0.0),
+                    0.0,
+                )
         if self.parse_int(watch.get("capture_price", 0)) <= 0:
             watch["capture_price"] = close
             watch["target_price"] = self.quant_strategy.trigger_price(close)
@@ -2659,6 +3003,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             try:
                 candidate = self.candidate_registry.get(code) if hasattr(self, "candidate_registry") else None
                 candidate_id = str(watch.get("candidate_id") or getattr(candidate, "candidate_id", "") or "")
+                condition_meta = self._condition_log_meta(candidate, watch)
                 detected_at_value = watch.get("detected_at", "")
                 detected_at_text = (
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(detected_at_value)))
@@ -2680,6 +3025,30 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     accum_volume=accum_volume,
                     signal_source=watch.get("signal_source", TRADE_LOG_SIGNAL_SOURCE),
                     detected_at=detected_at_text,
+                    candidate_role=str(watch.get("candidate_role", "")) or str(
+                        (getattr(candidate, "meta", {}) or {}).get("candidate_role", "trading")
+                    ),
+                    time_policy_reason=watch.get(
+                        "time_policy_reason",
+                        (getattr(candidate, "meta", {}) or {}).get("time_policy_reason", ""),
+                    ),
+                    entry_allowed=watch.get(
+                        "entry_allowed",
+                        (getattr(candidate, "meta", {}) or {}).get("entry_allowed", ""),
+                    ),
+                    capture_allowed=watch.get(
+                        "capture_allowed",
+                        (getattr(candidate, "meta", {}) or {}).get("capture_allowed", ""),
+                    ),
+                    manage_allowed=watch.get(
+                        "manage_allowed",
+                        (getattr(candidate, "meta", {}) or {}).get("manage_allowed", ""),
+                    ),
+                    analysis_allowed=watch.get(
+                        "analysis_allowed",
+                        (getattr(candidate, "meta", {}) or {}).get("analysis_allowed", ""),
+                    ),
+                    condition_meta=condition_meta,
                 )
             except Exception as exc:
                 logger.warning("[조건검색 포착가 로그 실패] %s %s", code, exc)
@@ -2751,6 +3120,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.candidate_registry = CandidateRegistry(
                 signal_source=TRADE_CONFIG.signal_source,
                 candidate_expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+                primary_condition_name=PRIMARY_CONDITION_NAME,
+                bonus_condition_name=BONUS_CONDITION_NAME,
             )
         candidate = self.candidate_registry.get(code) if hasattr(self, "candidate_registry") else None
         if candidate is None:
@@ -2766,6 +3137,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     "condition_formula": watch.get("condition_formula", TRADE_LOG_CONDITION_FORMULA),
                     "condition_formula_version": watch.get("condition_formula_version", TRADE_LOG_CONDITION_FORMULA_VERSION),
                     "signal_source": watch.get("signal_source", TRADE_LOG_SIGNAL_SOURCE),
+                    **{
+                        key: watch.get(key, "")
+                        for key in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)
+                        if watch.get(key, "") != ""
+                    },
                 },
             )
             capture_price = self.parse_int(watch.get("capture_price", 0))
@@ -2784,12 +3160,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         bid = self.parse_int(tick.get("bid", 0))
         spread_rate = (ask - bid) / current_price if current_price > 0 and ask > 0 and bid > 0 else None
         recent_volume = self.monitoring_volume_5m(code) if hasattr(self, "monitoring_volume_5m") else 0
+        one_min_volume = self.monitoring_volume_1m(code) if hasattr(self, "monitoring_volume_1m") else 0
         base_volume = max(
             self.parse_int(watch.get("breakout_volume", 0)),
             self.parse_int(watch.get("capture_accum_volume", 0)),
             0,
         )
         volume_ratio = recent_volume / base_volume if base_volume > 0 and recent_volume > 0 else None
+        volume_ratio_1m = one_min_volume / base_volume if base_volume > 0 and one_min_volume > 0 else None
+        volume_ratio_5m = volume_ratio
         ticks = self.realtime_ticks.get(code, [])
         if len(ticks) >= 2:
             elapsed = max(float(ticks[-1].get("received_at", time.time())) - float(ticks[0].get("received_at", time.time())), 1.0)
@@ -2800,6 +3179,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             turnover_speed_per_min = volume_delta * current_price / elapsed * 60 if volume_delta > 0 else None
         else:
             turnover_speed_per_min = None
+            volume_delta = 0
         minute_bars = self.minute_aggregator.all_bars(code) if hasattr(self.minute_aggregator, "all_bars") else []
         raw_vwap = (
             float(self.minute_aggregator.intraday_vwap(code) or 0.0)
@@ -2807,11 +3187,54 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             else 0.0
         )
         intraday_vwap = raw_vwap if raw_vwap > 0 else None
-        high_since = max([self.parse_int(t.get("high", 0)) for t in ticks if self.parse_int(t.get("high", 0)) > 0] or [current_price])
+        candidate_high = self.parse_int(
+            getattr(candidate, "high_since_capture", 0)
+            or getattr(candidate, "max_price_after_capture", 0)
+            if candidate is not None
+            else 0
+        )
+        high_since = max(
+            [self.parse_int(t.get("high", 0)) for t in ticks if self.parse_int(t.get("high", 0)) > 0]
+            or [current_price],
+            default=current_price,
+        )
+        high_since = max(high_since, candidate_high, current_price)
         rolling_high_since_capture = max(
             [self.parse_int(t.get("close", 0)) for t in ticks if self.parse_int(t.get("close", 0)) > 0]
             + [high_since, current_price]
         )
+        low_after_high = self.parse_int(getattr(candidate, "low_after_high", 0)) if candidate is not None else 0
+        bar_low_after_high = (
+            int(self.minute_aggregator.pullback_low_after_high(code) or 0)
+            if hasattr(self.minute_aggregator, "pullback_low_after_high")
+            else 0
+        )
+        low_candidates = [value for value in (low_after_high, bar_low_after_high) if value > 0]
+        low_after_high = min(low_candidates) if low_candidates else 0
+        pullback_from_high_pct = (
+            (high_since - current_price) / high_since
+            if high_since > 0 and high_since > current_price
+            else 0.0
+        )
+        rebound_from_low_pct = (
+            current_price / low_after_high - 1
+            if low_after_high > 0 and current_price > 0
+            else 0.0
+        )
+        one_min_reversal = (
+            self.minute_aggregator.first_pullback_reversal_confirmed(
+                code,
+                current_price=current_price,
+            )
+            if hasattr(self.minute_aggregator, "first_pullback_reversal_confirmed")
+            else None
+        )
+        if candidate is not None:
+            candidate.high_since_capture = max(self.parse_int(getattr(candidate, "high_since_capture", 0)), high_since)
+            if low_after_high > 0:
+                candidate.low_after_high = low_after_high
+            candidate.pullback_from_high_pct = pullback_from_high_pct
+            candidate.rebound_from_low_pct = rebound_from_low_pct
         lookback = max(int(getattr(TRADE_CONFIG, "high_distance_lookback_bars", 5) or 5), 1)
         prior_bars = list(minute_bars[:-1] if minute_bars else [])[-lookback:]
         prior_highs = [self.parse_int(getattr(bar, "high", 0)) for bar in prior_bars if self.parse_int(getattr(bar, "high", 0)) > 0]
@@ -2847,6 +3270,51 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             if current_price > 0 and prior_low and prior_low > 0 and current_price > prior_low
             else None
         )
+        accum_volume = self.parse_int(tick.get("accum_volume", 0))
+        daily_turnover = self.realtime_daily_turnover(
+            code,
+            current_price=current_price,
+            accum_volume=accum_volume,
+        )
+        turnover_rank_market, ranked_count = self.realtime_turnover_rank(
+            code,
+            current_turnover=daily_turnover,
+        )
+        trade_value_since_capture = self.parse_int(getattr(candidate, "trade_value_since_capture", 0)) if candidate is not None else 0
+        if trade_value_since_capture <= 0 and volume_delta > 0 and current_price > 0:
+            trade_value_since_capture = int(volume_delta * current_price)
+        condition_combo = str((getattr(candidate, "meta", {}) or {}).get("condition_combo", "") if candidate is not None else "")
+        vwap_support_ok = bool(intraday_vwap is None or intraday_vwap <= 0 or current_price >= intraday_vwap)
+        leader_score = calculate_leader_score(
+            turnover_speed_per_min=float(turnover_speed_per_min or 0.0),
+            volume_ratio_1m=float(volume_ratio_1m or 0.0),
+            volume_ratio_5m=float(volume_ratio_5m or 0.0),
+            trade_value_since_capture=float(trade_value_since_capture or 0.0),
+            turnover_rank_market=turnover_rank_market,
+            ranked_count=ranked_count,
+            condition_combo=condition_combo,
+            vwap_support_ok=vwap_support_ok,
+            chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
+            opening_phase=self.is_opening_leader_phase() if hasattr(self, "is_opening_leader_phase") else True,
+            config=TRADE_CONFIG,
+        )
+        if candidate is not None:
+            candidate.update_leader_metrics(
+                trade_value_since_capture=trade_value_since_capture,
+                turnover_speed_per_min=float(turnover_speed_per_min or 0.0),
+                volume_ratio_1m=float(volume_ratio_1m or 0.0),
+                volume_ratio_5m=float(volume_ratio_5m or 0.0),
+                turnover_rank_market=turnover_rank_market,
+                turnover_rank_sector=0,  # TODO: fill when sector grouping is available.
+                leader_score=leader_score,
+            )
+        watch["trade_value_since_capture"] = trade_value_since_capture
+        watch["turnover_speed_per_min"] = float(turnover_speed_per_min or 0.0)
+        watch["volume_ratio_1m"] = float(volume_ratio_1m or 0.0)
+        watch["volume_ratio_5m"] = float(volume_ratio_5m or 0.0)
+        watch["turnover_rank_market"] = turnover_rank_market
+        watch["turnover_rank_sector"] = 0
+        watch["leader_score"] = leader_score
         return MomentumContext(
             candidate=candidate,
             current_price=current_price,
@@ -2854,6 +3322,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             spread_rate=spread_rate,
             volume_ratio=volume_ratio,
             turnover_speed_per_min=turnover_speed_per_min,
+            trade_value_since_capture=trade_value_since_capture,
+            volume_ratio_1m=volume_ratio_1m,
+            volume_ratio_5m=volume_ratio_5m,
+            turnover_rank_market=turnover_rank_market,
+            turnover_rank_sector=0,
+            leader_score=leader_score,
             intraday_vwap=intraday_vwap,
             minute_bars=minute_bars,
             prior_high=prior_high,
@@ -2862,6 +3336,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             realtime_day_high=high_since,
             rolling_high_since_capture=rolling_high_since_capture,
             high_since_capture=high_since,
+            low_after_high=low_after_high,
+            pullback_from_high_pct=pullback_from_high_pct,
+            rebound_from_low_pct=rebound_from_low_pct,
+            one_min_reversal=one_min_reversal,
             upper_wick_ratio=upper_wick,
             signal_candle_range_pct=signal_candle_range_pct,
             position_in_signal_candle_pct=position_in_signal_candle_pct,
@@ -2903,6 +3381,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "momentum_metrics": decision.metrics,
             "candidate_age_sec": decision.metrics.get("age_seconds", ""),
             "volume_speed": decision.metrics.get("turnover_speed_per_min", 0.0),
+            "leader_score": decision.metrics.get("leader_score", 0.0),
+            "trade_value_since_capture": decision.metrics.get("trade_value_since_capture", 0.0),
+            "volume_ratio_1m": decision.metrics.get("volume_ratio_1m", 0.0),
+            "volume_ratio_5m": decision.metrics.get("volume_ratio_5m", 0.0),
+            "turnover_rank_market": decision.metrics.get("turnover_rank_market", 0),
+            "turnover_rank_sector": decision.metrics.get("turnover_rank_sector", 0),
             "spread_rate": decision.metrics.get("spread_rate", 0.0),
             "pullback_pct": decision.metrics.get("pullback_pct", 0.0),
             "entry_type": getattr(decision, "entry_type", ""),
@@ -3124,6 +3608,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             active_positions=self.active_position_count(),
             recent_low_price=recent_low_price,
             market_state=market_regime,
+            high_since_capture=self.parse_int(
+                getattr(momentum_ctx, "high_since_capture", 0)
+                or watch.get("high_since_capture", 0)
+            ),
+            low_after_high=self.parse_int(
+                getattr(momentum_ctx, "low_after_high", 0)
+                or watch.get("low_after_high", 0)
+            ),
+            intraday_vwap=getattr(momentum_ctx, "intraday_vwap", None),
+            was_below_vwap=bool(watch.get("was_below_vwap")),
+            minute_bars=getattr(momentum_ctx, "minute_bars", ()),
+            one_min_reversal=getattr(momentum_ctx, "one_min_reversal", None),
+            leader_score=getattr(momentum_ctx, "leader_score", 0.0),
         )
         final_decision = self.build_final_entry_decision(momentum_decision, entry_decision)
         if hasattr(self, "log_final_entry_decision"):
@@ -3140,6 +3637,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     "candidate_age_sec": (momentum_decision.metrics or {}).get("age_seconds", ""),
                     "pullback_dry_run": (momentum_decision.metrics or {}).get("pullback_dry_run", {}),
                     "prior_high_source": (momentum_decision.metrics or {}).get("prior_high_source", ""),
+                    "high_since_capture": entry_decision.high_since_capture,
+                    "low_after_high": entry_decision.low_after_high,
+                    "pullback_from_high_pct": entry_decision.pullback_from_high_pct,
+                    "rebound_from_low_pct": entry_decision.rebound_from_low_pct,
+                    "intraday_vwap": entry_decision.intraday_vwap,
+                    "vwap_support_ok": entry_decision.vwap_support_ok,
+                    "first_pullback_ready": entry_decision.first_pullback_ready,
+                    **self._condition_log_meta(momentum_ctx.candidate, watch),
                 },
             )
         if not final_decision.allowed:
@@ -3194,24 +3699,28 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "ranked_count": time_filter.get("ranked_count", 0),
             "time_filter_phase": time_filter.get("phase", ""),
             "time_filter_weight": time_filter.get("weight", 1.0),
+            "high_since_capture": entry_decision.high_since_capture,
+            "low_after_high": entry_decision.low_after_high,
+            "pullback_from_high_pct": entry_decision.pullback_from_high_pct,
+            "rebound_from_low_pct": entry_decision.rebound_from_low_pct,
+            "intraday_vwap": entry_decision.intraday_vwap,
+            "vwap_support_ok": entry_decision.vwap_support_ok,
+            "first_pullback_ready": entry_decision.first_pullback_ready,
+            "leader_score": getattr(momentum_ctx, "leader_score", 0.0),
+            "trade_value_since_capture": getattr(momentum_ctx, "trade_value_since_capture", 0),
+            "turnover_speed_per_min": getattr(momentum_ctx, "turnover_speed_per_min", 0.0) or 0.0,
+            "volume_ratio_1m": getattr(momentum_ctx, "volume_ratio_1m", 0.0) or 0.0,
+            "volume_ratio_5m": getattr(momentum_ctx, "volume_ratio_5m", 0.0) or 0.0,
+            "turnover_rank_market": getattr(momentum_ctx, "turnover_rank_market", 0),
+            "turnover_rank_sector": getattr(momentum_ctx, "turnover_rank_sector", 0),
         }
-        if final_decision.legacy_veto_ignored:
-            prediction = self.momentum_prediction(
-                code,
-                name,
-                momentum_decision,
-                current_price,
-                stage=1,
-            )
-            prediction.update(common_extra)
-            prediction["entry_plan_reason"] = "BREAKOUT_SMALL momentum entry; legacy pullback veto ignored"
-        else:
-            prediction = entry_decision.to_prediction(
-                code=code,
-                name=name,
-                config=QUANT_STRATEGY_CONFIG,
-                extra=common_extra,
-            )
+        common_extra.update(self._condition_log_meta(momentum_ctx.candidate, watch))
+        prediction = entry_decision.to_prediction(
+            code=code,
+            name=name,
+            config=QUANT_STRATEGY_CONFIG,
+            extra=common_extra,
+        )
         return self.apply_final_entry_decision(
             prediction,
             final_decision,
@@ -3470,6 +3979,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             atr_5m_pct=ctx.atr_5m_pct,
             intraday_vwap=ctx.intraday_vwap,
             pullback_low_after_high=ctx.pullback_low_after_high,
+            leader_score=getattr(ctx, "leader_score", 0.0) or 0.0,
+            turnover_speed_per_min=getattr(ctx, "turnover_speed_per_min", 0.0) or 0.0,
+            volume_ratio_1m=getattr(ctx, "volume_ratio_1m", 0.0) or 0.0,
+            volume_ratio_5m=getattr(ctx, "volume_ratio_5m", 0.0) or 0.0,
+            trade_value_since_capture=getattr(ctx, "trade_value_since_capture", 0.0) or 0.0,
+            turnover_rank_market=getattr(ctx, "turnover_rank_market", 0) or 0,
+            turnover_rank_sector=getattr(ctx, "turnover_rank_sector", 0) or 0,
         )
         payload = {
             "code": code,
@@ -4274,6 +4790,46 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         )
 
         # 매크로 dry-run 게이트 — 이번 PR 은 status/ratio 변경 없이 메타만 부여.
+        candidate = self.candidate_registry.get(code) if hasattr(self, "candidate_registry") else None
+        base_volume = max(
+            self.parse_int(last.get("accum_volume", 0)),
+            self.parse_int(getattr(candidate, "capture_accum_volume", 0)) if candidate is not None else 0,
+            0,
+        )
+        volume_1m = self.monitoring_volume_1m(code) if hasattr(self, "monitoring_volume_1m") else 0
+        volume_5m = self.monitoring_volume_5m(code) if hasattr(self, "monitoring_volume_5m") else 0
+        volume_ratio_1m = volume_1m / base_volume if base_volume > 0 and volume_1m > 0 else 0.0
+        volume_ratio_5m = volume_5m / base_volume if base_volume > 0 and volume_5m > 0 else 0.0
+        trade_value_since_capture = self.parse_int(getattr(candidate, "trade_value_since_capture", 0)) if candidate is not None else 0
+        if trade_value_since_capture <= 0:
+            trade_value_since_capture = int(volume_delta * current_price)
+        turnover_rank_market = int(time_filter.get("turnover_rank", 0) or 0)
+        ranked_count = int(time_filter.get("ranked_count", 0) or 0)
+        condition_combo = str((getattr(candidate, "meta", {}) or {}).get("condition_combo", "") if candidate is not None else "")
+        vwap_support_ok = bool(intraday_vwap <= 0 or current_price >= intraday_vwap)
+        leader_score = calculate_leader_score(
+            turnover_speed_per_min=turnover_speed_per_min,
+            volume_ratio_1m=volume_ratio_1m,
+            volume_ratio_5m=volume_ratio_5m,
+            trade_value_since_capture=trade_value_since_capture,
+            turnover_rank_market=turnover_rank_market,
+            ranked_count=ranked_count,
+            condition_combo=condition_combo,
+            vwap_support_ok=vwap_support_ok,
+            chejan_strength=chejan_strength,
+            opening_phase=self.is_opening_leader_phase() if hasattr(self, "is_opening_leader_phase") else True,
+            config=TRADE_CONFIG,
+        )
+        if candidate is not None:
+            candidate.update_leader_metrics(
+                trade_value_since_capture=trade_value_since_capture,
+                turnover_speed_per_min=turnover_speed_per_min,
+                volume_ratio_1m=volume_ratio_1m,
+                volume_ratio_5m=volume_ratio_5m,
+                turnover_rank_market=turnover_rank_market,
+                turnover_rank_sector=0,
+                leader_score=leader_score,
+            )
         market_snapshot = self.market_state.snapshot()
 
         ctx = entry_strategy.EntryContext(
@@ -4304,6 +4860,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             atr_5m_pct=atr_5m_pct,
             intraday_vwap=intraday_vwap,
             pullback_low_after_high=pullback_low_after_high,
+            trade_value_since_capture=trade_value_since_capture,
+            turnover_speed_per_min=turnover_speed_per_min,
+            volume_ratio_1m=volume_ratio_1m,
+            volume_ratio_5m=volume_ratio_5m,
+            turnover_rank_market=turnover_rank_market,
+            turnover_rank_sector=0,
+            leader_score=leader_score,
         )
 
         reentry_watch = self.dante_reentry_watchlist.get(code)
@@ -4327,6 +4890,29 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         else:
             decision = entry_strategy.evaluate_first_entry(ctx)
             stage = decision.stage if decision.stage in (1, 2) else 1
+
+        if (
+            decision.status == "ready"
+            and bool(getattr(TRADE_CONFIG, "leader_score_enabled", True))
+        ):
+            opening_leader_phase = self.is_opening_leader_phase() if hasattr(self, "is_opening_leader_phase") else True
+            leader_threshold = (
+                float(getattr(TRADE_CONFIG, "opening_min_leader_score", TRADE_CONFIG.min_leader_score) or 0.0)
+                if opening_leader_phase
+                else float(getattr(TRADE_CONFIG, "post_opening_min_leader_score", TRADE_CONFIG.min_leader_score) or 0.0)
+            )
+            if leader_threshold > 0 and leader_score < leader_threshold:
+                decision = entry_strategy.EntryDecision(
+                    status="wait" if opening_leader_phase else "blocked",
+                    ratio=0.0,
+                    stage=stage,
+                    reason="leader score wait {:.1f} < {:.1f}".format(leader_score, leader_threshold),
+                    grade=getattr(decision, "grade", ""),
+                    reason_code="WAIT_LEADER_SCORE" if opening_leader_phase else "BLOCK_WEAK_LEADER",
+                    market_regime=getattr(decision, "market_regime", ""),
+                    market_gate_action=getattr(decision, "market_gate_action", ""),
+                    market_gate_reason=getattr(decision, "market_gate_reason", ""),
+                )
 
         if decision.reason_code == entry_strategy.GATE_VOLUME_SPEED:
             if self.record_volume_speed_wait(code, volume_speed, turnover_speed_per_min):
@@ -4422,6 +5008,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "chejan_strength": chejan_strength,
             "volume_speed": volume_speed,
             "turnover_speed_per_min": turnover_speed_per_min,
+            "leader_score": leader_score,
+            "trade_value_since_capture": trade_value_since_capture,
+            "volume_ratio_1m": volume_ratio_1m,
+            "volume_ratio_5m": volume_ratio_5m,
+            "turnover_rank_market": turnover_rank_market,
+            "turnover_rank_sector": 0,
             "daily_turnover": time_filter.get("daily_turnover", 0),
             "turnover_rank": time_filter.get("turnover_rank", 0),
             "ranked_count": time_filter.get("ranked_count", 0),
@@ -4472,9 +5064,25 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return "{}차 매수 대기".format(stage)
         return "{}차 매수 제외".format(stage)
 
+    def first_pullback_log_fields(self, prediction):
+        return _first_pullback_log_fields(prediction)
+
     def handle_condition_stock(self, code):
         code = self.normalize_code(code)
         if code in self.no_tick_codes:
+            return
+        candidate = self.candidate_registry.get(code) if hasattr(self, "candidate_registry") else None
+        candidate_meta = getattr(candidate, "meta", {}) or {}
+        if (
+            candidate_meta.get("condition_combo") == CONDITION_COMBO_DANTE_ONLY
+            or candidate_meta.get("candidate_role") == "analysis_only"
+        ):
+            logger.info(
+                "[DANTE_ONLY 매수 제외] %s combo=%s role=%s",
+                code,
+                candidate_meta.get("condition_combo", ""),
+                candidate_meta.get("candidate_role", ""),
+            )
             return
         if hasattr(self, "ensure_monitoring_stock"):
             self.ensure_monitoring_stock(code)
@@ -4578,6 +5186,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 market_regime=prediction.get("market_regime", ""),
                 market_gate_action=prediction.get("market_gate_action", ""),
                 market_gate_reason=prediction.get("market_gate_reason", ""),
+                **_first_pullback_log_fields(prediction),
             )
             return
 
@@ -4626,6 +5235,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 market_regime=prediction.get("market_regime", ""),
                 market_gate_action=prediction.get("market_gate_action", ""),
                 market_gate_reason=prediction.get("market_gate_reason", ""),
+                **_first_pullback_log_fields(prediction),
             )
             return
         if code in self.risk_too_wide_watchlist:
@@ -4928,6 +5538,53 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 blocked_by="order_guard",
                 symbol=code,
             )
+        if guard_decision is not None and not getattr(guard_decision, "allowed", False):
+            blocked_by = str(getattr(guard_decision, "blocked_by", "") or "")
+            guard_reason = str(getattr(guard_decision, "reason", "") or "ORDER_GUARD_BLOCKED")
+            blocked_reason_code = guard_reason
+            blocked_plan_source = prediction.get("plan_source", "")
+            if blocked_by == LIVE_BREAKOUT_BLOCKED_BY:
+                blocked_reason_code = LIVE_BREAKOUT_BLOCK_REASON_CODE
+                blocked_plan_source = PAPER_ONLY_BREAKOUT_PLAN_SOURCE
+            elif blocked_by == LIVE_ANALYSIS_ONLY_BLOCKED_BY:
+                blocked_reason_code = LIVE_ANALYSIS_ONLY_REASON_CODE
+            self.append_trade_log(
+                "buy_skip",
+                code=code,
+                name=prediction.get("name", ""),
+                side="buy",
+                order_type="?쒖옣媛" if order_gubun == "03" else "吏?뺢?",
+                order_result=guard_reason,
+                quantity=0,
+                order_price=send_order_price,
+                current_price=current_price,
+                entry_price=entry_limit_price,
+                target_price=take_profit_price,
+                score=prediction.get("score", 0.0),
+                model_name=prediction.get("model_name", "DanteRule"),
+                model_score=prediction.get("model_score", ""),
+                model_action=prediction.get("model_action", ""),
+                model_target=prediction.get("model_target", ""),
+                model_threshold=prediction.get("model_threshold", ""),
+                candidate_id=prediction.get("candidate_id", ""),
+                reason_code=blocked_reason_code,
+                reason="OrderGuard block",
+                blocked_by=blocked_by,
+                plan_source=blocked_plan_source,
+                capture_price=prediction.get("capture_price", ""),
+                pullback_pct=prediction.get("pullback_pct", ""),
+                chejan_strength=prediction.get("chejan_strength", ""),
+                message="{} blocked requested_quantity={} original_reason_code={}".format(
+                    guard_reason,
+                    order_quantity,
+                    prediction.get("reason_code", ""),
+                ),
+                market_regime=prediction.get("market_regime", ""),
+                market_gate_action=prediction.get("market_gate_action", ""),
+                market_gate_reason=prediction.get("market_gate_reason", ""),
+                **_first_pullback_log_fields(prediction),
+            )
+            return
         is_guarded_non_live = bool(guard_decision is not None and not getattr(guard_decision, "live", False))
         is_paper_order = bool(getattr(guard_decision, "paper", False))
         self.order_context[code] = {
@@ -4968,6 +5625,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "placed_at": time.time(),
             "order_no": "",
         }
+        for key in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS):
+            if key in prediction:
+                self.order_context[code][key] = prediction.get(key, "")
+        self.order_context[code].update(_first_pullback_log_fields(prediction))
         self.append_trade_log(
             "would_order" if is_guarded_non_live else "buy_order",
             code=code,
@@ -5006,6 +5667,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             market_regime=prediction.get("market_regime", ""),
             market_gate_action=prediction.get("market_gate_action", ""),
             market_gate_reason=prediction.get("market_gate_reason", ""),
+            **_first_pullback_log_fields(prediction),
         )
         if is_guarded_non_live and result == 0:
             if safe_pullback_entry and stage != 1:
@@ -5925,11 +6587,16 @@ def _log_quant_condition_startup_banner():
         TRADE_LOG_SIGNAL_SOURCE,
     )
     logger.info(
-        "[조건식] HTS='%s'%s | formula_version=%s | formula=%s",
+        "[조건식] primary='%s' | bonus='%s' | HTS='%s'%s | formula_version=%s | formula=%s",
+        PRIMARY_CONDITION_NAME,
+        BONUS_CONDITION_NAME,
         CONDITION_NAME,
         legacy_condition_text,
         TRADE_LOG_CONDITION_FORMULA_VERSION,
         TRADE_LOG_CONDITION_FORMULA,
+    )
+    logger.info(
+        "[조건식 조합] QUANT_ONLY=primary 후보 | QUANT_AND_DANTE=primary 이후 bonus 강도 가점 | DANTE_ONLY=analysis/shadow 전용",
     )
     logger.info("[조건식 상세] %s", TRADE_LOG_CONDITION_RULES)
     logger.info(

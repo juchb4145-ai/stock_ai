@@ -90,6 +90,32 @@ class PullbackLowAfterHighTests(unittest.TestCase):
         self.assertEqual(agg.pullback_low_after_high("000001"), 0)
 
 
+class FirstPullbackReversalTests(unittest.TestCase):
+    def test_no_bars_returns_false(self):
+        agg = MinuteBarAggregator()
+        self.assertFalse(agg.first_pullback_reversal_confirmed("000001"))
+
+    def test_positive_current_bar_confirms_reversal(self):
+        agg = MinuteBarAggregator()
+        agg.push("000001", received_at=60, close=10_150, high=10_180, low=10_000, open_=10_050, accum_volume=0)
+
+        self.assertTrue(agg.first_pullback_reversal_confirmed("000001", current_price=10_150))
+
+    def test_previous_high_reclaim_confirms_reversal(self):
+        agg = MinuteBarAggregator()
+        agg.push("000001", received_at=60, close=10_100, high=10_250, low=10_000, open_=10_050, accum_volume=0)
+        agg.push("000001", received_at=120, close=10_250, high=10_260, low=10_120, open_=10_300, accum_volume=100)
+
+        self.assertTrue(agg.first_pullback_reversal_confirmed("000001", current_price=10_250))
+
+    def test_weak_current_bar_waits(self):
+        agg = MinuteBarAggregator()
+        agg.push("000001", received_at=60, close=10_100, high=10_250, low=10_000, open_=10_050, accum_volume=0)
+        agg.push("000001", received_at=120, close=10_180, high=10_220, low=10_120, open_=10_240, accum_volume=100)
+
+        self.assertFalse(agg.first_pullback_reversal_confirmed("000001", current_price=10_180))
+
+
 class FiveMinAtrTests(unittest.TestCase):
     def test_no_bars_atr_none(self):
         cache = FiveMinIndicatorCache()

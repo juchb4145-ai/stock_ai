@@ -5,7 +5,9 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+from trade_config import TRADE_CONFIG
 
 
 logger = logging.getLogger(__name__)
@@ -14,6 +16,142 @@ LIFECYCLE_REGISTERED = "registered"
 LIFECYCLE_REFRESHED = "refreshed"
 LIFECYCLE_EXPIRED = "expired"
 LIFECYCLE_RECREATED_AFTER_TTL = "recreated_after_ttl"
+CONDITION_COMBO_QUANT_ONLY = "QUANT_ONLY"
+CONDITION_COMBO_DANTE_ONLY = "DANTE_ONLY"
+CONDITION_COMBO_QUANT_AND_DANTE = "QUANT_AND_DANTE"
+CONDITION_SCORE_BONUS_VALUE = 1.0
+CONDITION_COMBO_META_FIELDS = (
+    "primary_condition_name",
+    "bonus_condition_name",
+    "quant_detected",
+    "dante_detected",
+    "condition_combo",
+    "condition_score_bonus",
+    "first_condition_name",
+    "last_condition_name",
+    "first_condition_detected_at",
+    "bonus_condition_detected_at",
+    "time_between_conditions_sec",
+)
+LEADER_META_FIELDS = (
+    "trade_value_since_capture",
+    "turnover_speed_per_min",
+    "volume_ratio_1m",
+    "volume_ratio_5m",
+    "turnover_rank_market",
+    "turnover_rank_sector",
+    "leader_score",
+)
+
+
+def _clamp_ratio(value: float, full_value: float) -> float:
+    if full_value <= 0:
+        return 0.0
+    return max(0.0, min(float(value or 0.0) / float(full_value), 1.0))
+
+
+def _rank_score(rank: int, ranked_count: int) -> float:
+    rank = int(rank or 0)
+    ranked_count = int(ranked_count or 0)
+    if rank <= 0 or ranked_count <= 0:
+        return 0.0
+    if ranked_count <= 1:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - ((rank - 1) / max(ranked_count - 1, 1))))
+
+
+def _condition_combo_score(condition_combo: str) -> float:
+    combo = str(condition_combo or "").upper()
+    if combo == CONDITION_COMBO_QUANT_AND_DANTE:
+        return 1.0
+    if combo == CONDITION_COMBO_QUANT_ONLY:
+        return 0.45
+    return 0.0
+
+
+def calculate_leader_score(
+    *,
+    turnover_speed_per_min: float = 0.0,
+    volume_ratio_1m: float = 0.0,
+    volume_ratio_5m: float = 0.0,
+    trade_value_since_capture: float = 0.0,
+    turnover_rank_market: int = 0,
+    ranked_count: int = 0,
+    condition_combo: str = "",
+    vwap_support_ok: bool = False,
+    chejan_strength: float = 0.0,
+    opening_phase: bool = False,
+    config=TRADE_CONFIG,
+) -> float:
+    """Score whether a candidate is a morning turnover leader.
+
+    Sector rank is intentionally left outside the formula until reliable sector
+    grouping is available. ``turnover_rank_market`` is the current fallback.
+    """
+
+    turnover_full = float(getattr(config, "leader_score_turnover_speed_full", 200_000_000.0) or 200_000_000.0)
+    trade_value_full = float(getattr(config, "leader_score_trade_value_full", 500_000_000.0) or 500_000_000.0)
+    volume_ratio_full = float(getattr(config, "leader_score_volume_ratio_full", 2.0) or 2.0)
+    chejan_full = float(getattr(config, "leader_score_chejan_full", 200.0) or 200.0)
+
+    turnover_component = _clamp_ratio(float(turnover_speed_per_min or 0.0), turnover_full)
+    trade_value_component = _clamp_ratio(float(trade_value_since_capture or 0.0), trade_value_full)
+    volume_component = _clamp_ratio(
+        float(volume_ratio_1m if opening_phase else max(volume_ratio_5m or 0.0, volume_ratio_1m or 0.0)),
+        volume_ratio_full,
+    )
+    rank_component = _rank_score(turnover_rank_market, ranked_count)
+    combo_component = _condition_combo_score(condition_combo)
+    vwap_component = 1.0 if vwap_support_ok else 0.0
+    chejan_component = _clamp_ratio(float(chejan_strength or 0.0), chejan_full)
+
+    if opening_phase:
+        weights = {
+            "turnover": 30.0,
+            "rank": 20.0,
+            "trade_value": 15.0,
+            "volume": 15.0,
+            "combo": 10.0,
+            "vwap": 5.0,
+            "chejan": 5.0,
+        }
+    else:
+        weights = {
+            "turnover": 20.0,
+            "rank": 10.0,
+            "trade_value": 20.0,
+            "volume": 15.0,
+            "combo": 10.0,
+            "vwap": 15.0,
+            "chejan": 10.0,
+        }
+    score = (
+        turnover_component * weights["turnover"]
+        + rank_component * weights["rank"]
+        + trade_value_component * weights["trade_value"]
+        + volume_component * weights["volume"]
+        + combo_component * weights["combo"]
+        + vwap_component * weights["vwap"]
+        + chejan_component * weights["chejan"]
+    )
+    return round(max(0.0, min(score, 100.0)), 2)
+
+
+def candidate_leader_priority(candidate: "Candidate") -> Tuple[int, float, int, float]:
+    meta = candidate.meta or {}
+    combo = str(meta.get("condition_combo", "") or "").upper()
+    combo_rank = {
+        CONDITION_COMBO_QUANT_AND_DANTE: 0,
+        CONDITION_COMBO_QUANT_ONLY: 1,
+        CONDITION_COMBO_DANTE_ONLY: 2,
+    }.get(combo, 3)
+    rank = int(candidate.turnover_rank_market or meta.get("turnover_rank_market", 0) or 0)
+    return (
+        combo_rank,
+        -float(candidate.leader_score or meta.get("leader_score", 0.0) or 0.0),
+        rank if rank > 0 else 999_999,
+        float(candidate.first_detected_at or candidate.detected_at or 0.0),
+    )
 
 
 @dataclass
@@ -35,6 +173,12 @@ class Candidate:
     last_accum_volume: int = 0
     volume_since_capture: int = 0
     trade_value_since_capture: int = 0
+    turnover_speed_per_min: float = 0.0
+    volume_ratio_1m: float = 0.0
+    volume_ratio_5m: float = 0.0
+    turnover_rank_market: int = 0
+    turnover_rank_sector: int = 0
+    leader_score: float = 0.0
     entry_trigger_price: int = 0
     last_price: int = 0
     last_chejan_strength: float = 0.0
@@ -42,6 +186,10 @@ class Candidate:
     recent_low_price: int = 0
     min_price_after_capture: int = 0
     max_price_after_capture: int = 0
+    high_since_capture: int = 0
+    low_after_high: int = 0
+    pullback_from_high_pct: float = 0.0
+    rebound_from_low_pct: float = 0.0
     status: str = "WATCHING"
     refresh_count: int = 0
     duplicate_policy: str = DUPLICATE_POLICY_KEEP_FIRST
@@ -67,10 +215,52 @@ class Candidate:
             self.min_price_after_capture = int(self.capture_price)
         if self.max_price_after_capture <= 0 and self.capture_price > 0:
             self.max_price_after_capture = int(self.capture_price)
+        if self.high_since_capture <= 0 and self.max_price_after_capture > 0:
+            self.high_since_capture = int(self.max_price_after_capture)
         if not self.last_condition_name:
             self.last_condition_name = self.condition_name
         if not self.last_signal_source:
             self.last_signal_source = self.signal_source
+
+    def _refresh_pullback_metrics(self, price: int) -> None:
+        high = int(self.high_since_capture or self.max_price_after_capture or 0)
+        low = int(self.low_after_high or 0)
+        if high > 0 and price > 0 and high > self.capture_price:
+            self.pullback_from_high_pct = max((high - int(price)) / high, 0.0)
+        else:
+            self.pullback_from_high_pct = 0.0
+        if low > 0 and price > 0:
+            self.rebound_from_low_pct = max(int(price) / low - 1, 0.0)
+        else:
+            self.rebound_from_low_pct = 0.0
+
+    def update_leader_metrics(
+        self,
+        *,
+        trade_value_since_capture: Optional[int] = None,
+        turnover_speed_per_min: Optional[float] = None,
+        volume_ratio_1m: Optional[float] = None,
+        volume_ratio_5m: Optional[float] = None,
+        turnover_rank_market: Optional[int] = None,
+        turnover_rank_sector: Optional[int] = None,
+        leader_score: Optional[float] = None,
+    ) -> None:
+        if trade_value_since_capture is not None:
+            self.trade_value_since_capture = int(max(0, int(trade_value_since_capture or 0)))
+        if turnover_speed_per_min is not None:
+            self.turnover_speed_per_min = float(max(0.0, float(turnover_speed_per_min or 0.0)))
+        if volume_ratio_1m is not None:
+            self.volume_ratio_1m = float(max(0.0, float(volume_ratio_1m or 0.0)))
+        if volume_ratio_5m is not None:
+            self.volume_ratio_5m = float(max(0.0, float(volume_ratio_5m or 0.0)))
+        if turnover_rank_market is not None:
+            self.turnover_rank_market = int(max(0, int(turnover_rank_market or 0)))
+        if turnover_rank_sector is not None:
+            self.turnover_rank_sector = int(max(0, int(turnover_rank_sector or 0)))
+        if leader_score is not None:
+            self.leader_score = float(max(0.0, min(float(leader_score or 0.0), 100.0)))
+        for field_name in LEADER_META_FIELDS:
+            self.meta[field_name] = getattr(self, field_name)
 
     def on_tick(
         self,
@@ -81,6 +271,12 @@ class Candidate:
         volume_delta: int = 0,
         trade_value: int = 0,
         entry_trigger_price: int = 0,
+        turnover_speed_per_min: Optional[float] = None,
+        volume_ratio_1m: Optional[float] = None,
+        volume_ratio_5m: Optional[float] = None,
+        turnover_rank_market: Optional[int] = None,
+        turnover_rank_sector: Optional[int] = None,
+        leader_score: Optional[float] = None,
     ) -> bool:
         if price <= 0:
             return False
@@ -107,7 +303,10 @@ class Candidate:
             self.recent_low_price = int(price)
             self.min_price_after_capture = int(price)
             self.max_price_after_capture = int(price)
+            self.high_since_capture = int(price)
+            self.low_after_high = 0
         else:
+            previous_high = int(self.high_since_capture or self.max_price_after_capture or self.capture_price or 0)
             self.recent_low_price = min(self.recent_low_price or int(price), int(price))
             self.min_price_after_capture = min(
                 self.min_price_after_capture or int(price),
@@ -117,6 +316,24 @@ class Candidate:
                 self.max_price_after_capture or int(price),
                 int(price),
             )
+            self.high_since_capture = max(
+                self.high_since_capture or self.max_price_after_capture or int(price),
+                self.max_price_after_capture,
+                int(price),
+            )
+            if int(price) > previous_high:
+                self.low_after_high = 0
+            elif self.high_since_capture > self.capture_price and int(price) < self.high_since_capture:
+                self.low_after_high = min(self.low_after_high or int(price), int(price))
+        self._refresh_pullback_metrics(int(price))
+        self.update_leader_metrics(
+            turnover_speed_per_min=turnover_speed_per_min,
+            volume_ratio_1m=volume_ratio_1m,
+            volume_ratio_5m=volume_ratio_5m,
+            turnover_rank_market=turnover_rank_market,
+            turnover_rank_sector=turnover_rank_sector,
+            leader_score=leader_score,
+        )
         return first_capture
 
     def age_seconds(self, now: Optional[float] = None) -> float:
@@ -140,10 +357,121 @@ class CandidateRegistry:
         *,
         signal_source: str = "HTS_CONDITION_SEARCH",
         candidate_expiry_seconds: int = 0,
+        primary_condition_name: str = "",
+        bonus_condition_name: str = "",
+        condition_score_bonus_value: float = CONDITION_SCORE_BONUS_VALUE,
     ):
         self.signal_source = signal_source
         self.candidate_expiry_seconds = int(candidate_expiry_seconds or 0)
+        self.primary_condition_name = str(
+            primary_condition_name
+            or getattr(TRADE_CONFIG, "primary_condition_name", "")
+            or getattr(TRADE_CONFIG, "condition_name", "")
+            or ""
+        )
+        self.bonus_condition_name = str(
+            bonus_condition_name
+            or getattr(TRADE_CONFIG, "bonus_condition_name", "")
+            or getattr(TRADE_CONFIG, "legacy_condition_name", "")
+            or ""
+        )
+        self.condition_score_bonus_value = float(condition_score_bonus_value or 0.0)
         self._candidates: Dict[str, Candidate] = {}
+
+    @staticmethod
+    def _normalize_condition_name(condition_name: str) -> str:
+        return str(condition_name or "").strip()
+
+    def is_primary_condition(self, condition_name: str) -> bool:
+        name = self._normalize_condition_name(condition_name)
+        aliases = {
+            self._normalize_condition_name(self.primary_condition_name),
+            self._normalize_condition_name(getattr(TRADE_CONFIG, "condition_name", "")),
+        }
+        aliases.discard("")
+        return bool(name and name in aliases)
+
+    def is_bonus_condition(self, condition_name: str) -> bool:
+        name = self._normalize_condition_name(condition_name)
+        aliases = {
+            self._normalize_condition_name(self.bonus_condition_name),
+            self._normalize_condition_name(getattr(TRADE_CONFIG, "legacy_condition_name", "")),
+        }
+        aliases.discard("")
+        return bool(name and name in aliases)
+
+    def condition_role(self, condition_name: str) -> str:
+        if self.is_primary_condition(condition_name):
+            return "primary"
+        if self.is_bonus_condition(condition_name):
+            return "bonus"
+        return "unknown"
+
+    def _apply_condition_combo_meta(
+        self,
+        candidate: Candidate,
+        *,
+        condition_name: str,
+        detected_at: float,
+    ) -> None:
+        name = self._normalize_condition_name(condition_name)
+        if not name:
+            return
+        is_primary = self.is_primary_condition(name)
+        is_bonus = self.is_bonus_condition(name)
+        if not is_primary and not is_bonus:
+            candidate.meta.setdefault("primary_condition_name", self.primary_condition_name)
+            candidate.meta.setdefault("bonus_condition_name", self.bonus_condition_name)
+            candidate.meta.setdefault("last_condition_name", name)
+            return
+
+        meta = candidate.meta
+        meta["primary_condition_name"] = self.primary_condition_name
+        meta["bonus_condition_name"] = self.bonus_condition_name
+        if not meta.get("first_condition_name"):
+            meta["first_condition_name"] = name
+        if not meta.get("first_condition_detected_at"):
+            meta["first_condition_detected_at"] = float(detected_at or time.time())
+        meta["last_condition_name"] = name
+
+        if is_primary:
+            meta["quant_detected"] = True
+            meta.setdefault("primary_condition_detected_at", float(detected_at or time.time()))
+        else:
+            meta["quant_detected"] = bool(meta.get("quant_detected", False))
+
+        if is_bonus:
+            meta["dante_detected"] = True
+            if not meta.get("bonus_condition_detected_at"):
+                meta["bonus_condition_detected_at"] = float(detected_at or time.time())
+        else:
+            meta["dante_detected"] = bool(meta.get("dante_detected", False))
+
+        quant_detected = bool(meta.get("quant_detected", False))
+        dante_detected = bool(meta.get("dante_detected", False))
+        if quant_detected and dante_detected:
+            meta["condition_combo"] = CONDITION_COMBO_QUANT_AND_DANTE
+        elif quant_detected:
+            meta["condition_combo"] = CONDITION_COMBO_QUANT_ONLY
+        elif dante_detected:
+            meta["condition_combo"] = CONDITION_COMBO_DANTE_ONLY
+        else:
+            meta["condition_combo"] = ""
+
+        first_ts = float(meta.get("first_condition_detected_at", 0.0) or 0.0)
+        primary_ts = float(meta.get("primary_condition_detected_at", 0.0) or 0.0)
+        bonus_ts = float(meta.get("bonus_condition_detected_at", 0.0) or 0.0)
+        if quant_detected and dante_detected:
+            other_ts = primary_ts if is_bonus else bonus_ts
+            if other_ts > 0:
+                meta["time_between_conditions_sec"] = abs(float(detected_at) - other_ts)
+            elif first_ts > 0:
+                meta["time_between_conditions_sec"] = abs(float(detected_at) - first_ts)
+        else:
+            meta["time_between_conditions_sec"] = 0.0
+        meta["condition_score_bonus"] = (
+            self.condition_score_bonus_value if dante_detected else 0.0
+        )
 
     def register_detection(
         self,
@@ -187,9 +515,15 @@ class CandidateRegistry:
                 recent_low_price=int(capture_price or 0),
                 min_price_after_capture=int(capture_price or 0),
                 max_price_after_capture=int(capture_price or 0),
+                high_since_capture=int(capture_price or 0),
                 last_condition_name=condition_name,
                 last_signal_source=source,
                 meta=dict(meta or {}),
+            )
+            self._apply_condition_combo_meta(
+                candidate,
+                condition_name=condition_name,
+                detected_at=now,
             )
             self._candidates[code] = candidate
             if old_candidate is not None:
@@ -218,6 +552,11 @@ class CandidateRegistry:
                 candidate.meta["last_capture_accum_volume"] = int(capture_accum_volume or 0)
             if meta:
                 candidate.meta.update(meta)
+            self._apply_condition_combo_meta(
+                candidate,
+                condition_name=condition_name,
+                detected_at=now,
+            )
             self._log_duplicate_refresh(candidate, now, ttl)
         return candidate
 
@@ -246,6 +585,18 @@ class CandidateRegistry:
             "capture_price": candidate.capture_price or None,
             "min_price_after_capture": candidate.min_price_after_capture or None,
             "max_price_after_capture": candidate.max_price_after_capture or None,
+            "recent_low_price": candidate.recent_low_price or None,
+            "high_since_capture": candidate.high_since_capture or candidate.max_price_after_capture or None,
+            "low_after_high": candidate.low_after_high or None,
+            "pullback_from_high_pct": candidate.pullback_from_high_pct,
+            "rebound_from_low_pct": candidate.rebound_from_low_pct,
+            "trade_value_since_capture": candidate.trade_value_since_capture,
+            "turnover_speed_per_min": candidate.turnover_speed_per_min,
+            "volume_ratio_1m": candidate.volume_ratio_1m,
+            "volume_ratio_5m": candidate.volume_ratio_5m,
+            "turnover_rank_market": candidate.turnover_rank_market,
+            "turnover_rank_sector": candidate.turnover_rank_sector,
+            "leader_score": candidate.leader_score,
             "refresh_count": candidate.refresh_count,
             "candidate_age_sec": candidate.age_seconds(now),
             "ttl_sec": int(ttl or 0),
@@ -261,6 +612,8 @@ class CandidateRegistry:
             "capture_allowed",
             "manage_allowed",
             "analysis_allowed",
+            *CONDITION_COMBO_META_FIELDS,
+            *LEADER_META_FIELDS,
         ):
             if key in candidate.meta:
                 payload[key] = candidate.meta.get(key)
@@ -279,6 +632,8 @@ class CandidateRegistry:
         capture = int(candidate.capture_price or candidate.first_capture_price or 0)
         min_price = int(candidate.min_price_after_capture or candidate.recent_low_price or 0)
         max_price = int(candidate.max_price_after_capture or candidate.last_price or 0)
+        high_since = int(candidate.high_since_capture or max_price or 0)
+        low_after_high = int(candidate.low_after_high or 0)
         max_pullback_pct = (
             (capture - min_price) / capture
             if capture > 0 and min_price > 0 and min_price < capture
@@ -302,6 +657,18 @@ class CandidateRegistry:
                 "capture_price": capture or None,
                 "min_price_after_capture": min_price or None,
                 "max_price_after_capture": max_price or None,
+                "recent_low_price": candidate.recent_low_price or None,
+                "high_since_capture": high_since or None,
+                "low_after_high": low_after_high or None,
+                "pullback_from_high_pct": candidate.pullback_from_high_pct,
+                "rebound_from_low_pct": candidate.rebound_from_low_pct,
+                "trade_value_since_capture": candidate.trade_value_since_capture,
+                "turnover_speed_per_min": candidate.turnover_speed_per_min,
+                "volume_ratio_1m": candidate.volume_ratio_1m,
+                "volume_ratio_5m": candidate.volume_ratio_5m,
+                "turnover_rank_market": candidate.turnover_rank_market,
+                "turnover_rank_sector": candidate.turnover_rank_sector,
+                "leader_score": candidate.leader_score,
                 "max_pullback_pct": max_pullback_pct,
                 "max_return_pct": max_return_pct,
                 "time_policy_block_count": int(meta.get("time_policy_block_count", 0) or 0),
@@ -402,6 +769,12 @@ class CandidateRegistry:
         volume_delta: int = 0,
         trade_value: int = 0,
         entry_trigger_price: int = 0,
+        turnover_speed_per_min: Optional[float] = None,
+        volume_ratio_1m: Optional[float] = None,
+        volume_ratio_5m: Optional[float] = None,
+        turnover_rank_market: Optional[int] = None,
+        turnover_rank_sector: Optional[int] = None,
+        leader_score: Optional[float] = None,
     ) -> bool:
         candidate = self._candidates.get(code)
         if candidate is None:
@@ -413,6 +786,12 @@ class CandidateRegistry:
             volume_delta=volume_delta,
             trade_value=trade_value,
             entry_trigger_price=entry_trigger_price,
+            turnover_speed_per_min=turnover_speed_per_min,
+            volume_ratio_1m=volume_ratio_1m,
+            volume_ratio_5m=volume_ratio_5m,
+            turnover_rank_market=turnover_rank_market,
+            turnover_rank_sector=turnover_rank_sector,
+            leader_score=leader_score,
         )
 
     def record_gate_result(
@@ -451,6 +830,17 @@ class CandidateRegistry:
 
     def codes(self):
         return set(self._candidates.keys())
+
+    def ranked_candidates(self, *, include_analysis: bool = False) -> List[Candidate]:
+        candidates = list(self._candidates.values())
+        if not include_analysis:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if (candidate.meta or {}).get("candidate_role") != "analysis_only"
+                and (candidate.meta or {}).get("condition_combo") != CONDITION_COMBO_DANTE_ONLY
+            ]
+        return sorted(candidates, key=candidate_leader_priority)
 
     def expire(self, *, now: Optional[float] = None, expiry_seconds: int = 0):
         expired = []

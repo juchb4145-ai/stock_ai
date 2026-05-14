@@ -22,10 +22,20 @@ class ConditionCaptureLoggerTests(unittest.TestCase):
                 code="A005930",
                 candidate_id="candidate-1",
                 name="삼성전자",
-                condition_name="퀀트조건식",
+                condition_name="단테떡상이_수정",
                 strategy_name="momentum-test",
                 signal_source="HTS_CONDITION_SEARCH",
                 detected_at="2026-05-13 09:00:00",
+                condition_meta={
+                    "primary_condition_name": "단테떡상이_수정",
+                    "bonus_condition_name": "단테떡상이",
+                    "quant_detected": True,
+                    "dante_detected": False,
+                    "condition_combo": "QUANT_ONLY",
+                    "condition_score_bonus": 0.0,
+                    "first_condition_name": "단테떡상이_수정",
+                    "last_condition_name": "단테떡상이_수정",
+                },
             )
 
             rows = read_condition_captures(str(path))
@@ -34,7 +44,13 @@ class ConditionCaptureLoggerTests(unittest.TestCase):
             self.assertEqual(rows[0]["symbol"], "A005930")
             self.assertEqual(rows[0]["symbol_name"], "삼성전자")
             self.assertEqual(rows[0]["strategy_name"], "momentum-test")
-            self.assertEqual(rows[0]["condition_name"], "퀀트조건식")
+            self.assertEqual(rows[0]["condition_name"], "단테떡상이_수정")
+            self.assertEqual(rows[0]["primary_condition_name"], "단테떡상이_수정")
+            self.assertEqual(rows[0]["bonus_condition_name"], "단테떡상이")
+            self.assertEqual(rows[0]["quant_detected"], "True")
+            self.assertEqual(rows[0]["dante_detected"], "False")
+            self.assertEqual(rows[0]["condition_combo"], "QUANT_ONLY")
+            self.assertEqual(rows[0]["condition_score_bonus"], "0.0")
             self.assertEqual(rows[0]["signal_source"], "HTS_CONDITION_SEARCH")
             self.assertEqual(rows[0]["source_event"], "condition_detected")
             self.assertEqual(rows[0]["created_at"], rows[0]["logged_at"])

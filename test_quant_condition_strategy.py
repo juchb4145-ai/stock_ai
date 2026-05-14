@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from bars import MinuteBar
 from condition_capture_logger import ConditionCaptureLogger, read_condition_captures
 from quant_backtest import (
     BacktestExecutionConfig,
@@ -113,6 +114,131 @@ class QuantConditionStrategyTests(unittest.TestCase):
         )
         self.assertEqual(blocked.reason_code, "SAFE_CHEJAN_WAIT")
         self.assertEqual(blocked.min_chejan_strength, 110.0)
+
+    def test_high_since_capture_pullback_can_pass_even_above_capture_price(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_450,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_450,
+            intraday_vwap=10_420,
+            one_min_reversal=True,
+        )
+
+        self.assertEqual(decision.status, "ready")
+        self.assertEqual(decision.reason_code, "QUANT_FIRST_PULLBACK_READY")
+        self.assertAlmostEqual(decision.pullback_from_high_pct, (10_800 - 10_500) / 10_800)
+        self.assertAlmostEqual(decision.rebound_from_low_pct, 10_500 / 10_450 - 1)
+        self.assertTrue(decision.vwap_support_ok)
+        self.assertTrue(decision.first_pullback_ready)
+
+    def test_high_since_capture_pullback_is_shallow(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_650,
+            current_price=10_700,
+            chejan_strength=125,
+            recent_low_price=10_650,
+            one_min_reversal=True,
+        )
+
+        self.assertEqual(decision.status, "wait")
+        self.assertEqual(decision.reason_code, "SAFE_PULLBACK_FROM_HIGH_SHALLOW")
+
+    def test_high_since_capture_pullback_too_deep(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_360,
+            current_price=10_400,
+            chejan_strength=125,
+            recent_low_price=10_360,
+            one_min_reversal=True,
+        )
+
+        self.assertEqual(decision.status, "wait")
+        self.assertEqual(decision.reason_code, "SAFE_PULLBACK_FROM_HIGH_TOO_DEEP")
+
+    def test_high_since_capture_requires_low_after_high_and_rebound(self):
+        missing_low = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=0,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_450,
+            one_min_reversal=True,
+        )
+        self.assertEqual(missing_low.reason_code, "SAFE_LOW_AFTER_HIGH_MISSING")
+
+        no_rebound = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_490,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_490,
+            one_min_reversal=True,
+        )
+        self.assertEqual(no_rebound.reason_code, "SAFE_REBOUND_FROM_LOW_WAIT")
+
+    def test_high_since_capture_vwap_and_strength_gates(self):
+        below_vwap = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_450,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_450,
+            intraday_vwap=10_600,
+            one_min_reversal=True,
+        )
+        self.assertEqual(below_vwap.reason_code, "SAFE_VWAP_SUPPORT_WAIT")
+        self.assertFalse(below_vwap.vwap_support_ok)
+
+        weak = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_450,
+            current_price=10_500,
+            chejan_strength=99,
+            recent_low_price=10_450,
+            intraday_vwap=10_420,
+            one_min_reversal=True,
+        )
+        self.assertEqual(weak.reason_code, "SAFE_CHEJAN_WAIT")
+
+    def test_one_minute_reversal_can_confirm_with_positive_bar_or_prev_high_reclaim(self):
+        positive_bar = [
+            MinuteBar(0, 10_470, 10_520, 10_430, 10_500, 100, 0),
+        ]
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_450,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_450,
+            minute_bars=positive_bar,
+        )
+        self.assertEqual(decision.reason_code, "QUANT_FIRST_PULLBACK_READY")
+
+        weak_bar = [
+            MinuteBar(0, 10_520, 10_540, 10_480, 10_490, 100, 0),
+        ]
+        wait = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_450,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_450,
+            minute_bars=weak_bar,
+        )
+        self.assertEqual(wait.reason_code, "SAFE_ONE_MIN_REVERSAL_WAIT")
 
     def test_exit_sells_all_at_profit_or_stop(self):
         profit = self.strategy.evaluate_exit(entry_price=10_000, current_price=10_200)
