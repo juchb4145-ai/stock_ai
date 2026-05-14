@@ -1,0 +1,5 @@
+﻿code,detected_at,capture_price,evaluated_at,current_price,decision,entry_price,stop_price,take_profit_price,reason,reason_code,chase_risk_score,pullback_pct,volume_ratio,spread_rate,upper_wick_ratio
+BUY1,2026-05-13 09:30:00,10000,2026-05-13 09:34:00,9850,BUY,9850,9702,10047,pullback entry confirmed pullback=1.50% strength=126.0 volume_ratio=1.56,BUY_PULLBACK_CONFIRMED,24.1667,0.015,1.560976,0.001,0.25
+WAIT1,2026-05-13 09:30:00,10000,2026-05-13 09:34:00,9950,WAIT_PULLBACK,,,,waiting for first pullback pullback=0.50% < 1.50%,WAIT_PULLBACK,24.1667,0.005,1.346939,0.001,0.25
+BLOCK1,2026-05-13 09:30:00,10000,2026-05-13 09:34:00,10500,BLOCK_CHASE,,,,chase distance too high 5.00% > 4.00%,BLOCK_CHASE_DISTANCE,78.1944,-0.05,1.560976,0.001,0.133333
+REJECT1,2026-05-13 09:30:00,10000,2026-05-13 09:34:00,9850,REJECT,,,,trade strength weak 80.0 < 100.0,REJECT_TRADE_STRENGTH,24.1667,0.015,2.173913,0.001,0.25

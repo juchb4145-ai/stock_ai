@@ -62,6 +62,12 @@ def _prediction(**overrides):
         "model_target": "reached_1r",
         "model_threshold": 0.58,
         "market_gate_action": entry_strategy.MARKET_ACTION_ALLOW,
+        "final_entry_allowed": True,
+        "final_reason": "test final pass",
+        "final_reason_code": "FINAL_BUY_READY",
+        "strategy_version": "test",
+        "legacy_filter_enabled": True,
+        "decision_trace": {"test": True},
     }
     payload.update(overrides)
     return payload
@@ -216,6 +222,22 @@ class RiskTooWideWatchTests(unittest.TestCase):
         _code, prediction, _ratio, _stage = kw.placed_orders[0]
         self.assertEqual(prediction["entry_limit_price"], 10_000)
         self.assertEqual(prediction["stop_price"], 9_850)
+
+    def test_recheck_without_final_entry_decision_does_not_order(self):
+        kw = _WatchStub()
+        kw.prediction.pop("final_entry_allowed", None)
+        kw.prediction.pop("final_reason", None)
+        kw.prediction.pop("final_reason_code", None)
+        kw.risk_too_wide_watchlist["000001"] = {
+            "deadline": time.time() + 600,
+            "last_recheck_at": time.time() - main.RISK_TOO_WIDE_RECHECK_INTERVAL_SECONDS - 1,
+            "best_risk_pct": 0.03,
+        }
+
+        kw.handle_condition_stock("A000001")
+
+        self.assertEqual(kw.placed_orders, [])
+        self.assertTrue(any(call[0][0] == "buy_skip" for call in kw.trade_logs))
 
 
 if __name__ == "__main__":

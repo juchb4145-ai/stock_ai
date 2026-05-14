@@ -24,6 +24,7 @@ Kiwoom._sync_position_from_dicts 를 통해 양쪽이 동기화된다.
     - pullback_window_deadline / entry1_time / entry2_time
     - breakout_grade       ("A"/"B" 분할 매수 분기 식별자)
     - pending_sell_intent  (잃으면 큐에 들어 있던 매도 의도가 사라짐)
+    - candidate_id         (복기/매수-매도 join key)
 
   반대로 quantity / available_quantity / entry_price / pending_buy / pending_sell
   은 부팅 시 키움 잔고/미체결 TR 응답으로 덮어쓰여야 하므로 디스크 본을 무시한다.
@@ -41,7 +42,7 @@ from typing import Any, Dict, Optional, Set
 _logger = logging.getLogger(__name__)
 
 
-# 디스크 영속화에 포함시키는 필드들. 위 docstring 의 "잃으면 안 되는 8개" 이외에
+# 디스크 영속화에 포함시키는 필드들. 위 docstring 의 "잃으면 안 되는 필드" 이외에
 # audit 가독성을 위해 보존해 두면 좋은 항목(name/r_unit_pct/highest_price 등)도 포함.
 # quantity/available_quantity/entry_price/pending_* 같은 휘발성 필드는 의도적으로 제외.
 _PERSISTED_POSITION_FIELDS = (
@@ -53,6 +54,7 @@ _PERSISTED_POSITION_FIELDS = (
     "entry_time",
     "bought_today",
     "pending_sell_intent",
+    "candidate_id",
     "order_context",
     "entry_stage",
     "planned_quantity",
@@ -79,7 +81,7 @@ _PERSISTED_FLOAT_FIELDS = frozenset({
     "r_unit_pct", "pullback_window_deadline",
 })
 _PERSISTED_BOOL_FIELDS = frozenset({"bought_today", "partial_taken"})
-_PERSISTED_STR_FIELDS = frozenset({"name", "breakout_grade"})
+_PERSISTED_STR_FIELDS = frozenset({"name", "breakout_grade", "candidate_id"})
 
 
 # 캐스트 실패 sentinel. None 은 정상 값(pending_sell_intent 등)이라 별도 sentinel 사용.
@@ -154,6 +156,7 @@ class Position:
     pending_buy: bool = False
     pending_sell: bool = False
     pending_sell_intent: Optional[dict] = None
+    candidate_id: str = ""
     order_context: dict = field(default_factory=dict)
 
     # === 단테 분할매수/청산 상태 (1차 추격 + 2차 본진입 + R-multiple 트레일링) ===

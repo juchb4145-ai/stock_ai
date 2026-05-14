@@ -65,11 +65,28 @@ class _StubKiwoom:
         self.pending_order_codes: set = set()
         self.pending_sell_order_codes: set = set()
         self.order_context: dict = {}
-        self.send_order_calls: list = []
+        self.guarded_order_calls: list = []
         self.trade_log_calls: list = []
 
     def send_order(self, *args, **kwargs):
-        self.send_order_calls.append((args, kwargs))
+        raise AssertionError("cancel_stale_buy_orders must use submit_order_guarded")
+
+    def submit_order_guarded(self, request):
+        self.guarded_order_calls.append(
+            (
+                (
+                    request.rqname,
+                    request.screen_no,
+                    request.order_type,
+                    request.code,
+                    request.quantity,
+                    request.price,
+                    request.order_gubun,
+                    request.order_no,
+                ),
+                {},
+            )
+        )
         return 0
 
     def append_trade_log(self, *args, **kwargs):
@@ -91,9 +108,9 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "take_profit_price": 10_400,
         }
         kw.cancel_stale_buy_orders()
-        self.assertEqual(len(kw.send_order_calls), 1)
-        args = kw.send_order_calls[0][0]
-        # send_order(rqname, screen_no, order_type, code, qty, price, gubun, order_no)
+        self.assertEqual(len(kw.guarded_order_calls), 1)
+        args = kw.guarded_order_calls[0][0]
+        # submit_order_guarded(OrderRequest(...)) materializes these guarded order args.
         self.assertEqual(args[0], "buy_cancel")
         self.assertEqual(args[2], 3)  # order_type=3 (매수 취소)
         self.assertEqual(args[3], "000001")
@@ -112,7 +129,7 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "expiry_seconds": 45,
         }
         kw.cancel_stale_buy_orders()
-        self.assertEqual(kw.send_order_calls, [])
+        self.assertEqual(kw.guarded_order_calls, [])
         self.assertNotIn("cancel_requested_at", kw.order_context["000001"])
 
     def test_skips_when_no_order_no(self):
@@ -127,7 +144,7 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "expiry_seconds": 45,
         }
         kw.cancel_stale_buy_orders()
-        self.assertEqual(kw.send_order_calls, [])
+        self.assertEqual(kw.guarded_order_calls, [])
 
     def test_skips_when_sell_side(self):
         kw = _StubKiwoom()
@@ -141,7 +158,7 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "expiry_seconds": 45,
         }
         kw.cancel_stale_buy_orders()
-        self.assertEqual(kw.send_order_calls, [])
+        self.assertEqual(kw.guarded_order_calls, [])
 
     def test_does_not_double_cancel(self):
         # 이미 cancel_requested_at 이 최근(10초 이내) 마킹된 주문은 다시 취소 발사 안 함.
@@ -156,7 +173,7 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "cancel_requested_at": now - 2,  # 2초 전 이미 발사
         }
         kw.cancel_stale_buy_orders()
-        self.assertEqual(kw.send_order_calls, [])
+        self.assertEqual(kw.guarded_order_calls, [])
 
     def test_re_cancels_after_long_silence(self):
         # 10초 이상 chejan 응답 없이 만료 점검이 또 돌면 재발사(키움이 첫 취소를 누락한 경우 대비).
@@ -171,7 +188,7 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "cancel_requested_at": now - 30,  # 30초 전 첫 발사
         }
         kw.cancel_stale_buy_orders()
-        self.assertEqual(len(kw.send_order_calls), 1)
+        self.assertEqual(len(kw.guarded_order_calls), 1)
 
     def test_cancels_multiple_codes_independently(self):
         kw = _StubKiwoom()
@@ -200,7 +217,7 @@ class CancelStaleBuyOrdersTests(unittest.TestCase):
             "expiry_seconds": 45,
         }
         kw.cancel_stale_buy_orders()
-        cancelled_codes = {call[0][3] for call in kw.send_order_calls}
+        cancelled_codes = {call[0][3] for call in kw.guarded_order_calls}
         self.assertEqual(cancelled_codes, {"000001"})
 
 

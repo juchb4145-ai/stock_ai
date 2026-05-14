@@ -1,106 +1,118 @@
 from __future__ import annotations
 
-import sys
-import types
 import unittest
-from unittest import mock
+from datetime import datetime
+
+from time_policy import (
+    ALLOW_ENTRY,
+    ALLOW_MANAGE_ONLY,
+    BLOCK_AFTER_ENTRY_CUTOFF,
+    BLOCK_CLOSING_AUCTION,
+    BLOCK_NON_TRADING_DAY,
+    BLOCK_OPENING_STABILIZATION,
+    BLOCK_PRE_OPEN,
+    CLOSING_AUCTION_EMERGENCY_EXIT,
+    FORCE_EXIT_WINDOW,
+    TimePolicy,
+    load_timezone,
+)
+from trade_config import TradeConfig
 
 
-def _ensure_external_stubs() -> None:
-    if "PyQt5" not in sys.modules:
-        qax = types.ModuleType("PyQt5.QAxContainer")
-        qax.QAxWidget = mock.MagicMock
-        qax.__all__ = ["QAxWidget"]
-
-        widgets = types.ModuleType("PyQt5.QtWidgets")
-        widgets.QApplication = mock.MagicMock
-        widgets.QWidget = mock.MagicMock
-        widgets.__all__ = ["QApplication", "QWidget"]
-
-        core = types.ModuleType("PyQt5.QtCore")
-        core.QTimer = mock.MagicMock
-        core.QObject = mock.MagicMock
-        core.pyqtSignal = mock.MagicMock()
-        core.__all__ = ["QTimer", "QObject", "pyqtSignal"]
-
-        pyqt5 = types.ModuleType("PyQt5")
-        pyqt5.QAxContainer = qax
-        pyqt5.QtWidgets = widgets
-        pyqt5.QtCore = core
-
-        sys.modules["PyQt5"] = pyqt5
-        sys.modules["PyQt5.QAxContainer"] = qax
-        sys.modules["PyQt5.QtWidgets"] = widgets
-        sys.modules["PyQt5.QtCore"] = core
-
-    if "pandas" not in sys.modules:
-        sys.modules["pandas"] = mock.MagicMock()
+SEOUL = load_timezone("Asia/Seoul")
 
 
-_ensure_external_stubs()
-
-import main  # noqa: E402
-
-
-class _TimeFilterStub:
-    normalize_code = main.Kiwoom.normalize_code
-    parse_int = main.Kiwoom.parse_int
-    realtime_daily_turnover = main.Kiwoom.realtime_daily_turnover
-    realtime_turnover_rank = main.Kiwoom.realtime_turnover_rank
-    evaluate_time_filter = main.Kiwoom.evaluate_time_filter
-
-    def __init__(self, hhmmss: int) -> None:
-        self.hhmmss = hhmmss
-        self.realtime_ticks = {}
-
-    def current_hhmmss(self) -> int:
-        return self.hhmmss
+def _at(clock: str, *, day: str = "2026-05-13") -> datetime:
+    hour, minute, second = [int(part) for part in clock.split(":")]
+    year, month, month_day = [int(part) for part in day.split("-")]
+    return datetime(year, month, month_day, hour, minute, second, tzinfo=SEOUL)
 
 
-class TimeFilterTests(unittest.TestCase):
-    def test_morning_allows_even_without_turnover_threshold(self):
-        kw = _TimeFilterStub(93000)
+class TimePolicyTests(unittest.TestCase):
+    def test_blocks_before_regular_open(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("08:59:00"))
 
-        out = kw.evaluate_time_filter("000001", current_price=10_000, accum_volume=1)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_PRE_OPEN)
 
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["phase"], "morning")
-        self.assertGreater(out["weight"], 1.0)
+    def test_blocks_opening_stabilization_period(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("09:01:00"))
 
-    def test_morning_keeps_turnover_metadata_for_logs(self):
-        kw = _TimeFilterStub(93000)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_OPENING_STABILIZATION)
+        self.assertIn("09:03:00", decision.next_allowed_time)
 
-        out = kw.evaluate_time_filter("000001", current_price=10_000, accum_volume=500_000)
+    def test_allows_main_entry_window(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("09:05:00"))
 
-        self.assertTrue(out["ok"])
-        self.assertEqual(out["phase"], "morning")
-        self.assertEqual(out["daily_turnover"], 5_000_000_000)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.action, ALLOW_ENTRY)
 
-    def test_midday_blocks_new_buys(self):
-        kw = _TimeFilterStub(110000)
+    def test_midday_entry_depends_on_configured_windows_and_defaults_to_block(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("10:45:00"))
 
-        out = kw.evaluate_time_filter("000001", current_price=10_000, accum_volume=5_000_000)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.action, ALLOW_MANAGE_ONLY)
+        self.assertIn("13:00:00", decision.next_allowed_time)
 
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["status"], "blocked")
-        self.assertEqual(out["phase"], "midday")
+    def test_allows_secondary_entry_window(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("13:30:00"))
 
-    def test_closing_requires_top_turnover_rank(self):
-        kw = _TimeFilterStub(143000)
-        for idx in range(11):
-            code = f"{idx:06d}"
-            kw.realtime_ticks[code] = [
-                {
-                    "close": 10_000,
-                    "accum_volume": 2_000_000 - idx,
-                }
-            ]
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.action, ALLOW_ENTRY)
 
-        out = kw.evaluate_time_filter("000010", current_price=10_000, accum_volume=1_999_990)
+    def test_blocks_after_new_entry_cutoff(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("14:25:00"))
 
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["phase"], "closing")
-        self.assertEqual(out["turnover_rank"], 11)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_AFTER_ENTRY_CUTOFF)
+
+    def test_force_exit_window_allows_management_only(self):
+        policy = TimePolicy(TradeConfig())
+        entry = policy.evaluate_entry(now=_at("15:10:00"))
+        manage = policy.evaluate_manage(now=_at("15:10:00"))
+
+        self.assertFalse(entry.allowed)
+        self.assertEqual(entry.action, FORCE_EXIT_WINDOW)
+        self.assertTrue(manage.allowed)
+        self.assertEqual(manage.action, FORCE_EXIT_WINDOW)
+
+    def test_blocks_entry_during_closing_auction(self):
+        decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("15:22:00"))
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_CLOSING_AUCTION)
+
+    def test_closing_auction_manage_is_emergency_policy_only(self):
+        decision = TimePolicy(TradeConfig()).evaluate_manage(now=_at("15:22:00"))
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.action, CLOSING_AUCTION_EMERGENCY_EXIT)
+        self.assertEqual(decision.reason_code, CLOSING_AUCTION_EMERGENCY_EXIT)
+
+    def test_closing_auction_manage_can_be_disabled_by_config(self):
+        config = TradeConfig(allow_closing_auction_emergency_exit=False)
+        decision = TimePolicy(config).evaluate_manage(now=_at("15:22:00"))
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_CLOSING_AUCTION)
+
+    def test_configured_weekday_holiday_is_non_trading_day(self):
+        config = TradeConfig(krx_holidays="2026-05-13")
+        decision = TimePolicy(config).evaluate_entry(now=_at("09:05:00"))
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason_code, BLOCK_NON_TRADING_DAY)
+
+    def test_candidate_capture_window_is_separate_from_entry_window(self):
+        policy = TimePolicy(TradeConfig())
+
+        capture = policy.evaluate_candidate_capture(now=_at("14:25:00"))
+        entry = policy.evaluate_entry(now=_at("14:25:00"))
+
+        self.assertTrue(capture.allowed)
+        self.assertFalse(entry.allowed)
+        self.assertEqual(entry.reason_code, BLOCK_AFTER_ENTRY_CUTOFF)
 
 
 if __name__ == "__main__":

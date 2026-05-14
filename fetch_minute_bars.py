@@ -33,16 +33,23 @@ import sys
 import time
 from collections import OrderedDict
 from datetime import datetime
-from typing import Iterable, List, Optional, Set
+from typing import Iterable, List, Optional
 
 
 TRADE_LOG_DEFAULT = os.path.join("data", "trade_log.csv")
+CONDITION_CAPTURE_DEFAULT = os.path.join("data", "condition_captures.csv")
 INTRADAY_DIR_DEFAULT = os.path.join("data", "intraday")
 
 TR_TIMEOUT_MS = 7000
 TR_INTERVAL_SECONDS = 0.35
 SCREEN_NO = "0370"
 RQ_NAME = "opt10080_min1"
+CODE_SOURCE_TRADED = "traded"
+CODE_SOURCE_CONDITION = "condition"
+CODE_SOURCE_ALL = "all"
+CODE_SOURCE_CHOICES = (CODE_SOURCE_TRADED, CODE_SOURCE_CONDITION, CODE_SOURCE_ALL)
+TRADE_EVENTS_FOR_CACHE = {"buy_order", "chejan", "would_order"}
+CONDITION_EVENTS_FOR_CACHE = {"condition_detected", "capture_price"}
 
 # QApplication 인스턴스를 모듈 전역으로 유지한다.
 # PyQt 는 QApplication 객체에 대한 강한 참조가 사라지면 즉시 정리하는 경우가
@@ -56,8 +63,25 @@ def _normalize_code(code: str) -> str:
     return str(code or "").strip().lstrip("A")
 
 
+def _dedupe_codes(codes: Iterable[str]) -> List[str]:
+    seen: "OrderedDict[str, None]" = OrderedDict()
+    for code in codes:
+        normalized = _normalize_code(code)
+        if normalized:
+            seen.setdefault(normalized, None)
+    return list(seen.keys())
+
+
+def _row_matches_date(row: dict, target_date: str, fields: Iterable[str]) -> bool:
+    for field in fields:
+        value = str(row.get(field, "") or "").strip()
+        if value.startswith(target_date):
+            return True
+    return False
+
+
 def collect_traded_codes(trade_log_path: str, target_date: str) -> List[str]:
-    """trade_log.csv 에서 ``target_date`` 의 buy_order/chejan(체결) 종목코드 목록.
+    """trade_log.csv 에서 ``target_date`` 의 매매/paper/live 종목코드 목록.
 
     중복 제거하되 입력 등장 순서를 유지한다.
     """
@@ -66,17 +90,78 @@ def collect_traded_codes(trade_log_path: str, target_date: str) -> List[str]:
     seen: "OrderedDict[str, None]" = OrderedDict()
     with open(trade_log_path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
-            logged_at = row.get("logged_at", "") or ""
-            if not logged_at.startswith(target_date):
+            if not _row_matches_date(row, target_date, ("logged_at", "detected_at")):
                 continue
             event = row.get("event", "")
-            if event not in ("buy_order", "chejan"):
+            if event not in TRADE_EVENTS_FOR_CACHE:
                 continue
             code = _normalize_code(row.get("code"))
             if not code:
                 continue
             seen.setdefault(code, None)
     return list(seen.keys())
+
+
+def collect_condition_capture_codes(
+    condition_capture_path: str,
+    target_date: str,
+) -> List[str]:
+    """Return all condition-captured codes for ``target_date``.
+
+    This reads only ``data/condition_captures.csv`` and is intended for
+    post-market review coverage. It does not inspect order state and does not
+    call any trading API.
+    """
+    if not os.path.exists(condition_capture_path):
+        raise FileNotFoundError(f"condition_captures.csv not found: {condition_capture_path}")
+    seen: "OrderedDict[str, None]" = OrderedDict()
+    with open(condition_capture_path, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            if not _row_matches_date(
+                row,
+                target_date,
+                ("detected_at", "captured_at", "logged_at"),
+            ):
+                continue
+            event = str(row.get("event", "") or "").strip()
+            if event and event not in CONDITION_EVENTS_FOR_CACHE:
+                continue
+            code = _normalize_code(row.get("code"))
+            if not code:
+                continue
+            seen.setdefault(code, None)
+    return list(seen.keys())
+
+
+def collect_target_codes(
+    *,
+    target_date: str,
+    source: str = CODE_SOURCE_TRADED,
+    trade_log_path: str = TRADE_LOG_DEFAULT,
+    condition_capture_path: str = CONDITION_CAPTURE_DEFAULT,
+) -> List[str]:
+    """Collect cache target codes from trade logs, condition captures, or both."""
+    if source == CODE_SOURCE_TRADED:
+        return collect_traded_codes(trade_log_path, target_date)
+    if source == CODE_SOURCE_CONDITION:
+        return collect_condition_capture_codes(condition_capture_path, target_date)
+    if source != CODE_SOURCE_ALL:
+        raise ValueError(f"unsupported code source: {source}")
+
+    collected: List[str] = []
+    missing_errors: List[str] = []
+    for loader, path in (
+        (collect_condition_capture_codes, condition_capture_path),
+        (collect_traded_codes, trade_log_path),
+    ):
+        try:
+            collected.extend(loader(path, target_date))
+        except FileNotFoundError as exc:
+            missing_errors.append(str(exc))
+    codes = _dedupe_codes(collected)
+    if not codes and missing_errors:
+        raise FileNotFoundError("; ".join(missing_errors))
+    return codes
 
 
 def _output_path(intraday_dir: str, target_date: str, code: str) -> str:
@@ -328,8 +413,27 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
         help="콤마로 구분된 종목코드. 지정하면 trade_log 가 아니라 이 리스트만 받는다.",
     )
     parser.add_argument(
+        "--source",
+        choices=CODE_SOURCE_CHOICES,
+        default=CODE_SOURCE_TRADED,
+        help=(
+            "Code source when --codes is omitted: traded=trade_log only, "
+            "condition=condition_captures only, all=condition captures plus trade_log."
+        ),
+    )
+    parser.add_argument(
+        "--include-condition-captures",
+        action="store_true",
+        help="Compatibility shortcut for --source all when --codes is omitted.",
+    )
+    parser.add_argument(
         "--trade-log", default=TRADE_LOG_DEFAULT,
         help=f"trade_log.csv 경로 (기본: {TRADE_LOG_DEFAULT}).",
+    )
+    parser.add_argument(
+        "--condition-captures",
+        default=CONDITION_CAPTURE_DEFAULT,
+        help=f"condition capture CSV path (default: {CONDITION_CAPTURE_DEFAULT}).",
     )
     parser.add_argument(
         "--intraday-dir", default=INTRADAY_DIR_DEFAULT,
@@ -345,18 +449,28 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(list(argv) if argv is not None else sys.argv[1:])
     if args.codes:
-        codes = [_normalize_code(c) for c in args.codes.split(",") if c.strip()]
+        codes = _dedupe_codes(c for c in args.codes.split(",") if c.strip())
+        source = "explicit"
     else:
+        source = CODE_SOURCE_ALL if args.include_condition_captures else args.source
         try:
-            codes = collect_traded_codes(args.trade_log, args.target_date)
+            codes = collect_target_codes(
+                target_date=args.target_date,
+                source=source,
+                trade_log_path=args.trade_log,
+                condition_capture_path=args.condition_captures,
+            )
         except FileNotFoundError as exc:
             print(str(exc), file=sys.stderr)
             return 1
     if not codes:
+        if source != CODE_SOURCE_TRADED:
+            print(f"{args.target_date} no target codes found (source={source}).", file=sys.stderr)
+            return 0
         print(f"{args.target_date} 매매 기록이 없습니다.", file=sys.stderr)
         return 0
 
-    print(f"== fetch_minute_bars {args.target_date} (codes={len(codes)}) ==")
+    print(f"== fetch_minute_bars {args.target_date} (source={source}, codes={len(codes)}) ==")
     stats = fetch_for_codes(
         codes, args.target_date, intraday_dir=args.intraday_dir, force=args.force,
     )

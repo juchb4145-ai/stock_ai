@@ -1,0 +1,5 @@
+code,detected_at,capture_price,condition_name,name,chejan_strength,volume,trade_value
+BUY1,2026-05-13 09:30:00,10000,mock_quant_condition,Replay Buy,120,1000,10000000
+WAIT1,2026-05-13 09:30:00,10000,mock_quant_condition,Replay Wait,120,1000,10000000
+BLOCK1,2026-05-13 09:30:00,10000,mock_quant_condition,Replay Block,125,1000,10000000
+REJECT1,2026-05-13 09:30:00,10000,mock_quant_condition,Replay Reject,80,1000,10000000

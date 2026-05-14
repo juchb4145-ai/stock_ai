@@ -34,6 +34,7 @@ from market_state import (
     REGIME_WEAK,
 )
 from portfolio import Position
+from trade_config import TRADE_CONFIG
 
 
 # === 분할매수 비율 (합 = 1.0) ===
@@ -49,23 +50,23 @@ DANTE_MIN_OBSERVATION_SECONDS = 30
 # 1차 진입에 필요한 최소 실시간 틱 수
 DANTE_MIN_TICKS = 5
 # 체결강도 임계 — Soft 미만은 차단, Soft~Hard 사이는 추세 상승 시만 통과, Hard 이상은 무조건 통과
-MIN_CHEJAN_STRENGTH = 100.0  # backward-compat alias = MIN_CHEJAN_STRENGTH_SOFT
-MIN_CHEJAN_STRENGTH_SOFT = 100.0
+MIN_CHEJAN_STRENGTH = TRADE_CONFIG.min_trade_strength  # backward-compat alias = MIN_CHEJAN_STRENGTH_SOFT
+MIN_CHEJAN_STRENGTH_SOFT = TRADE_CONFIG.min_trade_strength
 MIN_CHEJAN_STRENGTH_HARD = 120.0
 # 체결강도 추세 평가에 사용할 최근 틱 개수
 CHEJAN_STRENGTH_TREND_LOOKBACK = 6
 # 거래대금 속도 임계 (원/분). 실시간성은 유지하고, 조건식 편입 후 받은 틱 구간을
 # 분당 거래대금으로 환산해 가격대별 왜곡(저가주는 느슨/고가주는 과도하게 엄격)을 줄인다.
-MIN_TURNOVER_SPEED_PER_MIN = 50_000_000.0
+MIN_TURNOVER_SPEED_PER_MIN = TRADE_CONFIG.min_turnover_speed_per_min
 # 기존 학습 피처/로그 호환용 주/초 기준. 신규 게이트는 거래대금 속도를 우선 사용한다.
 MIN_VOLUME_SPEED = 300.0
 # 호가 스프레드 상한
-MAX_SPREAD_RATE = 0.006
+MAX_SPREAD_RATE = TRADE_CONFIG.max_spread_pct
 
 # === 가짜 돌파 / 과열 차단 ===
 # 5분봉 진행봉의 윗꼬리 비율 (high-close)/(high-low). 임계 초과 시 가짜 돌파로 보고 1차 추격 차단.
 # 2026-05-04 daily_review: 가짜돌파 3/8건(38%), 평균 윗꼬리 1% / 시가대비 +4.0% — 0.40→0.30 으로 강화.
-MAX_UPPER_WICK_RATIO = 0.30
+MAX_UPPER_WICK_RATIO = TRADE_CONFIG.max_upper_wick_ratio
 # 시가 대비 등락률이 +N 이상이면 이미 너무 오른 종목 — 추격 차단 (눌림으로만 진입 허용)
 # 같은 배경으로 0.10→0.08 으로 강화.
 OVERHEATED_OPEN_RETURN = 0.08
@@ -74,7 +75,7 @@ OVERHEATED_OPEN_RETURN_MORNING = 0.10
 OVERHEATED_OPEN_RETURN_MIDDAY = 0.12
 OVERHEATED_OPEN_RETURN_LATE = 0.10
 # 현재가가 BB(55,2) 상단보다 +N 이상 위면 과열 — 추격 차단
-OVERHEATED_BB55_DISTANCE = 0.04
+OVERHEATED_BB55_DISTANCE = TRADE_CONFIG.max_chase_distance_pct
 
 # === 2차(본진입) 눌림 정의 ===
 # 정적 fallback 임계 — ATR 데이터가 없을 때만 사용. 평소엔 ATR 기반 동적 밴드를 쓴다.
@@ -107,7 +108,8 @@ ATR_PULLBACK_DRAWDOWN_CAP = 0.060    # 위태 차단의 절대 상한
 # 위험으로 보고 차단한다. VWAP == 0 (데이터 미수신) 이면 게이트 자체를 skip.
 VWAP_SUPPORT_BUFFER_PCT = 0.003  # VWAP 의 -0.3% 까지는 노이즈로 허용
 # 양봉 reversal 의 종가는 VWAP 위에서 형성되어야 ready (고점추매 vs 정상 풀백 구분).
-VWAP_REVERSAL_REQUIRE_ABOVE = True
+VWAP_REVERSAL_REQUIRE_ABOVE = TRADE_CONFIG.require_vwap_filter
+REQUIRE_ONE_MIN_REVERSAL = TRADE_CONFIG.require_one_min_reversal
 
 # === RSI helper gate ===
 # RSI is not a buy signal here. It only blocks shallow overheated pullbacks and
@@ -836,7 +838,7 @@ def _evaluate_b_grade_pullback(ctx: EntryContext) -> EntryDecision:
             reason_code=GATE_BGRADE_VWAP_LOST,
         )
 
-    if not _has_neg_then_positive_pattern(
+    if REQUIRE_ONE_MIN_REVERSAL and not _has_neg_then_positive_pattern(
         bars,
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
@@ -1028,7 +1030,7 @@ def _evaluate_a_grade_watch_entry_inner(
             reason_code=GATE_STAGE2_VWAP_LOST,
         )
 
-    if not _has_neg_then_positive_pattern(
+    if REQUIRE_ONE_MIN_REVERSAL and not _has_neg_then_positive_pattern(
         ctx.minute_bars,
         neg_min=PULLBACK_NEG_BARS_MIN,
         neg_max=PULLBACK_NEG_BARS_MAX,
@@ -1444,7 +1446,7 @@ def evaluate_reentry_after_exit(ctx: EntryContext, watch: dict) -> EntryDecision
             reason_code=GATE_STAGE2_NO_REVERSAL,
         )
 
-    if not _has_neg_then_positive_pattern(
+    if REQUIRE_ONE_MIN_REVERSAL and not _has_neg_then_positive_pattern(
         list(ctx.minute_bars[-5:]) if ctx.minute_bars else [],
         neg_min=0,
         neg_max=3,

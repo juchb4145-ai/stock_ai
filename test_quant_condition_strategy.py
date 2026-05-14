@@ -5,8 +5,13 @@ import unittest
 from pathlib import Path
 
 from condition_capture_logger import ConditionCaptureLogger, read_condition_captures
-from quant_backtest import BacktestTick, QuantConditionBacktester, QuantForwardSimulator
-from quant_condition_strategy import QuantConditionStrategy
+from quant_backtest import (
+    BacktestExecutionConfig,
+    BacktestTick,
+    QuantConditionBacktester,
+    QuantForwardSimulator,
+)
+from quant_condition_strategy import QuantConditionStrategy, QuantStrategyConfig
 
 
 class QuantConditionStrategyTests(unittest.TestCase):
@@ -26,6 +31,7 @@ class QuantConditionStrategyTests(unittest.TestCase):
             capture_price=10_000,
             current_price=9_850,
             chejan_strength=99.9,
+            recent_low_price=9_820,
         )
         self.assertEqual(weak.status, "wait")
         self.assertEqual(weak.reason_code, "SAFE_CHEJAN_WAIT")
@@ -34,11 +40,79 @@ class QuantConditionStrategyTests(unittest.TestCase):
             capture_price=10_000,
             current_price=9_850,
             chejan_strength=100,
+            recent_low_price=9_820,
         )
         self.assertEqual(ready.status, "ready")
         self.assertEqual(ready.reason_code, "QUANT_PULLBACK_READY")
         self.assertGreater(ready.take_profit_price, ready.entry_limit_price)
         self.assertLess(ready.stop_price, ready.entry_limit_price)
+        self.assertGreaterEqual(ready.rebound_pct, self.strategy.config.rebound_confirm_pct)
+
+    def test_entry_blocks_pullback_deeper_than_three_percent(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_690,
+            chejan_strength=130,
+            recent_low_price=9_650,
+        )
+
+        self.assertEqual(decision.status, "wait")
+        self.assertEqual(decision.reason_code, "SAFE_PULLBACK_TOO_DEEP")
+
+    def test_entry_waits_for_rebound_from_recent_low(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_850,
+            chejan_strength=130,
+            recent_low_price=9_840,
+        )
+
+        self.assertEqual(decision.status, "wait")
+        self.assertEqual(decision.reason_code, "SAFE_REBOUND_WAIT")
+
+        ready = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_850,
+            chejan_strength=130,
+            recent_low_price=9_820,
+        )
+        self.assertEqual(ready.status, "ready")
+
+    def test_weak_market_raises_chejan_strength_threshold(self):
+        weak = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_850,
+            chejan_strength=119.9,
+            recent_low_price=9_820,
+            market_state="weak",
+        )
+        self.assertEqual(weak.reason_code, "SAFE_CHEJAN_WAIT")
+        self.assertEqual(weak.min_chejan_strength, 120.0)
+
+        strong = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_850,
+            chejan_strength=100.0,
+            recent_low_price=9_820,
+            market_state="strong",
+        )
+        self.assertEqual(strong.status, "ready")
+        self.assertEqual(strong.min_chejan_strength, 100.0)
+
+    def test_market_strength_config_can_keep_neutral_at_110(self):
+        strategy = QuantConditionStrategy(
+            QuantStrategyConfig(market_min_chejan_strength={"neutral": 110.0, "weak": 120.0})
+        )
+
+        blocked = strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_850,
+            chejan_strength=109.9,
+            recent_low_price=9_820,
+            market_state="neutral",
+        )
+        self.assertEqual(blocked.reason_code, "SAFE_CHEJAN_WAIT")
+        self.assertEqual(blocked.min_chejan_strength, 110.0)
 
     def test_exit_sells_all_at_profit_or_stop(self):
         profit = self.strategy.evaluate_exit(entry_price=10_000, current_price=10_200)
@@ -94,15 +168,120 @@ class QuantBacktestTests(unittest.TestCase):
             ticks_by_code={
                 "005930": [
                     BacktestTick("005930", 9_900, 110, "091000"),
-                    BacktestTick("005930", 9_850, 100, "091100"),
-                    BacktestTick("005930", 10_050, 120, "091500"),
+                    BacktestTick("005930", 9_700, 120, "091100"),
+                    BacktestTick("005930", 9_730, 120, "091200"),
+                    BacktestTick("005930", 9_960, 120, "091500"),
                 ]
             },
         )
 
         self.assertEqual(len(trades), 1)
         self.assertEqual(trades[0].code, "005930")
-        self.assertGreaterEqual(trades[0].return_pct, 0.02)
+        self.assertGreaterEqual(trades[0].gross_return_pct, 0.02)
+        self.assertLess(trades[0].return_pct, trades[0].gross_return_pct)
+        self.assertGreater(trades[0].fee_cost + trades[0].tax_cost, 0)
+
+    def test_backtest_waits_for_limit_fill_after_latency(self):
+        backtester = QuantConditionBacktester(
+            execution=BacktestExecutionConfig(
+                buy_slippage_pct=0.0,
+                sell_slippage_pct=0.0,
+                latency_ticks=1,
+            )
+        )
+        trades = backtester.run(
+            captures=[{"code": "005930", "capture_price": 10_000}],
+            ticks_by_code={
+                "005930": [
+                    BacktestTick("005930", 9_730, 130, "091200", low_price=9_730),
+                    BacktestTick("005930", 9_760, 130, "091201", low_price=9_750),
+                    BacktestTick("005930", 9_730, 130, "091202", low_price=9_720),
+                    BacktestTick("005930", 9_930, 130, "091500"),
+                ]
+            },
+        )
+
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].entry_at, "091202")
+
+    def test_backtest_blocks_partial_fill_below_min_ratio(self):
+        backtester = QuantConditionBacktester(
+            execution=BacktestExecutionConfig(
+                quantity=10,
+                min_fill_ratio=1.0,
+                buy_slippage_pct=0.0,
+                sell_slippage_pct=0.0,
+            )
+        )
+        trades = backtester.run(
+            captures=[{"code": "005930", "capture_price": 10_000}],
+            ticks_by_code={
+                "005930": [
+                    BacktestTick(
+                        "005930",
+                        9_730,
+                        130,
+                        "091200",
+                        low_price=9_720,
+                        available_volume=3,
+                    ),
+                    BacktestTick("005930", 9_930, 130, "091500"),
+                ]
+            },
+        )
+
+        self.assertEqual(trades, [])
+
+    def test_backtest_uses_bid_ask_and_order_rate_limit(self):
+        captures = [
+            {"code": f"00000{i}", "capture_price": 10_000}
+            for i in range(6)
+        ]
+        ticks_by_code = {
+            str(capture["code"]): [
+                BacktestTick(
+                    str(capture["code"]),
+                    9_700,
+                    130,
+                    "091159",
+                    bid_price=9_690,
+                    ask_price=9_700,
+                    low_price=9_690,
+                ),
+                BacktestTick(
+                    str(capture["code"]),
+                    9_730,
+                    130,
+                    "091200",
+                    bid_price=9_720,
+                    ask_price=9_730,
+                    low_price=9_720,
+                ),
+                BacktestTick(
+                    str(capture["code"]),
+                    9_960,
+                    130,
+                    "091500",
+                    bid_price=9_950,
+                    ask_price=9_960,
+                ),
+            ]
+            for capture in captures
+        }
+        backtester = QuantConditionBacktester(
+            execution=BacktestExecutionConfig(
+                buy_slippage_pct=0.0,
+                sell_slippage_pct=0.0,
+                max_orders_per_second=5,
+            )
+        )
+
+        trades = backtester.run(captures=captures, ticks_by_code=ticks_by_code)
+
+        self.assertEqual(len(trades), 6)
+        self.assertEqual(trades[0].entry_price, 9_730)
+        self.assertEqual(trades[0].exit_price, 9_950)
+        self.assertEqual(trades[5].entry_order_at, "091201")
 
     def test_forward_simulator_uses_same_rules(self):
         simulator = QuantForwardSimulator()
@@ -111,7 +290,10 @@ class QuantBacktestTests(unittest.TestCase):
         wait = simulator.on_tick(BacktestTick("005930", 9_900, 120, "091000"))
         self.assertEqual(wait["state"], "watching")
 
-        entered = simulator.on_tick(BacktestTick("005930", 9_850, 100, "091100"))
+        rebound_wait = simulator.on_tick(BacktestTick("005930", 9_820, 120, "091100"))
+        self.assertEqual(rebound_wait["reason_code"], "SAFE_REBOUND_WAIT")
+
+        entered = simulator.on_tick(BacktestTick("005930", 9_850, 120, "091200"))
         self.assertEqual(entered["state"], "entered")
 
         holding = simulator.on_tick(BacktestTick("005930", 10_050, 110, "091500"))

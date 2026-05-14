@@ -562,7 +562,7 @@ def commit_overrides(
             ok = bool(fixture_hook())
         except Exception as exc:  # noqa: BLE001 — fixture_hook 의 어떤 예외도 rollback 트리거
             ok = False
-            _logger.error("[OVERRIDE] fixture_hook 예외 — rollback: %s", exc)
+            _logger.error("[OVERRIDE] fixture_hook 예외 - rollback: %s", exc)
         if not ok:
             # === rollback 단계화 (P1 #8) ===
             # 어떤 항목이 정확히 원복됐고, 어떤 항목은 rollback 자체가 실패해서
@@ -577,7 +577,7 @@ def commit_overrides(
                 except Exception as exc:  # noqa: BLE001
                     target_str = f"{module.__name__}.{attr_name}"
                     rollback_failed_targets.append(target_str)
-                    _logger.error("[OVERRIDE] rollback 실패 %s: %s — 부분 변경 상태",
+                    _logger.error("[OVERRIDE] rollback 실패 %s: %s - 부분 변경 상태",
                                   target_str, exc)
             for e in committed_entries:
                 e["applied"] = False
@@ -588,7 +588,7 @@ def commit_overrides(
                     e["skipped_reason"] = "fixture_failed"
             if rollback_failed_targets:
                 _logger.error(
-                    "[OVERRIDE][SUMMARY] rollback 부분 실패 %d건 — 모듈 상태 점검 필요: %s",
+                    "[OVERRIDE][SUMMARY] rollback 부분 실패 %d건 - 모듈 상태 점검 필요: %s",
                     len(rollback_failed_targets), ",".join(rollback_failed_targets),
                 )
 

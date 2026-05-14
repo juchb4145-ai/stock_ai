@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import sys
+import types
+import unittest
+from unittest import mock
+
+from final_entry_decision import build_final_entry_decision
+from momentum_breakout_strategy import EntryDecision, MomentumDecision
+from quant_condition_strategy import QuantEntryDecision
+
+
+def _ensure_external_stubs() -> None:
+    if "PyQt5" not in sys.modules:
+        qax = types.ModuleType("PyQt5.QAxContainer")
+        qax.QAxWidget = mock.MagicMock
+        qax.__all__ = ["QAxWidget"]
+
+        widgets = types.ModuleType("PyQt5.QtWidgets")
+        widgets.QApplication = mock.MagicMock
+        widgets.QWidget = mock.MagicMock
+        widgets.__all__ = ["QApplication", "QWidget"]
+
+        core = types.ModuleType("PyQt5.QtCore")
+        core.QTimer = mock.MagicMock
+        core.QObject = mock.MagicMock
+        core.pyqtSignal = mock.MagicMock()
+        core.__all__ = ["QTimer", "QObject", "pyqtSignal"]
+
+        pyqt5 = types.ModuleType("PyQt5")
+        pyqt5.QAxContainer = qax
+        pyqt5.QtWidgets = widgets
+        pyqt5.QtCore = core
+
+        sys.modules["PyQt5"] = pyqt5
+        sys.modules["PyQt5.QAxContainer"] = qax
+        sys.modules["PyQt5.QtWidgets"] = widgets
+        sys.modules["PyQt5.QtCore"] = core
+
+    if "pandas" not in sys.modules:
+        sys.modules["pandas"] = mock.MagicMock()
+
+
+_ensure_external_stubs()
+import main  # noqa: E402
+
+
+def _final_from(momentum: MomentumDecision, legacy: QuantEntryDecision):
+    return build_final_entry_decision(
+        momentum_action=momentum.action.value,
+        momentum_reason_code=momentum.reason_code,
+        momentum_reason=momentum.reason,
+        momentum_chase_risk_score=momentum.chase_risk_score,
+        legacy_status=legacy.status,
+        legacy_reason_code=legacy.reason_code,
+        legacy_reason=legacy.reason,
+        strategy_version="test_strategy",
+        legacy_filter_enabled=True,
+    )
+
+
+def _legacy(status: str, reason_code: str = "LEGACY_READY") -> QuantEntryDecision:
+    return QuantEntryDecision(
+        status=status,
+        reason="legacy {}".format(status),
+        reason_code=reason_code,
+        capture_price=10_000,
+        current_price=9_850,
+        entry_limit_price=9_850,
+        stop_price=9_700,
+        take_profit_price=10_050,
+    )
+
+
+class FinalEntryDecisionTests(unittest.TestCase):
+    def test_momentum_buy_legacy_block_prevents_final_buy(self):
+        momentum = MomentumDecision(
+            EntryDecision.BUY,
+            "momentum pass",
+            "BUY_PULLBACK_CONFIRMED",
+            chase_risk_score=12.0,
+            entry_ratio=1.0,
+        )
+        final = _final_from(momentum, _legacy("blocked", "LEGACY_BLOCK_SPREAD"))
+
+        self.assertFalse(final.allowed)
+        self.assertEqual(final.status, "blocked")
+        self.assertEqual(final.blocked_by, "legacy_veto")
+        self.assertIn("LEGACY_BLOCK_SPREAD", final.reason_code)
+
+    def test_legacy_ready_cannot_override_momentum_block_chase(self):
+        momentum = MomentumDecision(
+            EntryDecision.BLOCK_CHASE,
+            "signal candle top",
+            "BLOCK_SIGNAL_CANDLE_TOP",
+            chase_risk_score=88.0,
+        )
+        final = _final_from(momentum, _legacy("ready"))
+
+        self.assertFalse(final.allowed)
+        self.assertEqual(final.status, "blocked")
+        self.assertEqual(final.blocked_by, "momentum")
+        self.assertIn("BLOCK_SIGNAL_CANDLE_TOP", final.reason_code)
+
+    def test_missing_data_momentum_wait_data_blocks_even_if_legacy_ready(self):
+        momentum = MomentumDecision(
+            EntryDecision.WAIT_DATA,
+            "missing_volume_ratio",
+            "MISSING_VOLUME_RATIO",
+            chase_risk_score=0.0,
+            metrics={"volume_ratio": None},
+        )
+        final = _final_from(momentum, _legacy("ready"))
+
+        self.assertFalse(final.allowed)
+        self.assertEqual(final.status, "wait")
+        self.assertEqual(final.blocked_by, "momentum")
+        self.assertIn("MISSING_VOLUME_RATIO", final.reason_code)
+
+    def test_both_pass_allows_final_buy_with_trace(self):
+        momentum = MomentumDecision(
+            EntryDecision.BUY,
+            "pullback confirmed",
+            "BUY_PULLBACK_CONFIRMED",
+            chase_risk_score=10.0,
+            entry_ratio=1.0,
+        )
+        final = _final_from(momentum, _legacy("ready"))
+
+        self.assertTrue(final.allowed)
+        self.assertEqual(final.reason_code, "FINAL_BUY_READY")
+        self.assertEqual(final.decision_trace["momentum_decision"]["action"], "BUY")
+        self.assertEqual(final.decision_trace["legacy_decision"]["status"], "ready")
+
+    def test_place_buy_order_blocks_missing_final_entry_approval(self):
+        class Stub:
+            parse_int = main.Kiwoom.parse_int
+            place_buy_order = main.Kiwoom.place_buy_order
+
+            def __init__(self):
+                self.trade_log_calls = []
+                self.submit_calls = 0
+
+            def normalize_code(self, code):
+                return str(code).strip().lstrip("A")
+
+            def append_trade_log(self, *args, **kwargs):
+                self.trade_log_calls.append((args, kwargs))
+
+            def submit_order_guarded(self, request):
+                self.submit_calls += 1
+                raise AssertionError("missing FinalEntryDecision must not reach OrderGuard")
+
+        stub = Stub()
+        prediction = {
+            "name": "test",
+            "current_price": 10_000,
+            "reason": "legacy direct ready",
+            "reason_code": "LEGACY_READY",
+        }
+
+        stub.place_buy_order("A000001", prediction, ratio=1.0, stage=2)
+
+        self.assertEqual(stub.submit_calls, 0)
+        self.assertEqual(len(stub.trade_log_calls), 1)
+        self.assertEqual(stub.trade_log_calls[0][1]["reason"], "FinalEntryDecision block")
+
+    def test_safe_second_entry_without_final_decision_does_not_order(self):
+        class Stub:
+            parse_int = main.Kiwoom.parse_int
+            place_buy_order = main.Kiwoom.place_buy_order
+
+            def __init__(self):
+                self.trade_log_calls = []
+                self.submit_calls = 0
+
+            def normalize_code(self, code):
+                return str(code).strip().lstrip("A")
+
+            def append_trade_log(self, *args, **kwargs):
+                self.trade_log_calls.append((args, kwargs))
+
+            def submit_order_guarded(self, request):
+                self.submit_calls += 1
+                raise AssertionError("SAFE second entry must not bypass FinalEntryDecision")
+
+        stub = Stub()
+        prediction = {
+            "name": "test",
+            "current_price": 10_000,
+            "capture_price": 10_200,
+            "safe_pullback_entry": True,
+            "grade": "SAFE",
+            "status": "ready",
+            "reason": "legacy safe second entry",
+            "reason_code": "SAFE_SECOND_ENTRY",
+            "entry_limit_price": 9_950,
+            "stop_price": 9_800,
+            "take_profit_price": 10_200,
+        }
+
+        stub.place_buy_order("A000001", prediction, ratio=0.5, stage=2)
+
+        self.assertEqual(stub.submit_calls, 0)
+        self.assertEqual(len(stub.trade_log_calls), 1)
+        self.assertEqual(stub.trade_log_calls[0][1]["reason"], "FinalEntryDecision block")
+
+
+if __name__ == "__main__":
+    unittest.main()

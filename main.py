@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 import pandas as pd
 import pickle
@@ -15,21 +16,30 @@ import scoring
 import entry_strategy
 import exit_strategy
 from bars import FiveMinIndicatorCache, MinuteBarAggregator
+from candidate_registry import CandidateRegistry
 from condition_capture_logger import CONDITION_CAPTURE_CSV, ConditionCaptureLogger
+from final_entry_decision import (
+    build_final_entry_decision,
+    trace_with_order_guard,
+)
 from market_state import KOSDAQ_CODE, KOSPI_CODE, MarketStateCache
+from momentum_breakout_strategy import (
+    EntryDecision as MomentumEntryDecision,
+    MomentumBreakoutStrategy,
+    MomentumContext,
+)
+from order_guard import GuardDecision, OrderGuard, OrderRequest, PaperPortfolio, RiskState
 from portfolio import LoadedPortfolioState, Position, PortfolioState
 from logging_setup import setup_logging
 from fid_codes import FID_CODES, FID_NAME_TO_CODE, get_fid
 from quant_condition_strategy import QuantConditionStrategy, QuantStrategyConfig
+from trade_config import TRADE_CONFIG
+from time_policy import TimePolicy, first_window_start_hhmmss, hhmmss_from_clock
 from training_recorder import (
     TrainingRecorderMixin,
     # 모듈 상수 re-export — 외부 테스트가 main.X 로 직접 접근하므로 호환 유지
-    TRAINING_DATA_ENABLED,
     TRAINING_DATA_DIR,
-    TRAINING_ENTRY_CSV,
     TRADE_LOG_CSV,
-    TRAINING_SAMPLE_COOLDOWN_SECONDS,
-    TRAINING_LABEL_HORIZONS,
     DANTE_TRAINING_DATA_ENABLED,
     DANTE_TRAINING_CSV,
     DANTE_TRAINING_LABEL_HORIZONS,
@@ -40,12 +50,12 @@ from training_recorder import (
     DANTE_SHADOW_TRAINING_CSV,
     DANTE_SHADOW_SAMPLE_COOLDOWN_SECONDS,
     DANTE_SHADOW_TRAINING_FIELDS,
-    ENTRY_FEATURE_NAMES,
     TRADE_LOG_CONDITION_FORMULA,
+    TRADE_LOG_CONDITION_FORMULA_VERSION,
     TRADE_LOG_CONDITION_RULES,
+    TRADE_LOG_SIGNAL_SOURCE,
     TRADE_LOG_RULE_VERSION,
     TRADE_LOG_STRATEGY_NAME,
-    TRAINING_ENTRY_FIELDS,
     TRADE_LOG_FIELDS,
 )
 
@@ -56,7 +66,8 @@ logger = setup_logging()
 # 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 조건식 자체의 A/J/N/P/S/T
 # 필터는 영웅문 조건검색이 담당하고, 이 프로그램은 편입 후 실시간으로 포착가 대비
 # -1.5% 눌림 + 체결강도 100% 이상만 진입 트리거로 확인한다.
-CONDITION_NAME = "퀀트조건식"
+CONDITION_NAME = TRADE_CONFIG.condition_name
+LEGACY_CONDITION_NAME = TRADE_CONFIG.legacy_condition_name
 CONDITION_SCREEN_NO = "0150"
 REALTIME_SCREEN_NO = "0160"
 # KOSPI/KOSDAQ 업종지수 실시간용 별도 스크린(종목 실시간과 충돌 방지).
@@ -66,7 +77,7 @@ ORDER_SCREEN_NO = "0001"
 AI_SERVER_ENABLED = True
 AI_SERVER_URL = "http://127.0.0.1:8000"
 AI_SERVER_TIMEOUT_SECONDS = 0.35
-# 학습 트랙(구학습 + 단테 + shadow) 의 enable 플래그/CSV 경로/필드 정의는
+# 학습 트랙(단테 + shadow) 의 enable 플래그/CSV 경로/필드 정의는
 # training_recorder 모듈로 이전했다. 같은 이름의 모듈 상수를 main 에서 re-export
 # 하므로 기존 ``from main import DANTE_TRAINING_CSV`` 같은 사용처는 그대로 동작한다.
 
@@ -80,20 +91,21 @@ AI_SERVER_TIMEOUT_SECONDS = 0.35
 # write 한다. 부팅 시 잔고 TR 보다 먼저 로드해 두면, _sync_position_from_dicts 가
 # 잔고 정보로 휘발성 필드만 덮어쓰고 전략 필드는 그대로 보존된다.
 PORTFOLIO_STATE_PATH = os.path.join(TRAINING_DATA_DIR, "portfolio_state.json")
-BUY_CASH_BUFFER_RATE = 0.98
+BUY_CASH_BUFFER_RATE = TRADE_CONFIG.cash_usage_ratio
 BUY_PRICE_MARGIN_RATE = 1.005
 RISK_PER_TRADE_RATE = 0.005
 MAX_PORTFOLIO_RISK_RATE = 0.02
-MIN_ORDER_CASH = 50_000
-SAFE_PULLBACK_MIN_DROP_PCT = 0.015
-SAFE_PULLBACK_MAX_DROP_PCT = 0.999
+MIN_ORDER_CASH = TRADE_CONFIG.min_order_cash
+SAFE_PULLBACK_MIN_DROP_PCT = TRADE_CONFIG.pullback_entry_pct
+SAFE_PULLBACK_MAX_DROP_PCT = TRADE_CONFIG.max_pullback_pct
+SAFE_PULLBACK_REBOUND_CONFIRM_PCT = TRADE_CONFIG.rebound_confirm_pct
 SAFE_PULLBACK_RUNAWAY_PCT = 0.030
 SAFE_PULLBACK_VOLUME_RATIO_MAX = 0.30
-SAFE_PULLBACK_CASH_RATE = 0.10
+SAFE_PULLBACK_CASH_RATE = TRADE_CONFIG.max_position_cash_ratio
 SAFE_PULLBACK_FIRST_ENTRY_RATIO = 0.50
-SAFE_PULLBACK_MAX_POSITIONS = 3
-SAFE_PULLBACK_STOP_LOSS_PCT = 0.015
-SAFE_PULLBACK_TAKE_PROFIT_PCT = 0.020
+SAFE_PULLBACK_MAX_POSITIONS = TRADE_CONFIG.max_positions
+SAFE_PULLBACK_STOP_LOSS_PCT = TRADE_CONFIG.default_stop_loss_pct
+SAFE_PULLBACK_TAKE_PROFIT_PCT = TRADE_CONFIG.default_take_profit_pct
 SAFE_PULLBACK_TARGET_NEAR_PCT = 0.003
 SAFE_PULLBACK_ASK_BID_RATIO_MIN = 2.0
 SAFE_PULLBACK_BIG_BUY_MULT = 3.0
@@ -102,15 +114,18 @@ SAFE_PULLBACK_SECOND_WINDOW_SECONDS = 10 * 60
 SAFE_PULLBACK_SECOND_MIN_REBOUND_PCT = 0.003
 SAFE_PULLBACK_SECOND_MAX_CHASE_PCT = 0.012
 QUANT_ENTRY_PULLBACK_PCT = SAFE_PULLBACK_MIN_DROP_PCT
-QUANT_ENTRY_CHEJAN_STRENGTH_MIN = 100.0
+QUANT_ENTRY_CHEJAN_STRENGTH_MIN = TRADE_CONFIG.min_trade_strength
 QUANT_TAKE_PROFIT_PCT = SAFE_PULLBACK_TAKE_PROFIT_PCT
 QUANT_STOP_LOSS_PCT = SAFE_PULLBACK_STOP_LOSS_PCT
 QUANT_PLAN_SOURCE = "quant_condition_pullback"
 QUANT_GRADE = "QUANT"
 QUANT_STRATEGY_CONFIG = QuantStrategyConfig(
-    condition_name=CONDITION_NAME,
+    condition_name=TRADE_CONFIG.strategy_name,
     entry_pullback_pct=QUANT_ENTRY_PULLBACK_PCT,
+    max_pullback_pct=SAFE_PULLBACK_MAX_DROP_PCT,
+    rebound_confirm_pct=SAFE_PULLBACK_REBOUND_CONFIRM_PCT,
     min_chejan_strength=QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+    market_min_chejan_strength={"weak": TRADE_CONFIG.weak_market_min_trade_strength},
     take_profit_pct=QUANT_TAKE_PROFIT_PCT,
     stop_loss_pct=QUANT_STOP_LOSS_PCT,
     max_positions=SAFE_PULLBACK_MAX_POSITIONS,
@@ -179,15 +194,20 @@ MIN_NET_EXPECTED_RETURN = 0.006
 DYNAMIC_MIN_NET_RETURN_PERCENTILE = 0.5
 DYNAMIC_MIN_NET_RETURN_CEILING = 0.015
 # 매수 가능 시간(장 마감 직전 강제 청산 시점은 OPENING_FORCE_EXIT 동일).
-TIME_FILTER_MORNING_START = 90000
-TIME_FILTER_MORNING_END = 100000
-TIME_FILTER_MIDDAY_END = 140000
-TIME_FILTER_CLOSING_END = 152000
+TIME_FILTER_MORNING_START = hhmmss_from_clock(TRADE_CONFIG.candidate_capture_start)
+TIME_FILTER_MORNING_END = first_window_start_hhmmss(
+    TRADE_CONFIG.entry_windows,
+    TRADE_CONFIG.no_new_entry_after,
+)
+TIME_FILTER_MIDDAY_END = hhmmss_from_clock(TRADE_CONFIG.no_new_entry_after)
+TIME_FILTER_CLOSING_END = hhmmss_from_clock(TRADE_CONFIG.closing_auction_start)
 TIME_FILTER_CLOSING_MIN_TURNOVER = 10_000_000_000
 TIME_FILTER_CLOSING_TOP_RANK = 10
-OPENING_BUY_START = TIME_FILTER_MORNING_START
-OPENING_BUY_END = TIME_FILTER_CLOSING_END
-OPENING_FORCE_EXIT = TIME_FILTER_CLOSING_END
+OPENING_BUY_START = TIME_FILTER_MORNING_END
+OPENING_BUY_END = hhmmss_from_clock(TRADE_CONFIG.no_new_entry_after)
+OPENING_FORCE_EXIT = hhmmss_from_clock(TRADE_CONFIG.force_exit_start)
+FORCE_EXIT_DEADLINE = hhmmss_from_clock(TRADE_CONFIG.force_exit_deadline)
+CLOSING_AUCTION_START = hhmmss_from_clock(TRADE_CONFIG.closing_auction_start)
 # 실시간 틱 버퍼 크기 / 최소 틱 수 (단테 1차 게이트가 사용)
 OPENING_MIN_TICKS = entry_strategy.DANTE_MIN_TICKS
 OPENING_TICK_LIMIT = 40
@@ -199,14 +219,14 @@ OPENING_MAX_HOLD_SECONDS = exit_strategy.EXIT_TIME_LIMIT_SECONDS
 # 동시 종목 수는 리스크 예산 기반 sizing 의 안전 상한이다. 실제 진입 가능 여부는
 # RISK_PER_TRADE_RATE / MAX_PORTFOLIO_RISK_RATE 가 결정한다.
 MAX_CONCURRENT_POSITIONS = SAFE_PULLBACK_MAX_POSITIONS
-MAX_DAILY_BUY_COUNT = 20
+MAX_DAILY_BUY_COUNT = TRADE_CONFIG.max_daily_buy_count
 CONDITION_PROCESS_INTERVAL_MS = 1000
 CONDITION_COOLDOWN_SECONDS = 60
 WAIT_LOG_COOLDOWN_SECONDS = 30
 REALTIME_TICK_WAIT_TIMEOUT_SECONDS = 60
 MAX_DAILY_CANDLE_COUNT = 120
 TR_REQUEST_INTERVAL_SECONDS = 0.35
-ORDER_REQUEST_INTERVAL_SECONDS = 0.25
+ORDER_REQUEST_INTERVAL_SECONDS = TRADE_CONFIG.order_request_interval_seconds
 ACCOUNT_CACHE_SECONDS = 20
 DEPOSIT_CACHE_SECONDS = 10
 REALTIME_CODES_PER_SCREEN = 100
@@ -215,9 +235,11 @@ SELL_CHECK_INTERVAL_MS = 1500
 SELL_INTENT_RETRY_SECONDS = 2.0
 SELL_SKIP_LOG_COOLDOWN_SECONDS = 30
 TR_RESPONSE_TIMEOUT_MS = 5000
+MARKET_BOOTSTRAP_RETRY_INTERVAL_MS = 30_000
+MARKET_BOOTSTRAP_MAX_DELAY_MS = 30 * 60 * 1000
 AI_SERVER_FAILURE_THRESHOLD = 3
 AI_SERVER_COOLDOWN_SECONDS = 30
-# 학습/거래 로그 필드 정의(ENTRY_FEATURE_NAMES, TRAINING_ENTRY_FIELDS, TRADE_LOG_FIELDS)
+# 학습/거래 로그 필드 정의(TRADE_LOG_FIELDS)
 # 는 training_recorder.py 로 이전. 본 파일 상단 import 에서 re-export 한다.
 
 
@@ -255,10 +277,17 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.realtime_ticks = {}
         self.orderbook_snapshots = {}
         self.condition_registered_at = {}
+        self.candidate_registry = CandidateRegistry(
+            signal_source=TRADE_CONFIG.signal_source,
+            candidate_expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+        )
         self.quant_strategy = QuantConditionStrategy(QUANT_STRATEGY_CONFIG)
+        self.time_policy = TimePolicy(TRADE_CONFIG)
+        self.momentum_strategy = MomentumBreakoutStrategy(
+            TRADE_CONFIG,
+            time_policy=self.time_policy,
+        )
         self.condition_capture_logger = ConditionCaptureLogger(CONDITION_CAPTURE_CSV)
-        self.pending_training_samples = {}
-        self.last_training_sample_at = {}
         # 단테 학습 트랙(Phase A) 의 sample_id → 진행 정보. 5/10/20분 horizon 라벨링 후 CSV flush.
         self.pending_dante_samples = {}
         self.last_dante_sample_at = {}
@@ -278,6 +307,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self._selling_codes = set()
         self.pending_sell_order_codes = set()
         self.pending_sell_intents = {}
+        self.exit_escalation_active = False
+        self.exit_escalated_codes = set()
         self.last_sell_skip_log_at = {}
         self.cached_deposit = None
         self.deposit_updated_at = 0
@@ -296,12 +327,24 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # 미수신 시 entry_strategy 가 neutral fallback 으로 안전 처리한다.
         self.market_state = MarketStateCache()
         self.index_realtime_registered = False
-        # 학습 데이터(entry_training.csv) 기반 보정값.
-        # 단테 룰 전환 직후에는 사용하지 않으므로 None 상태로 둔다.
-        self.dynamic_min_net_return = None
-        self.entry_calibration = self.load_entry_calibration()
+        self.market_services_started = False
         self.ai_server_failure_count = 0
         self.ai_server_cooldown_until = 0.0
+        self.paper_portfolio = (
+            PaperPortfolio(
+                initial_cash=TRADE_CONFIG.paper_initial_cash,
+                daily_loss_limit_pct=TRADE_CONFIG.paper_daily_loss_limit_pct,
+            )
+            if TRADE_CONFIG.paper_portfolio_enabled
+            else None
+        )
+        self.order_guard = OrderGuard(
+            TRADE_CONFIG,
+            self.paper_portfolio,
+            time_policy=self.time_policy,
+        )
+        self.last_order_guard_decision = None
+        self._order_guard_live_call = False
         self.condition_timer = QTimer()
         self.condition_timer.timeout.connect(self.process_next_condition_stock)
         self.position_check_timer = QTimer()
@@ -312,6 +355,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # 안에 안 잡히면 자동 취소해 슬롯을 해제한다.
         self.buy_expiry_timer = QTimer()
         self.buy_expiry_timer.timeout.connect(self.cancel_stale_buy_orders)
+        self.market_bootstrap_timer = QTimer()
+        self.market_bootstrap_timer.setSingleShot(True)
+        self.market_bootstrap_timer.timeout.connect(self.start_market_services_if_allowed)
 
     
     def _make_kiwoom_instance(self):
@@ -390,10 +436,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             # 매수 접수 시점에만 채워두면 cancel_stale_buy_orders 가 만료된 주문에
             # 같은 order_no 로 취소 요청을 보낼 수 있다(키움 SendOrder 는 즉시
             # 주문번호를 주지 않음 — chejan "접수" 이벤트가 유일한 출처).
-            if chejan_side == "buy" and code and order_no:
+            if code and order_no:
                 ctx = self.order_context.get(code)
                 if isinstance(ctx, dict) and not ctx.get("order_no"):
                     ctx["order_no"] = order_no
+                if chejan_side == "sell" and isinstance(ctx, dict):
+                    ctx["exit_order_no"] = order_no
         elif order_status == "체결":
             if left_quantity_int > 0:
                 self.pending_order_codes.add(code)
@@ -444,7 +492,17 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             model_action=context.get("model_action", ""),
             model_target=context.get("model_target", ""),
             model_threshold=context.get("model_threshold", ""),
+            candidate_id=context.get("candidate_id", ""),
             reason=context.get("reason", ""),
+            exit_reason_code=context.get("exit_reason_code", ""),
+            exit_type=context.get("exit_type", ""),
+            stop_reason=context.get("stop_reason", ""),
+            exit_policy_source=context.get("exit_policy_source", ""),
+            sell_retry_count=context.get("sell_retry_count", ""),
+            unfilled_exit_qty=left_quantity,
+            sell_order_result=order_status,
+            exit_order_no=order_no,
+            exit_decision_trace=context.get("exit_decision_trace", ""),
             hold_seconds=context.get("hold_seconds", ""),
             profit_rate=context.get("profit_rate", ""),
             message="gubun {}".format(gubun),
@@ -483,6 +541,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 position.pending_buy = left_quantity_int > 0
                 if isinstance(context, dict):
                     position.order_context = dict(context)
+                    if context.get("candidate_id"):
+                        position.candidate_id = str(context.get("candidate_id") or "")
                     planned_stop = self.parse_int(context.get("stop_price", 0))
                     planned_target = self.parse_int(context.get("take_profit_price", 0))
                     if planned_stop > 0:
@@ -872,6 +932,69 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return True
         return False
 
+    def _market_bootstrap_delay_ms(self, next_allowed_time=""):
+        delay_ms = MARKET_BOOTSTRAP_RETRY_INTERVAL_MS
+        if next_allowed_time:
+            try:
+                target = datetime.fromisoformat(str(next_allowed_time))
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=self.time_policy.timezone)
+                now = datetime.now(target.tzinfo)
+                delay_ms = int((target - now).total_seconds() * 1000)
+            except (TypeError, ValueError):
+                delay_ms = MARKET_BOOTSTRAP_RETRY_INTERVAL_MS
+        delay_ms = max(1000, delay_ms)
+        return min(delay_ms, MARKET_BOOTSTRAP_MAX_DELAY_MS)
+
+    def start_market_services_if_allowed(self):
+        """장 전 장시간 실행 시 TR/조건검색 누적 호출을 막고, 허용 시간에만 시작한다."""
+        if self.market_services_started:
+            return True
+        decision = self.time_policy.evaluate_candidate_capture(
+            log=True,
+            context={"source": "market_bootstrap"},
+        )
+        if not decision.allowed:
+            delay_ms = self._market_bootstrap_delay_ms(decision.next_allowed_time)
+            self.market_bootstrap_timer.start(delay_ms)
+            logger.info(
+                "[장시작 대기] market services 보류 reason=%s session=%s next=%s retry=%.1fs",
+                decision.reason_code,
+                decision.session,
+                decision.next_allowed_time,
+                delay_ms / 1000.0,
+            )
+            return False
+        return self.start_market_services()
+
+    def start_market_services(self):
+        if self.market_services_started:
+            return True
+        self.market_services_started = True
+        if self.market_bootstrap_timer.isActive():
+            self.market_bootstrap_timer.stop()
+
+        logger.info("[장시작 초기화] 계좌 TR/실시간 등록/조건검색 시작")
+        my_deposit = self.get_deposit()
+        logger.info("남은 예수금 : %s", my_deposit)
+
+        # 잔고/미체결 TR은 장 시작 후 1회 동기화하고, 이후 타이머로 관리한다.
+        self.check_open_positions()
+        logger.info("현재가지고 있는 종목: {}".format(self.get_balance()))
+        logger.info("미체결 종목: {}".format(self.pending_order_codes))
+
+        self.position_check_timer.start(POSITION_CHECK_INTERVAL_MS)
+        self.sell_check_timer.start(SELL_CHECK_INTERVAL_MS)
+        self.buy_expiry_timer.start(BUY_ORDER_EXPIRY_CHECK_INTERVAL_MS)
+
+        # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 — 조건검색 시작 전에 1회 등록.
+        self.register_realtime_indices()
+
+        if not self.start_realtime_condition(CONDITION_NAME):
+            logger.error("실시간 조건검색을 시작하지 못했습니다. 조건식 설정을 확인해주세요.")
+            return False
+        return True
+
     def register_condition_detected_stock(
         self,
         code,
@@ -885,19 +1008,106 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         code = self.normalize_code(code)
         if not code:
             return
+        detected_at = time.time()
+        hts_condition_name = condition_name or CONDITION_NAME
+        if not hasattr(self, "time_policy"):
+            self.time_policy = TimePolicy(TRADE_CONFIG)
+        capture_decision = self.time_policy.evaluate_trading_candidate_capture(
+            min_observation_sec=getattr(TRADE_CONFIG, "min_candidate_age_seconds", 30),
+            log=True,
+            context={
+                "symbol": code,
+                "condition_name": hts_condition_name,
+                "condition_index": str(condition_index or ""),
+                "event_type": event_type,
+                "source": "condition_detected",
+            },
+        )
+        if not capture_decision.allowed:
+            code_name = self.get_code_name(code)
+            detected_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detected_at))
+            if getattr(capture_decision, "capture_allowed", False):
+                try:
+                    self.condition_capture_logger.append_detection(
+                        code=code,
+                        candidate_id="",
+                        name=code_name,
+                        condition_name=hts_condition_name,
+                        strategy_name=TRADE_CONFIG.strategy_name,
+                        condition_index=condition_index,
+                        event_type=event_type,
+                        screen_no=screen_no or CONDITION_SCREEN_NO,
+                        signal_source=TRADE_LOG_SIGNAL_SOURCE,
+                        detected_at=detected_at_text,
+                        candidate_role="analysis_only",
+                        time_policy_reason=capture_decision.reason_code,
+                        entry_allowed=capture_decision.entry_allowed,
+                        capture_allowed=capture_decision.capture_allowed,
+                        manage_allowed=capture_decision.manage_allowed,
+                        analysis_allowed=getattr(capture_decision, "analysis_allowed", ""),
+                    )
+                except Exception as exc:
+                    logger.warning("[condition analysis log failed] %s %s", code, exc)
+            logger.info(
+                "[TimePolicy analysis-only] %s condition=%s reason=%s session=%s next=%s role=%s",
+                code,
+                hts_condition_name,
+                capture_decision.reason_code,
+                capture_decision.session,
+                capture_decision.next_allowed_time,
+                capture_decision.candidate_role,
+            )
+            return
+        code_name = self.get_code_name(code)
+        detected_at_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(detected_at))
+        candidate = self.candidate_registry.register_detection(
+            code=code,
+            name=code_name,
+            condition_name=hts_condition_name,
+            condition_index=str(condition_index or ""),
+            event_type=event_type,
+            detected_at=detected_at,
+            meta={
+                "strategy_name": TRADE_CONFIG.strategy_name,
+                "condition_formula": TRADE_LOG_CONDITION_FORMULA,
+                "condition_formula_version": TRADE_LOG_CONDITION_FORMULA_VERSION,
+                "signal_source": TRADE_LOG_SIGNAL_SOURCE,
+                "candidate_role": capture_decision.candidate_role or "trading",
+                "time_policy_reason": capture_decision.reason_code,
+                "entry_allowed": capture_decision.entry_allowed,
+                "capture_allowed": capture_decision.capture_allowed,
+                "manage_allowed": capture_decision.manage_allowed,
+                "analysis_allowed": getattr(capture_decision, "analysis_allowed", ""),
+            },
+        )
         watch = self.ensure_monitoring_stock(code)
-        watch["condition_name"] = condition_name or CONDITION_NAME
+        watch["candidate_id"] = candidate.candidate_id
+        watch["condition_name"] = hts_condition_name
         watch["condition_event_type"] = event_type
         watch["condition_index"] = condition_index
+        watch["strategy_name"] = TRADE_CONFIG.strategy_name
         watch["condition_formula"] = TRADE_LOG_CONDITION_FORMULA
+        watch["condition_formula_version"] = TRADE_LOG_CONDITION_FORMULA_VERSION
+        watch["detected_at"] = detected_at
+        watch["signal_source"] = TRADE_LOG_SIGNAL_SOURCE
         try:
             self.condition_capture_logger.append_detection(
                 code=code,
-                name=self.get_code_name(code),
-                condition_name=condition_name or CONDITION_NAME,
+                candidate_id=candidate.candidate_id,
+                name=code_name,
+                condition_name=hts_condition_name,
+                strategy_name=TRADE_CONFIG.strategy_name,
                 condition_index=condition_index,
                 event_type=event_type,
                 screen_no=screen_no or CONDITION_SCREEN_NO,
+                signal_source=TRADE_LOG_SIGNAL_SOURCE,
+                detected_at=detected_at_text,
+                candidate_role=capture_decision.candidate_role or "trading",
+                time_policy_reason=capture_decision.reason_code,
+                entry_allowed=capture_decision.entry_allowed,
+                capture_allowed=capture_decision.capture_allowed,
+                manage_allowed=capture_decision.manage_allowed,
+                analysis_allowed=getattr(capture_decision, "analysis_allowed", ""),
             )
         except Exception as exc:
             logger.warning("[조건검색 포착 로그 실패] %s %s", code, exc)
@@ -907,7 +1117,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             logger.info(
                 "[조건편입 실시간등록] %s %s event=%s screen=%s - 첫 실시간 체결가를 포착가로 사용",
                 code,
-                condition_name or CONDITION_NAME,
+                hts_condition_name,
                 event_type,
                 self.realtime_code_screens.get(code, ""),
             )
@@ -1042,12 +1252,400 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self._tr_busy = False
         return self.cached_deposit if self.cached_deposit is not None else 0
 
-    def send_order(self, rqname, screen_no, order_type, code, order_quantity, order_price, order_gubun, order_no = ""):
+    def send_order(
+        self,
+        rqname,
+        screen_no,
+        order_type,
+        code,
+        order_quantity,
+        order_price,
+        order_gubun,
+        order_no="",
+        *,
+        guard_token="",
+        request_id="",
+    ):
+        guard = getattr(self, "order_guard", None)
+        if guard is None:
+            logger.error("[OrderGuard 차단] send_order 직접 호출 금지(order_guard missing): %s %s %s", rqname, code, order_type)
+            return -9901
+        token_ok, token_reason = guard.consume_live_order_token(
+            guard_token,
+            rqname=rqname,
+            order_type=order_type,
+            code=code,
+            quantity=order_quantity,
+            price=order_price,
+            order_gubun=order_gubun,
+            order_no=order_no,
+            request_id=request_id,
+        )
+        if not token_ok:
+            logger.error(
+                "[OrderGuard 차단] send_order guard token 거부: %s %s %s reason=%s",
+                rqname,
+                code,
+                order_type,
+                token_reason,
+            )
+            return -9901
         self.wait_for_order_slot()
         order_result = self.dynamicCall("SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)", [rqname, screen_no, self.account_number, order_type, code, order_quantity, order_price, order_gubun, order_no])
         self.account_updated_at = 0
         self.deposit_updated_at = 0
         return order_result
+
+    def build_order_risk_state(self, request):
+        mode = "paper" if TRADE_CONFIG.dry_run else "live"
+        pending_orders = set(getattr(self, "pending_order_codes", set()) or set())
+        pending_order_ids = set()
+        order_context = getattr(self, "order_context", {}) or {}
+        if isinstance(order_context, dict):
+            for pending_code in pending_orders:
+                ctx = order_context.get(pending_code, {})
+                if isinstance(ctx, dict):
+                    order_no = str(ctx.get("order_no", "") or "")
+                    if order_no:
+                        pending_order_ids.add(order_no)
+        paper = getattr(self, "paper_portfolio", None)
+        if mode == "paper" and paper is not None:
+            return paper.to_risk_state(
+                pending_orders=pending_orders,
+                pending_order_ids=pending_order_ids,
+            )
+
+        open_positions = set()
+        daily_exposure = 0
+        daily_buy_count = 0
+        portfolio = getattr(self, "portfolio", None)
+        if portfolio is not None and hasattr(portfolio, "items"):
+            for code, position in portfolio.items():
+                if position.is_holding():
+                    open_positions.add(code)
+                if position.bought_today:
+                    daily_buy_count += 1
+                    basis_price = self.parse_int(getattr(position, "entry_price", 0))
+                    quantity = self.parse_int(
+                        getattr(position, "planned_quantity", 0)
+                        or getattr(position, "quantity", 0)
+                    )
+                    daily_exposure += max(basis_price, 0) * max(quantity, 0)
+        for held_code in getattr(self, "holding_codes", set()) or set():
+            open_positions.add(self.normalize_code(held_code) if hasattr(self, "normalize_code") else str(held_code))
+        position_quantities = getattr(self, "position_quantities", {}) or {}
+        if isinstance(position_quantities, dict):
+            for held_code, quantity in position_quantities.items():
+                if self.parse_int(quantity) > 0:
+                    open_positions.add(self.normalize_code(held_code) if hasattr(self, "normalize_code") else str(held_code))
+
+        daily_loss_value = getattr(self, "daily_realized_pnl", None)
+        daily_loss_available = daily_loss_value is not None
+        account_state_available = True
+        if mode == "live":
+            account_state_available = bool(
+                getattr(self, "account_number", "")
+                and getattr(self, "account_updated_at", 0) > 0
+                and daily_loss_available
+            )
+
+        return RiskState(
+            mode=mode,
+            account_state_available=account_state_available,
+            daily_loss_available=daily_loss_available if mode == "live" else True,
+            daily_buy_count=daily_buy_count,
+            daily_loss=float(daily_loss_value or 0.0),
+            daily_exposure=int(daily_exposure),
+            open_positions=open_positions,
+            pending_orders=pending_orders,
+            pending_order_ids=pending_order_ids,
+            last_exit_at=dict(getattr(paper, "last_exit_at", {}) if paper is not None else {}),
+        )
+
+    def log_pre_live_order_submit(self, request, decision, risk_state, *, guard_token_id=""):
+        context = dict(getattr(request, "context", {}) or {})
+        metrics = context.get("momentum_metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        event = {
+            "event": "pre_live_order_submit",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": request.code,
+            "symbol_name": request.name,
+            "candidate_id": context.get("candidate_id", ""),
+            "side": request.normalized_side,
+            "order_type": "market" if request.order_gubun == "03" else "limit",
+            "qty": int(request.quantity or 0),
+            "price": int(request.price or 0),
+            "requested_amount": int(decision.requested_amount or 0),
+            "dry_run": bool(TRADE_CONFIG.dry_run),
+            "live_trading_enabled": bool(TRADE_CONFIG.live_trading_enabled),
+            "guard_decision_id": decision.guard_decision_id,
+            "guard_token_id": guard_token_id,
+            "request_id": getattr(request, "request_id", ""),
+            "time_decision_id": getattr(decision, "time_decision_id", ""),
+            "guard_allowed": bool(decision.allowed),
+            "guard_reason": decision.reason,
+            "strategy_name": context.get("strategy_name", TRADE_CONFIG.strategy_name),
+            "condition_name": context.get("condition_name", TRADE_CONFIG.condition_name),
+            "detected_at": context.get("detected_at", ""),
+            "candidate_age_sec": context.get("candidate_age_sec", metrics.get("age_seconds", "")),
+            "entry_decision": context.get("entry_decision", context.get("model_action", "")),
+            "entry_reason": request.reason or context.get("reason", ""),
+            "risk_score": context.get("chase_risk_score", metrics.get("chase_risk_score", "")),
+            "strategy_version": context.get("strategy_version", TRADE_CONFIG.entry_strategy_version),
+            "legacy_filter_enabled": bool(context.get("legacy_filter_enabled", True)),
+            "final_entry_allowed": bool(context.get("final_entry_allowed", False)),
+            "final_reason": context.get("final_reason", ""),
+            "decision_trace": context.get("decision_trace", {}),
+            "daily_buy_count": int(decision.daily_buy_count or 0),
+            "max_daily_buy_count": int(TRADE_CONFIG.max_daily_buy_count),
+            "daily_loss": float(decision.daily_loss or 0.0),
+            "max_daily_loss": int(TRADE_CONFIG.max_daily_loss),
+            "position_size_limit": int(TRADE_CONFIG.max_position_size),
+            "account_state_available": bool(risk_state.account_state_available),
+        }
+        logger.info(
+            "[pre_live_order_submit] %s",
+            json.dumps(event, ensure_ascii=False, sort_keys=True, default=str),
+        )
+
+    def log_would_order(self, request, decision, risk_state, fill_price):
+        context = dict(getattr(request, "context", {}) or {})
+        metrics = context.get("momentum_metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        event = {
+            "event": "would_order",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": request.code,
+            "symbol_name": request.name,
+            "candidate_id": context.get("candidate_id", ""),
+            "side": request.normalized_side,
+            "order_type": "market" if request.order_gubun == "03" else "limit",
+            "qty": int(request.quantity or 0),
+            "price": int(fill_price or request.price or 0),
+            "requested_amount": int(decision.requested_amount or 0),
+            "dry_run": bool(TRADE_CONFIG.dry_run),
+            "live_trading_enabled": bool(TRADE_CONFIG.live_trading_enabled),
+            "guard_decision_id": decision.guard_decision_id,
+            "request_id": getattr(request, "request_id", ""),
+            "time_decision_id": getattr(decision, "time_decision_id", ""),
+            "guard_allowed": bool(decision.allowed),
+            "guard_reason": decision.reason,
+            "strategy_name": context.get("strategy_name", TRADE_CONFIG.strategy_name),
+            "condition_name": context.get("condition_name", TRADE_CONFIG.condition_name),
+            "detected_at": context.get("detected_at", ""),
+            "candidate_age_sec": context.get("candidate_age_sec", metrics.get("age_seconds", "")),
+            "entry_decision": context.get("entry_decision", context.get("model_action", "")),
+            "entry_reason": request.reason or context.get("reason", ""),
+            "risk_score": context.get("chase_risk_score", metrics.get("chase_risk_score", "")),
+            "strategy_version": context.get("strategy_version", TRADE_CONFIG.entry_strategy_version),
+            "legacy_filter_enabled": bool(context.get("legacy_filter_enabled", True)),
+            "final_entry_allowed": bool(context.get("final_entry_allowed", False)),
+            "final_reason": context.get("final_reason", ""),
+            "decision_trace": context.get("decision_trace", {}),
+            "daily_buy_count": int(decision.daily_buy_count or 0),
+            "max_daily_buy_count": int(TRADE_CONFIG.max_daily_buy_count),
+            "daily_loss": float(decision.daily_loss or 0.0),
+            "max_daily_loss": int(TRADE_CONFIG.max_daily_loss),
+            "position_size_limit": int(TRADE_CONFIG.max_position_size),
+            "account_state_available": bool(risk_state.account_state_available),
+        }
+        logger.info(
+            "[would_order] %s",
+            json.dumps(event, ensure_ascii=False, sort_keys=True, default=str),
+        )
+
+    def log_final_entry_decision(self, code, name, final_decision, *, current_price=0, extra=None):
+        context = dict(extra or {})
+        event = {
+            "event": "final_entry_decision",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": code,
+            "symbol_name": name,
+            "candidate_id": context.get("candidate_id", ""),
+            "current_price": int(current_price or 0) or None,
+            "allowed": bool(final_decision.allowed),
+            "status": final_decision.status,
+            "reason_code": final_decision.reason_code,
+            "final_reason": final_decision.final_reason,
+            "blocked_by": final_decision.blocked_by,
+            "strategy_version": final_decision.strategy_version,
+            "legacy_filter_enabled": bool(final_decision.legacy_filter_enabled),
+            "momentum_decision": final_decision.momentum_decision,
+            "momentum_reason_code": final_decision.momentum_reason_code,
+            "legacy_decision": final_decision.legacy_decision,
+            "legacy_reason_code": final_decision.legacy_reason_code,
+            "entry_type": final_decision.entry_type,
+            "position_size_multiplier": final_decision.position_size_multiplier,
+            "legacy_veto_applied": final_decision.legacy_veto_applied,
+            "legacy_veto_ignored": final_decision.legacy_veto_ignored,
+            "decision_trace": final_decision.decision_trace,
+        }
+        event.update(context)
+        logger.info(
+            "[final_entry_decision] %s",
+            json.dumps(event, ensure_ascii=False, sort_keys=True, default=str),
+        )
+
+    def log_entry_decision_trace(self, request, guard_decision, risk_state):
+        context = dict(getattr(request, "context", {}) or {})
+        if not context.get("decision_trace") and "final_entry_allowed" not in context:
+            return
+        trace = trace_with_order_guard(
+            context.get("decision_trace"),
+            allowed=getattr(guard_decision, "allowed", False),
+            reason=getattr(guard_decision, "reason", ""),
+            blocked_by=getattr(guard_decision, "blocked_by", ""),
+            guard_decision_id=getattr(guard_decision, "guard_decision_id", ""),
+            mode=getattr(guard_decision, "mode", ""),
+        )
+        event = {
+            "event": "entry_decision_trace",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": request.code,
+            "symbol_name": request.name,
+            "candidate_id": context.get("candidate_id", ""),
+            "side": request.normalized_side,
+            "dry_run": bool(TRADE_CONFIG.dry_run),
+            "live_trading_enabled": bool(TRADE_CONFIG.live_trading_enabled),
+            "strategy_version": context.get("strategy_version", TRADE_CONFIG.entry_strategy_version),
+            "legacy_filter_enabled": bool(context.get("legacy_filter_enabled", True)),
+            "final_entry_allowed": bool(context.get("final_entry_allowed", False)),
+            "final_reason": context.get("final_reason", ""),
+            "guard_allowed": bool(getattr(guard_decision, "allowed", False)),
+            "guard_reason": getattr(guard_decision, "reason", ""),
+            "guard_decision_id": getattr(guard_decision, "guard_decision_id", ""),
+            "time_decision_id": getattr(guard_decision, "time_decision_id", ""),
+            "daily_buy_count": int(getattr(guard_decision, "daily_buy_count", 0) or 0),
+            "daily_loss": float(getattr(guard_decision, "daily_loss", 0.0) or 0.0),
+            "account_state_available": bool(getattr(risk_state, "account_state_available", False)),
+            "decision_trace": trace,
+        }
+        logger.info(
+            "[entry_decision_trace] %s",
+            json.dumps(event, ensure_ascii=False, sort_keys=True, default=str),
+        )
+
+    def submit_order_guarded(self, request):
+        """OrderGuard 를 통과한 주문만 live SendOrder 또는 paper fill 로 보낸다."""
+        guard = getattr(self, "order_guard", None)
+        if guard is None:
+            self.last_order_guard_decision = GuardDecision(
+                False,
+                False,
+                False,
+                "missing_order_guard",
+                blocked_by="order_guard",
+                symbol=request.code,
+            )
+            logger.error("[OrderGuard 차단] order_guard 누락: %s %s", request.rqname, request.code)
+            return -9904
+
+        try:
+            risk_state = self.build_order_risk_state(request)
+        except Exception as exc:
+            self.last_order_guard_decision = GuardDecision(
+                False,
+                False,
+                False,
+                "risk_state_error",
+                blocked_by="risk_state",
+                symbol=request.code,
+            )
+            logger.exception("[OrderGuard 상태 생성 실패] %s %s: %s", request.rqname, request.code, exc)
+            return -9903
+
+        decision = guard.validate(request, risk_state=risk_state)
+        self.last_order_guard_decision = decision
+        if hasattr(self, "log_entry_decision_trace"):
+            self.log_entry_decision_trace(request, decision, risk_state)
+        if not decision.allowed:
+            logger.info(
+                "[OrderGuard 거절] %s %s reason=%s blocked_by=%s amount=%s daily_buy=%s daily_loss=%s",
+                request.code,
+                request.rqname,
+                decision.reason,
+                decision.blocked_by,
+                decision.requested_amount,
+                decision.daily_buy_count,
+                decision.daily_loss,
+            )
+            return -9902
+
+        if decision.paper or not decision.live:
+            fill_price = (
+                self.parse_int(request.current_price)
+                or self.parse_int(request.price)
+                or self.parse_int(request.entry_price)
+            )
+            paper = getattr(self, "paper_portfolio", None)
+            if decision.paper and paper is not None and not request.is_cancel:
+                if request.normalized_side == "buy":
+                    paper.apply_buy(request, fill_price=fill_price)
+                elif request.normalized_side == "sell":
+                    paper.apply_sell(request, fill_price=fill_price)
+            guard.record_sent()
+            if hasattr(self, "log_would_order"):
+                self.log_would_order(request, decision, risk_state, fill_price)
+            logger.info(
+                "[DRY_RUN would_order] %s %s qty=%s price=%s reason=%s",
+                request.normalized_side,
+                request.code,
+                request.quantity,
+                fill_price,
+                request.reason,
+            )
+            return 0
+
+        if decision.throttle_seconds > 0:
+            time.sleep(decision.throttle_seconds)
+        token = guard.issue_live_order_token(request, decision)
+        self._order_guard_live_call = token.token_id
+        self._order_guard_live_request = (
+            request.rqname,
+            request.code,
+            request.order_type,
+            request.quantity,
+            request.price,
+            request.order_gubun,
+            request.order_no,
+            request.request_id,
+        )
+        self.log_pre_live_order_submit(
+            request,
+            decision,
+            risk_state,
+            guard_token_id=token.token_id,
+        )
+        logger.info(
+            "[OrderGuard live 승인] %s %s qty=%s price=%s amount=%s reason=%s",
+            request.normalized_side,
+            request.code,
+            request.quantity,
+            request.price,
+            decision.requested_amount,
+            request.reason,
+        )
+        try:
+            result = self.send_order(
+                request.rqname,
+                request.screen_no,
+                request.order_type,
+                request.code,
+                request.quantity,
+                request.price,
+                request.order_gubun,
+                request.order_no,
+                guard_token=token.token_id,
+                request_id=request.request_id,
+            )
+        finally:
+            self._order_guard_live_call = ""
+            self._order_guard_live_request = None
+        guard.record_sent()
+        return result
     
     def get_order(self, force=False):
         now = time.time()
@@ -1153,9 +1751,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.update_monitoring_tick(code, tick)
         self.update_reentry_watch(code, close)
 
-        self.update_training_labels(code, close, received_at)
         self.update_dante_training_labels(code, close, received_at)
         self.update_dante_shadow_training_labels(code, close, received_at)
+        self.check_paper_position_exit(code, close)
 
     def _on_receive_real_data(self, s_code, real_type, real_data):
         if real_type == "장시작시간":
@@ -1194,6 +1792,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
 
     def process_next_condition_stock(self):
         self.reset_daily_state()
+        self.expire_candidate_registry()
         if self.processing_condition or not self.pending_condition_codes:
             return
 
@@ -1205,6 +1804,28 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             logger.error("[조건검색 처리 오류] {} {}".format(code, e))
         finally:
             self.processing_condition = False
+
+    def expire_candidate_registry(self):
+        if not hasattr(self, "candidate_registry"):
+            return
+        expired = self.candidate_registry.expire(
+            now=time.time(),
+            expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+        )
+        for candidate in expired:
+            code = self.normalize_code(candidate.code)
+            self.clear_monitoring_stock(code, "후보 만료")
+            if code in self.pending_condition_codes:
+                try:
+                    self.pending_condition_codes.remove(code)
+                except ValueError:
+                    pass
+            logger.info(
+                "[후보 만료] %s age=%.0fs condition=%s",
+                code,
+                candidate.age_seconds(),
+                candidate.condition_name,
+            )
 
     def reset_daily_state(self):
         today = time.strftime("%Y-%m-%d")
@@ -1220,8 +1841,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.last_sell_skip_log_at.clear()
         self.pending_sell_intents.clear()
         self.pending_sell_order_codes.clear()
+        self.exit_escalation_active = False
+        self.exit_escalated_codes.clear()
         self.condition_registered_at.clear()
-        self.last_training_sample_at.clear()
         self.last_dante_sample_at.clear()
         # 전날 미라벨링된 단테 샘플은 표본 신뢰도가 낮으므로 폐기한다.
         self.pending_dante_samples.clear()
@@ -1262,6 +1884,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         position.pending_sell = code in self.pending_sell_order_codes
         position.pending_sell_intent = self.pending_sell_intents.get(code)
         order_context = self.order_context.get(code, {})
+        if isinstance(order_context, dict) and order_context.get("candidate_id"):
+            position.candidate_id = str(order_context.get("candidate_id") or "")
         position.order_context = order_context if isinstance(order_context, dict) else {}
         return position
 
@@ -1375,11 +1999,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         매 체결/매도 큐 변경/매도 평가 종료 시점마다 호출된다. IO 실패는 main 루프를
         멈추지 않고 로그만 남긴다(거래 자체가 막혀선 안 되므로 best-effort).
 
-        보유/주문 종목이 0 일 때는 디스크 IO 를 스킵한다 -- check_open_positions 의
-        1.5초 주기에서 의미 없는 fsync 가 누적되는 것을 방지한다. 잔존 portfolio_state.json
-        파일은 그대로 남되, 다음 부팅 시 trading_day 비교로 어차피 폐기되므로 안전.
+        보유/주문 종목이 0 일 때는 save/fsync 를 스킵하되, 기존 파일이 있으면 삭제한다.
+        그래야 같은 거래일 안에 전량 청산 후 재시작해도 닫힌 포지션이 되살아나지 않는다.
         """
         if len(self.portfolio) == 0:
+            try:
+                if os.path.exists(PORTFOLIO_STATE_PATH):
+                    os.remove(PORTFOLIO_STATE_PATH)
+            except OSError as exc:
+                logger.warning("portfolio_state 빈 상태 정리 실패: %s", exc)
             return
         try:
             self.portfolio.save(
@@ -1437,8 +2065,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 self.target_returns[code] = position.target_return
             if position.pending_sell_intent:
                 self.pending_sell_intents[code] = dict(position.pending_sell_intent)
-            if position.order_context:
-                self.order_context[code] = dict(position.order_context)
+            restored_context = dict(position.order_context) if position.order_context else {}
+            if position.candidate_id and not restored_context.get("candidate_id"):
+                restored_context["candidate_id"] = position.candidate_id
+            if restored_context:
+                self.order_context[code] = restored_context
 
         logger.info(
             "[portfolio_state] %d 종목 복원 (saved=%s) -- entry_stage/stop_price/"
@@ -1536,6 +2167,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         grade:
           "A" 또는 "B". B급 stage=2 는 신규 종목에서 한 번에 매수하므로 Position 미존재가 정상.
         """
+        paper = getattr(self, "paper_portfolio", None)
+        if TRADE_CONFIG.dry_run and paper is not None and paper.has_open_position(code):
+            logger.info("[paper 매수 제외] {} 가상 포지션 보유 중".format(code))
+            return True
         position = self.portfolio.get(code)
         if stage == 2:
             # B급 일괄 매수: position 미존재가 정상.
@@ -1593,9 +2228,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         return False
 
     def current_hhmmss(self):
+        if hasattr(self, "time_policy"):
+            return self.time_policy.current_hhmmss()
         return int(time.strftime("%H%M%S"))
 
     def is_opening_buy_time(self):
+        if hasattr(self, "time_policy"):
+            return self.time_policy.evaluate_entry().allowed
         now = self.current_hhmmss()
         return OPENING_BUY_START <= now <= OPENING_BUY_END
 
@@ -1635,160 +2274,52 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         return rank, len(turnovers)
 
     def evaluate_time_filter(self, code, *, current_price=0, accum_volume=0):
+        if not hasattr(self, "time_policy"):
+            self.time_policy = TimePolicy(TRADE_CONFIG)
         now = self.current_hhmmss()
-        if now < TIME_FILTER_MORNING_START:
-            return {
-                "ok": False,
-                "status": "wait",
-                "reason": "TimeFilter: 매수 시작 전",
-                "phase": "preopen",
-            }
-        if now >= TIME_FILTER_CLOSING_END:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "TimeFilter: 15:20 이후 신규 매수 금지",
-                "phase": "closed",
-            }
-
+        policy_now = self.time_policy.datetime_from_hhmmss(now)
+        decision = self.time_policy.evaluate_entry(
+            now=policy_now,
+            log=True,
+            context={"symbol": self.normalize_code(code), "source": "evaluate_time_filter"},
+        )
         daily_turnover = self.realtime_daily_turnover(
             code,
             current_price=current_price,
             accum_volume=accum_volume,
         )
-        if now < TIME_FILTER_MORNING_END:
-            return {
-                "ok": True,
-                "phase": "morning",
-                "weight": 1.2,
-                "reason": "TimeFilter morning: 조건식 거래대금 필터 신뢰, 적극 매매 구간",
-                "daily_turnover": daily_turnover,
-            }
-
-        if now < TIME_FILTER_MIDDAY_END:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "TimeFilter midday: 10:00~14:00 횡보장 구간 신규 매수 금지",
-                "phase": "midday",
-                "daily_turnover": daily_turnover,
-            }
-
         rank, ranked_count = self.realtime_turnover_rank(code, current_turnover=daily_turnover)
-        if daily_turnover < TIME_FILTER_CLOSING_MIN_TURNOVER:
-            return {
-                "ok": False,
-                "status": "wait",
-                "reason": "TimeFilter closing: 누적 거래대금 {:.1f}억 < {:.1f}억".format(
-                    daily_turnover / 100_000_000,
-                    TIME_FILTER_CLOSING_MIN_TURNOVER / 100_000_000,
-                ),
-                "phase": "closing",
-                "daily_turnover": daily_turnover,
-                "turnover_rank": rank,
-                "ranked_count": ranked_count,
-            }
-        if rank <= 0 or rank > TIME_FILTER_CLOSING_TOP_RANK:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "TimeFilter closing: 거래대금 순위 {}/{} > Top{}".format(
-                    rank,
-                    ranked_count,
-                    TIME_FILTER_CLOSING_TOP_RANK,
-                ),
-                "phase": "closing",
-                "daily_turnover": daily_turnover,
-                "turnover_rank": rank,
-                "ranked_count": ranked_count,
-            }
+        phase = decision.session
+        if decision.action == "ALLOW_ENTRY":
+            phase = "entry"
+        elif decision.action == "ALLOW_MANAGE_ONLY":
+            phase = "manage_only"
+        elif decision.action == "FORCE_EXIT_WINDOW":
+            phase = "force_exit"
+        wait_reason_codes = {
+            "BLOCK_PRE_OPEN",
+            "BLOCK_OPENING_STABILIZATION",
+        }
         return {
-            "ok": True,
-            "phase": "closing",
-            "weight": 0.8,
-            "reason": "TimeFilter closing: 거래대금 Top{} 종목".format(rank),
+            "ok": decision.allowed,
+            "status": "ready" if decision.allowed else ("wait" if decision.reason_code in wait_reason_codes else "blocked"),
+            "reason": "TimePolicy {}".format(decision.reason_code),
+            "reason_code": decision.reason_code,
+            "phase": phase,
+            "session": decision.session,
+            "weight": 1.0 if decision.allowed else 0.0,
             "daily_turnover": daily_turnover,
             "turnover_rank": rank,
             "ranked_count": ranked_count,
+            "next_allowed_time": decision.next_allowed_time,
+            "config_version": decision.config_version,
+            "entry_allowed": decision.entry_allowed,
+            "capture_allowed": decision.capture_allowed,
+            "manage_allowed": decision.manage_allowed,
         }
 
     def clamp(self, value, low=0.0, high=1.0):
         return max(low, min(high, value))
-
-    def load_entry_calibration(self, path=TRAINING_ENTRY_CSV, bins=10, min_per_bin=5, min_total=80):
-        """학습 데이터에서 score→평균 return_10m 매핑(보정 테이블)을 만든다.
-
-        - score를 bins개 구간으로 나눠 각 구간 평균 return_10m 을 계산한다.
-        - 각 구간에 표본이 min_per_bin개 미만이거나 전체가 min_total 미만이면 None 반환.
-        - return은 scoring.calibrated_return_from_score 가 사용하는 형식의 list of dict.
-        """
-        try:
-            if not os.path.exists(path):
-                return None
-            # 열 개수 불일치 행은 이후 줄에서 깨져도 전체 로드 실패하지 않도록 스킵(구학습 트랙 레거시 CSV).
-            try:
-                df = pd.read_csv(path, encoding="utf-8-sig", on_bad_lines="skip")
-            except TypeError:
-                # pandas <= 1.2.x
-                df = pd.read_csv(path, encoding="utf-8-sig")
-            if "score" not in df.columns or "return_10m" not in df.columns:
-                return None
-            df = df[["score", "return_10m"]].copy()
-            df["score"] = pd.to_numeric(df["score"], errors="coerce")
-            df["return_10m"] = pd.to_numeric(df["return_10m"], errors="coerce")
-            df = df.dropna()
-            if len(df) < min_total:
-                logger.info("[entry calibration] 표본 부족(%d < %d) → fallback 사용", len(df), min_total)
-                return None
-            edges = [i / bins for i in range(bins + 1)]
-            df["bin"] = pd.cut(df["score"], bins=edges, include_lowest=True, labels=False)
-            grouped = df.groupby("bin")
-            table = []
-            for bin_idx, group in grouped:
-                if len(group) < min_per_bin:
-                    continue
-                table.append({
-                    "score": float((edges[int(bin_idx)] + edges[int(bin_idx) + 1]) / 2),
-                    "return": float(group["return_10m"].mean()),
-                    "count": int(len(group)),
-                })
-            if len(table) < 3:
-                logger.info("[entry calibration] 유효 구간 부족(%d) → fallback 사용", len(table))
-                return None
-            table.sort(key=lambda row: row["score"])
-            logger.info("[entry calibration] %d개 구간 로드: %s", len(table),
-                        ["{:.2f}->{:+.2%}({})".format(r["score"], r["return"], r["count"]) for r in table])
-            self.dynamic_min_net_return = self._compute_dynamic_min_net_return(df["return_10m"])
-            return table
-        except Exception as exc:
-            logger.warning("[entry calibration] 로드 실패: %s", exc)
-            return None
-
-    def _compute_dynamic_min_net_return(self, returns):
-        """학습 데이터의 return_10m 분포에서 P50 기반의 자동 임계값을 계산한다.
-
-        - 표본이 너무 적으면 None 반환 → 정적 MIN_NET_EXPECTED_RETURN 사용.
-        - gross P50 에서 왕복비용을 차감한 net 값을 [floor, ceiling] 범위로 클램프한다.
-        """
-        try:
-            series = returns.dropna() if hasattr(returns, "dropna") else returns
-            if len(series) < 80:
-                return None
-            gross_p = float(series.quantile(DYNAMIC_MIN_NET_RETURN_PERCENTILE))
-            net = gross_p - ESTIMATED_ROUND_TRIP_COST_RATE
-            tuned = max(MIN_NET_EXPECTED_RETURN, min(net, DYNAMIC_MIN_NET_RETURN_CEILING))
-            logger.info(
-                "[entry calibration] 동적 매수 임계값 적용: P%.0f gross=%+.2f%%, 비용=%.2f%%, net=%+.2f%% → 임계 %.2f%%",
-                DYNAMIC_MIN_NET_RETURN_PERCENTILE * 100,
-                gross_p * 100,
-                ESTIMATED_ROUND_TRIP_COST_RATE * 100,
-                net * 100,
-                tuned * 100,
-            )
-            return tuned
-        except Exception as exc:
-            logger.warning("[entry calibration] 동적 임계값 계산 실패: %s", exc)
-            return None
 
     def gross_to_net_return(self, gross_return):
         gross_return = self.parse_float(gross_return, 0.0)
@@ -1844,17 +2375,77 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.last_sell_skip_log_at[code] = now
         return True
 
-    def queue_sell_intent(self, code, reason, order_price=0, order_gubun="03"):
+    def _exit_log_fields(self, exit_meta=None, **overrides):
+        if exit_meta is None:
+            fields = {}
+        elif hasattr(exit_meta, "as_log_fields"):
+            fields = dict(exit_meta.as_log_fields())
+        elif isinstance(exit_meta, dict):
+            fields = dict(exit_meta)
+        else:
+            fields = {}
+        if fields.get("exit_reason_code") and not fields.get("reason_code"):
+            fields["reason_code"] = fields.get("exit_reason_code")
+        if not fields.get("exit_policy_source"):
+            fields["exit_policy_source"] = "score_exit_timing"
+        for key, value in overrides.items():
+            if value is not None:
+                fields[key] = value
+        return {
+            "exit_reason_code": fields.get("exit_reason_code", ""),
+            "exit_type": fields.get("exit_type", ""),
+            "stop_reason": fields.get("stop_reason", ""),
+            "exit_policy_source": fields.get("exit_policy_source", ""),
+            "sell_retry_count": fields.get("sell_retry_count", ""),
+            "unfilled_exit_qty": fields.get("unfilled_exit_qty", ""),
+            "sell_order_result": fields.get("sell_order_result", ""),
+            "exit_order_no": fields.get("exit_order_no", ""),
+            "exit_decision_trace": fields.get("exit_decision_trace", fields.get("decision_trace", "")),
+            "reason_code": fields.get("reason_code", fields.get("exit_reason_code", "")),
+        }
+
+    def _mark_exit_escalation(self, code, reason_code, exit_meta=None):
+        code = self.normalize_code(code)
+        if not code:
+            return
+        self.exit_escalation_active = True
+        self.exit_escalated_codes.add(code)
+        meta = self._exit_log_fields(
+            exit_meta,
+            exit_reason_code=reason_code,
+            stop_reason=reason_code,
+            sell_order_result=reason_code,
+        )
+        logger.error("[exit escalation] %s reason=%s", code, reason_code)
+        self.append_trade_log(
+            "sell_order_escalation",
+            code=code,
+            name=self.get_code_name(code),
+            side="sell",
+            quantity=0,
+            reason=reason_code,
+            message="exit escalation active; new buys blocked by OrderGuard context",
+            **meta,
+        )
+
+    def queue_sell_intent(self, code, reason, order_price=0, order_gubun="03", *, exit_meta=None, retry_count=None, unfilled_exit_qty=None, sell_order_result=None):
         code = self.normalize_code(code)
         if not code:
             return
         existing = self.pending_sell_intents.get(code, {})
+        exit_fields = self._exit_log_fields(
+            exit_meta or existing,
+            sell_retry_count=retry_count if retry_count is not None else existing.get("sell_retry_count", 0),
+            unfilled_exit_qty=unfilled_exit_qty,
+            sell_order_result=sell_order_result,
+        )
         intent = {
             "reason": reason,
             "order_price": order_price,
             "order_gubun": order_gubun,
             "queued_at": existing.get("queued_at", time.time()),
             "last_try_at": existing.get("last_try_at", 0),
+            **exit_fields,
         }
         self.pending_sell_intents[code] = intent
         # Position 의 pending_sell_intent 도 같이 갱신해 portfolio_state.json 에 보존되게 한다.
@@ -1879,17 +2470,24 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             if code in self.pending_sell_order_codes or code in self.pending_order_codes:
                 continue
             last_try = intent.get("last_try_at", 0)
-            if now - last_try < SELL_INTENT_RETRY_SECONDS:
+            retry_interval = float(getattr(TRADE_CONFIG, "sell_retry_interval_sec", SELL_INTENT_RETRY_SECONDS) or SELL_INTENT_RETRY_SECONDS)
+            if now - last_try < retry_interval:
                 continue
             _, available_quantity = self._lookup_balance_quantity(code)
             if self.parse_int(available_quantity) <= 0:
                 continue
+            retry_count = int(intent.get("sell_retry_count", 0) or 0) + 1
             intent["last_try_at"] = now
+            intent["sell_retry_count"] = retry_count
+            if retry_count >= int(getattr(TRADE_CONFIG, "escalate_after_retry_count", 2) or 2):
+                self._mark_exit_escalation(code, "stop_order_escalation", intent)
             self.place_sell_order(
                 code,
                 intent.get("order_price", 0),
                 intent.get("order_gubun", "03"),
                 intent.get("reason", "매도 의도 재시도"),
+                exit_meta=intent,
+                sell_retry_count=retry_count,
             )
 
     def requeue_condition_stock(self, code):
@@ -1922,7 +2520,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 "last_reason": "",
                 "condition_name": CONDITION_NAME,
                 "condition_formula": TRADE_LOG_CONDITION_FORMULA,
+                "condition_formula_version": TRADE_LOG_CONDITION_FORMULA_VERSION,
                 "rule_version": TRADE_LOG_RULE_VERSION,
+                "signal_source": TRADE_LOG_SIGNAL_SOURCE,
             }
             self.monitoring_dict[code] = watch
             logger.info(
@@ -2035,17 +2635,42 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if close <= 0:
             return
         accum_volume = self.parse_int(tick.get("accum_volume", 0))
+        volume_delta = self.parse_int(tick.get("volume_delta", 0))
         watch["last_price"] = close
+        watch["last_chejan_strength"] = self.parse_float(tick.get("chejan_strength", 0.0), 0.0)
+        watch["last_accum_volume"] = accum_volume
+        watch["last_trade_value"] = close * accum_volume
+        registry_trigger_price = self.parse_int(watch.get("target_price", 0)) or self.quant_strategy.trigger_price(close)
+        if hasattr(self, "candidate_registry"):
+            self.candidate_registry.on_tick(
+                code,
+                price=close,
+                chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
+                accum_volume=accum_volume,
+                volume_delta=volume_delta,
+                trade_value=volume_delta * close,
+                entry_trigger_price=registry_trigger_price,
+            )
         if self.parse_int(watch.get("capture_price", 0)) <= 0:
             watch["capture_price"] = close
             watch["target_price"] = self.quant_strategy.trigger_price(close)
             watch["capture_accum_volume"] = accum_volume
             watch["breakout_volume"] = max(self.monitoring_volume_5m(code), 0)
             try:
+                candidate = self.candidate_registry.get(code) if hasattr(self, "candidate_registry") else None
+                candidate_id = str(watch.get("candidate_id") or getattr(candidate, "candidate_id", "") or "")
+                detected_at_value = watch.get("detected_at", "")
+                detected_at_text = (
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(detected_at_value)))
+                    if isinstance(detected_at_value, (int, float)) and float(detected_at_value) > 0
+                    else str(detected_at_value or "")
+                )
                 self.condition_capture_logger.append_capture_price(
                     code=code,
+                    candidate_id=candidate_id,
                     name=self.get_code_name(code),
                     condition_name=watch.get("condition_name", CONDITION_NAME),
+                    strategy_name=watch.get("strategy_name", TRADE_CONFIG.strategy_name),
                     condition_index=watch.get("condition_index", ""),
                     event_type=watch.get("condition_event_type", ""),
                     screen_no=self.realtime_code_screens.get(code, REALTIME_SCREEN_NO),
@@ -2053,6 +2678,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     entry_trigger_price=watch["target_price"],
                     chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
                     accum_volume=accum_volume,
+                    signal_source=watch.get("signal_source", TRADE_LOG_SIGNAL_SOURCE),
+                    detected_at=detected_at_text,
                 )
             except Exception as exc:
                 logger.warning("[조건검색 포착가 로그 실패] %s %s", code, exc)
@@ -2119,6 +2746,278 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
     def active_position_count(self):
         return len(self.portfolio.holding_codes()) + len(self.portfolio.pending_order_codes())
 
+    def build_momentum_context(self, code, watch, tick):
+        if not hasattr(self, "candidate_registry"):
+            self.candidate_registry = CandidateRegistry(
+                signal_source=TRADE_CONFIG.signal_source,
+                candidate_expiry_seconds=TRADE_CONFIG.candidate_expiry_seconds,
+            )
+        candidate = self.candidate_registry.get(code) if hasattr(self, "candidate_registry") else None
+        if candidate is None:
+            candidate = self.candidate_registry.register_detection(
+                code=code,
+                name=self.get_code_name(code),
+                condition_name=watch.get("condition_name", CONDITION_NAME),
+                condition_index=str(watch.get("condition_index", "")),
+                event_type=watch.get("condition_event_type", "I"),
+                detected_at=float(watch.get("detected_at", self.condition_registered_at.get(code, time.time())) or time.time()),
+                meta={
+                    "strategy_name": watch.get("strategy_name", TRADE_CONFIG.strategy_name),
+                    "condition_formula": watch.get("condition_formula", TRADE_LOG_CONDITION_FORMULA),
+                    "condition_formula_version": watch.get("condition_formula_version", TRADE_LOG_CONDITION_FORMULA_VERSION),
+                    "signal_source": watch.get("signal_source", TRADE_LOG_SIGNAL_SOURCE),
+                },
+            )
+            capture_price = self.parse_int(watch.get("capture_price", 0))
+            if capture_price > 0:
+                candidate.capture_price = capture_price
+                if candidate.first_capture_price <= 0:
+                    candidate.first_capture_price = capture_price
+                candidate.last_capture_price = capture_price
+                candidate.recent_low_price = self.parse_int(watch.get("recent_low_price", capture_price))
+                candidate.capture_accum_volume = self.parse_int(watch.get("capture_accum_volume", 0))
+        if candidate is not None:
+            watch["candidate_id"] = candidate.candidate_id
+
+        current_price = self.parse_int(tick.get("close", 0))
+        ask = self.parse_int(tick.get("ask", 0))
+        bid = self.parse_int(tick.get("bid", 0))
+        spread_rate = (ask - bid) / current_price if current_price > 0 and ask > 0 and bid > 0 else None
+        recent_volume = self.monitoring_volume_5m(code) if hasattr(self, "monitoring_volume_5m") else 0
+        base_volume = max(
+            self.parse_int(watch.get("breakout_volume", 0)),
+            self.parse_int(watch.get("capture_accum_volume", 0)),
+            0,
+        )
+        volume_ratio = recent_volume / base_volume if base_volume > 0 and recent_volume > 0 else None
+        ticks = self.realtime_ticks.get(code, [])
+        if len(ticks) >= 2:
+            elapsed = max(float(ticks[-1].get("received_at", time.time())) - float(ticks[0].get("received_at", time.time())), 1.0)
+            volume_delta = max(
+                self.parse_int(ticks[-1].get("accum_volume", 0)) - self.parse_int(ticks[0].get("accum_volume", 0)),
+                0,
+            )
+            turnover_speed_per_min = volume_delta * current_price / elapsed * 60 if volume_delta > 0 else None
+        else:
+            turnover_speed_per_min = None
+        minute_bars = self.minute_aggregator.all_bars(code) if hasattr(self.minute_aggregator, "all_bars") else []
+        raw_vwap = (
+            float(self.minute_aggregator.intraday_vwap(code) or 0.0)
+            if hasattr(self.minute_aggregator, "intraday_vwap")
+            else 0.0
+        )
+        intraday_vwap = raw_vwap if raw_vwap > 0 else None
+        high_since = max([self.parse_int(t.get("high", 0)) for t in ticks if self.parse_int(t.get("high", 0)) > 0] or [current_price])
+        rolling_high_since_capture = max(
+            [self.parse_int(t.get("close", 0)) for t in ticks if self.parse_int(t.get("close", 0)) > 0]
+            + [high_since, current_price]
+        )
+        lookback = max(int(getattr(TRADE_CONFIG, "high_distance_lookback_bars", 5) or 5), 1)
+        prior_bars = list(minute_bars[:-1] if minute_bars else [])[-lookback:]
+        prior_highs = [self.parse_int(getattr(bar, "high", 0)) for bar in prior_bars if self.parse_int(getattr(bar, "high", 0)) > 0]
+        prior_lows = [self.parse_int(getattr(bar, "low", 0)) for bar in prior_bars if self.parse_int(getattr(bar, "low", 0)) > 0]
+        prior_high = max(prior_highs) if prior_highs else None
+        prior_low = min(prior_lows) if prior_lows else None
+        short_ma = (
+            float(self.minute_aggregator.sma_close(code, min(5, len(minute_bars))) or 0.0)
+            if hasattr(self.minute_aggregator, "sma_close") and minute_bars
+            else 0.0
+        )
+        short_ma = short_ma if short_ma > 0 else None
+        five_min_ind = self.five_min_cache.get(code) if hasattr(self.five_min_cache, "get") else None
+        current_bar = minute_bars[-1] if minute_bars else None
+        signal_candle_range_pct = None
+        position_in_signal_candle_pct = None
+        upper_wick = None
+        if current_bar is not None:
+            bar_high = self.parse_int(getattr(current_bar, "high", 0))
+            bar_low = self.parse_int(getattr(current_bar, "low", 0))
+            bar_close = self.parse_int(getattr(current_bar, "close", current_price))
+            if bar_high > bar_low and bar_close > 0:
+                signal_candle_range_pct = (bar_high - bar_low) / bar_close
+                position_in_signal_candle_pct = (current_price - bar_low) / (bar_high - bar_low)
+                upper_wick = max(0.0, min(1.0, (bar_high - bar_close) / (bar_high - bar_low)))
+        if five_min_ind:
+            try:
+                upper_wick = float(five_min_ind.upper_wick_ratio_zero_bar())
+            except Exception:
+                upper_wick = upper_wick
+        recent_low_to_current = (
+            current_price / prior_low - 1
+            if current_price > 0 and prior_low and prior_low > 0 and current_price > prior_low
+            else None
+        )
+        return MomentumContext(
+            candidate=candidate,
+            current_price=current_price,
+            chejan_strength=self.parse_float(tick.get("chejan_strength", 0.0), 0.0),
+            spread_rate=spread_rate,
+            volume_ratio=volume_ratio,
+            turnover_speed_per_min=turnover_speed_per_min,
+            intraday_vwap=intraday_vwap,
+            minute_bars=minute_bars,
+            prior_high=prior_high,
+            prior_low=prior_low,
+            short_ma=short_ma,
+            realtime_day_high=high_since,
+            rolling_high_since_capture=rolling_high_since_capture,
+            high_since_capture=high_since,
+            upper_wick_ratio=upper_wick,
+            signal_candle_range_pct=signal_candle_range_pct,
+            position_in_signal_candle_pct=position_in_signal_candle_pct,
+            recent_low_to_current_pct=recent_low_to_current,
+            tick_count=len(ticks),
+            now_ts=time.time(),
+            was_below_vwap=bool(watch.get("was_below_vwap")),
+            short_reclaim_high=self.parse_int(watch.get("short_reclaim_high", 0)),
+        )
+
+    def momentum_prediction(self, code, name, decision, current_price, *, stage=2):
+        status = "ready" if decision.action == MomentumEntryDecision.BUY else "wait"
+        if decision.action in (MomentumEntryDecision.BLOCK_CHASE, MomentumEntryDecision.REJECT):
+            status = "blocked"
+        entry_limit_price = scoring.round_down_to_tick(current_price) if current_price > 0 else 0
+        stop_price = scoring.round_down_to_tick(entry_limit_price * (1 - SAFE_PULLBACK_STOP_LOSS_PCT)) if entry_limit_price > 0 else 0
+        take_profit_price = scoring.round_up_to_tick(entry_limit_price * (1 + SAFE_PULLBACK_TAKE_PROFIT_PCT)) if entry_limit_price > 0 else 0
+        return {
+            "status": status,
+            "code": code,
+            "name": name,
+            "current_price": current_price,
+            "ratio": float(decision.entry_ratio if decision.action == MomentumEntryDecision.BUY else 0.0),
+            "stage": stage,
+            "score": max(0.0, 1.0 - float(decision.chase_risk_score or 0.0) / 100.0),
+            "grade": QUANT_GRADE,
+            "reason": decision.reason,
+            "reason_code": decision.reason_code,
+            "entry_limit_price": entry_limit_price,
+            "stop_price": stop_price,
+            "take_profit_price": take_profit_price,
+            "order_gubun": QUANT_STRATEGY_CONFIG.order_gubun,
+            "plan_source": QUANT_PLAN_SOURCE,
+            "entry_decision": decision.action.value,
+            "strategy_name": TRADE_CONFIG.strategy_name,
+            "condition_name": TRADE_CONFIG.condition_name,
+            "entry_plan_reason": "MomentumBreakoutStrategy 2차 검증: {}".format(decision.reason),
+            "chase_risk_score": decision.chase_risk_score,
+            "momentum_metrics": decision.metrics,
+            "candidate_age_sec": decision.metrics.get("age_seconds", ""),
+            "volume_speed": decision.metrics.get("turnover_speed_per_min", 0.0),
+            "spread_rate": decision.metrics.get("spread_rate", 0.0),
+            "pullback_pct": decision.metrics.get("pullback_pct", 0.0),
+            "entry_type": getattr(decision, "entry_type", ""),
+            "position_size_multiplier": getattr(decision, "position_size_multiplier", 0.0),
+        }
+
+    def build_final_entry_decision(self, momentum_decision, legacy_decision):
+        return build_final_entry_decision(
+            momentum_action=getattr(momentum_decision.action, "value", momentum_decision.action),
+            momentum_reason_code=getattr(momentum_decision, "reason_code", ""),
+            momentum_reason=getattr(momentum_decision, "reason", ""),
+            momentum_chase_risk_score=getattr(momentum_decision, "chase_risk_score", None),
+            legacy_status=getattr(legacy_decision, "status", ""),
+            legacy_reason_code=getattr(legacy_decision, "reason_code", ""),
+            legacy_reason=getattr(legacy_decision, "reason", ""),
+            strategy_version=TRADE_CONFIG.entry_strategy_version,
+            legacy_filter_enabled=bool(getattr(TRADE_CONFIG, "legacy_filter_enabled", True)),
+            entry_type=getattr(momentum_decision, "entry_type", ""),
+            position_size_multiplier=getattr(momentum_decision, "position_size_multiplier", 0.0),
+            legacy_filter_veto_breakout_small=bool(
+                getattr(TRADE_CONFIG, "legacy_filter_veto_breakout_small", False)
+            ),
+        )
+
+    def apply_final_entry_decision(self, prediction, final_decision, momentum_decision=None):
+        prediction = dict(prediction or {})
+        trace = dict(final_decision.decision_trace or {})
+        prediction.update(
+            {
+                "final_entry_allowed": bool(final_decision.allowed),
+                "final_entry_status": final_decision.status,
+                "final_reason_code": final_decision.reason_code,
+                "final_reason": final_decision.final_reason,
+                "strategy_version": final_decision.strategy_version,
+                "legacy_filter_enabled": bool(final_decision.legacy_filter_enabled),
+                "decision_trace": trace,
+                "momentum_decision": final_decision.momentum_decision,
+                "momentum_reason_code": final_decision.momentum_reason_code,
+                "legacy_decision": final_decision.legacy_decision,
+                "legacy_reason_code": final_decision.legacy_reason_code,
+                "entry_type": final_decision.entry_type,
+                "position_size_multiplier": final_decision.position_size_multiplier,
+                "legacy_veto_applied": final_decision.legacy_veto_applied,
+                "legacy_veto_ignored": final_decision.legacy_veto_ignored,
+            }
+        )
+        if momentum_decision is not None:
+            metrics = getattr(momentum_decision, "metrics", {}) or {}
+            prediction.setdefault("entry_decision", getattr(momentum_decision.action, "value", momentum_decision.action))
+            prediction.setdefault("chase_risk_score", getattr(momentum_decision, "chase_risk_score", 0.0))
+            prediction.setdefault("momentum_metrics", metrics)
+            prediction.setdefault("candidate_age_sec", metrics.get("age_seconds", ""))
+            prediction.setdefault("volume_speed", metrics.get("turnover_speed_per_min", None))
+            prediction.setdefault("spread_rate", metrics.get("spread_rate", None))
+            prediction.setdefault("pullback_pct", metrics.get("pullback_pct", None))
+        if final_decision.allowed:
+            prediction["status"] = "ready"
+            if momentum_decision is not None:
+                entry_ratio = float(getattr(momentum_decision, "entry_ratio", 0.0) or 0.0)
+                if entry_ratio > 0:
+                    prediction["ratio"] = min(float(prediction.get("ratio", 1.0) or 1.0), entry_ratio)
+            return prediction
+        prediction["status"] = final_decision.status
+        prediction["ratio"] = 0.0
+        prediction["score"] = 0.0
+        prediction["reason"] = final_decision.final_reason
+        prediction["reason_code"] = final_decision.reason_code
+        return prediction
+
+    def final_entry_block_prediction(
+        self,
+        code,
+        name,
+        current_price,
+        final_decision,
+        *,
+        momentum_decision=None,
+        legacy_decision=None,
+        stage=2,
+    ):
+        if momentum_decision is not None and final_decision.blocked_by == "momentum":
+            prediction = self.momentum_prediction(
+                code,
+                name,
+                momentum_decision,
+                current_price,
+                stage=stage,
+            )
+        elif legacy_decision is not None and hasattr(legacy_decision, "to_prediction"):
+            prediction = legacy_decision.to_prediction(
+                code=code,
+                name=name,
+                config=QUANT_STRATEGY_CONFIG,
+                stage=stage,
+            )
+        else:
+            prediction = {
+                "status": final_decision.status,
+                "code": code,
+                "name": name,
+                "current_price": current_price,
+                "ratio": 0.0,
+                "stage": stage,
+                "score": 0.0,
+                "grade": QUANT_GRADE,
+                "reason": final_decision.final_reason,
+                "reason_code": final_decision.reason_code,
+                "plan_source": QUANT_PLAN_SOURCE,
+            }
+        return self.apply_final_entry_decision(
+            prediction,
+            final_decision,
+            momentum_decision=momentum_decision,
+        )
+
     def score_safe_pullback_trade(self, code):
         code = self.normalize_code(code)
         watch = self.ensure_monitoring_stock(code)
@@ -2131,12 +3030,43 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if current_price <= 0:
             return {"status": "wait", "stage": 2, "reason": "현재가 없음", "reason_code": "SAFE_NO_PRICE"}
 
-        time_filter = self.evaluate_time_filter(
-            code,
-            current_price=current_price,
-            accum_volume=tick.get("accum_volume", 0),
+        self.update_monitoring_tick(code, tick)
+        if not hasattr(self, "momentum_strategy"):
+            if not hasattr(self, "time_policy"):
+                self.time_policy = TimePolicy(TRADE_CONFIG)
+            self.momentum_strategy = MomentumBreakoutStrategy(
+                TRADE_CONFIG,
+                time_policy=self.time_policy,
+            )
+
+        time_filter = (
+            self.evaluate_time_filter(
+                code,
+                current_price=current_price,
+                accum_volume=tick.get("accum_volume", 0),
+            )
+            if hasattr(self, "evaluate_time_filter")
+            else {"ok": True, "phase": "", "weight": 1.0}
         )
         if not time_filter.get("ok"):
+            try:
+                momentum_ctx = self.build_momentum_context(code, watch, tick)
+                self.momentum_strategy.analysis_snapshot(
+                    momentum_ctx,
+                    reason_code="TIME_POLICY_PRE_MOMENTUM_BLOCK_{}".format(
+                        time_filter.get("reason_code", "TIME_FILTER")
+                    ),
+                    reason_detail=time_filter.get("reason", "TimePolicy pre-momentum block"),
+                    blocked_by="time_policy_pre_momentum",
+                )
+            except Exception as exc:
+                logger.warning("[momentum analysis snapshot failed] %s %s", code, exc)
+            if hasattr(self, "candidate_registry"):
+                self.candidate_registry.record_gate_result(
+                    code,
+                    reason_code=time_filter.get("reason_code", "TIME_FILTER"),
+                    blocked_by="time_policy",
+                )
             return {
                 "status": time_filter.get("status", "blocked"),
                 "stage": 2,
@@ -2145,15 +3075,17 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 "current_price": current_price,
                 "ratio": 0.0,
                 "reason": time_filter.get("reason", "TimeFilter block"),
-                "reason_code": "TIME_FILTER",
+                "reason_code": time_filter.get("reason_code", "TIME_FILTER"),
                 "time_filter_phase": time_filter.get("phase", ""),
                 "time_filter_weight": time_filter.get("weight", 0.0),
+                "entry_allowed": time_filter.get("entry_allowed", False),
+                "capture_allowed": time_filter.get("capture_allowed", False),
+                "manage_allowed": time_filter.get("manage_allowed", False),
                 "daily_turnover": time_filter.get("daily_turnover", 0),
                 "turnover_rank": time_filter.get("turnover_rank", 0),
                 "ranked_count": time_filter.get("ranked_count", 0),
             }
 
-        self.update_monitoring_tick(code, tick)
         capture_price = self.parse_int(watch.get("capture_price", 0))
         if capture_price <= 0:
             return {"status": "wait", "stage": 2, "reason": "포착가 저장 대기", "reason_code": "SAFE_NO_CAPTURE"}
@@ -2164,19 +3096,76 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if target_price <= 0:
             target_price = self.quant_strategy.trigger_price(capture_price)
             watch["target_price"] = target_price
+        recent_low_price = self.parse_int(watch.get("recent_low_price", capture_price))
+        if recent_low_price <= 0:
+            recent_low_price = capture_price
+        recent_low_price = min(recent_low_price, current_price)
+        watch["recent_low_price"] = recent_low_price
+        momentum_ctx = self.build_momentum_context(code, watch, tick)
+        momentum_decision = self.momentum_strategy.evaluate(momentum_ctx)
+        if getattr(momentum_decision, "reason_code", "") == "WAIT_RECLAIM_VWAP":
+            watch["was_below_vwap"] = True
+            watch["short_reclaim_high"] = max(
+                self.parse_int(watch.get("short_reclaim_high", 0)),
+                current_price,
+            )
+        elif current_price > 0 and watch.get("was_below_vwap"):
+            watch["short_reclaim_high"] = max(
+                self.parse_int(watch.get("short_reclaim_high", 0)),
+                current_price,
+            )
+        market_snapshot = self.market_state.snapshot()
+        market_regime = getattr(market_snapshot, "market_regime", "") or "neutral"
 
         entry_decision = self.quant_strategy.evaluate_entry(
             capture_price=capture_price,
             current_price=current_price,
             chejan_strength=chejan_strength,
             active_positions=self.active_position_count(),
+            recent_low_price=recent_low_price,
+            market_state=market_regime,
         )
-        if entry_decision.status != "ready":
-            watch["status"] = "WATCHING"
-            return entry_decision.to_prediction(
-                code=code,
-                name=name,
-                config=QUANT_STRATEGY_CONFIG,
+        final_decision = self.build_final_entry_decision(momentum_decision, entry_decision)
+        if hasattr(self, "log_final_entry_decision"):
+            self.log_final_entry_decision(
+                code,
+                name,
+                final_decision,
+                current_price=current_price,
+                extra={
+                    "candidate_id": watch.get("candidate_id", ""),
+                    "strategy_name": watch.get("strategy_name", TRADE_CONFIG.strategy_name),
+                    "condition_name": watch.get("condition_name", CONDITION_NAME),
+                    "detected_at": watch.get("detected_at", ""),
+                    "candidate_age_sec": (momentum_decision.metrics or {}).get("age_seconds", ""),
+                    "pullback_dry_run": (momentum_decision.metrics or {}).get("pullback_dry_run", {}),
+                    "prior_high_source": (momentum_decision.metrics or {}).get("prior_high_source", ""),
+                },
+            )
+        if not final_decision.allowed:
+            watch["status"] = final_decision.status.upper()
+            if hasattr(self, "candidate_registry"):
+                dry_run = (momentum_decision.metrics or {}).get("pullback_dry_run", {}) or {}
+                relaxed_pullback = any(
+                    bool(item.get("passes"))
+                    for item in dry_run.values()
+                    if isinstance(item, dict)
+                )
+                self.candidate_registry.record_gate_result(
+                    code,
+                    reason_code=final_decision.reason_code,
+                    blocked_by=final_decision.blocked_by,
+                    would_buy_under_relaxed_rules=relaxed_pullback
+                    or getattr(momentum_decision, "action", None) == MomentumEntryDecision.BUY,
+                )
+            return self.final_entry_block_prediction(
+                code,
+                name,
+                current_price,
+                final_decision,
+                momentum_decision=momentum_decision,
+                legacy_decision=entry_decision,
+                stage=2,
             )
 
         if watch.get("status") != "READY":
@@ -2192,18 +3181,41 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 chejan_strength,
             )
 
-        return entry_decision.to_prediction(
-            code=code,
-            name=name,
-            config=QUANT_STRATEGY_CONFIG,
-            extra={
-                "safe_target_price": target_price,
-                "daily_turnover": time_filter.get("daily_turnover", 0),
-                "turnover_rank": time_filter.get("turnover_rank", 0),
-                "ranked_count": time_filter.get("ranked_count", 0),
-                "time_filter_phase": time_filter.get("phase", ""),
-                "time_filter_weight": time_filter.get("weight", 1.0),
-            },
+        common_extra = {
+            "safe_target_price": target_price,
+            "candidate_id": watch.get("candidate_id", getattr(momentum_ctx.candidate, "candidate_id", "")),
+            "strategy_name": watch.get("strategy_name", TRADE_CONFIG.strategy_name),
+            "condition_name": watch.get("condition_name", CONDITION_NAME),
+            "detected_at": watch.get("detected_at", ""),
+            "chase_risk_score": momentum_decision.chase_risk_score,
+            "momentum_metrics": momentum_decision.metrics,
+            "daily_turnover": time_filter.get("daily_turnover", 0),
+            "turnover_rank": time_filter.get("turnover_rank", 0),
+            "ranked_count": time_filter.get("ranked_count", 0),
+            "time_filter_phase": time_filter.get("phase", ""),
+            "time_filter_weight": time_filter.get("weight", 1.0),
+        }
+        if final_decision.legacy_veto_ignored:
+            prediction = self.momentum_prediction(
+                code,
+                name,
+                momentum_decision,
+                current_price,
+                stage=1,
+            )
+            prediction.update(common_extra)
+            prediction["entry_plan_reason"] = "BREAKOUT_SMALL momentum entry; legacy pullback veto ignored"
+        else:
+            prediction = entry_decision.to_prediction(
+                code=code,
+                name=name,
+                config=QUANT_STRATEGY_CONFIG,
+                extra=common_extra,
+            )
+        return self.apply_final_entry_decision(
+            prediction,
+            final_decision,
+            momentum_decision=momentum_decision,
         )
 
     def score_safe_pullback_second_entry(self, code, position):
@@ -2216,10 +3228,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if current_price <= 0:
             return {"status": "wait", "stage": 2, "reason": "SAFE 2차 현재가 없음", "reason_code": "SAFE_SECOND_NO_PRICE"}
 
-        time_filter = self.evaluate_time_filter(
-            code,
-            current_price=current_price,
-            accum_volume=ticks[-1].get("accum_volume", 0),
+        time_filter = (
+            self.evaluate_time_filter(
+                code,
+                current_price=current_price,
+                accum_volume=ticks[-1].get("accum_volume", 0),
+            )
+            if hasattr(self, "evaluate_time_filter")
+            else {"ok": True, "phase": "", "weight": 1.0}
         )
         if not time_filter.get("ok"):
             return {
@@ -2755,7 +3771,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if prediction.get("market_gate_action", "") == entry_strategy.MARKET_ACTION_BLOCK_ALL:
             return False
         model_score = self.parse_float(plan.get("model_score", prediction.get("model_score", 0.0)), 0.0)
-        if not MODEL_ASSIST_ONLY and model_score >= RISK_TOO_WIDE_MIN_MODEL_SCORE:
+        if model_score >= RISK_TOO_WIDE_MIN_MODEL_SCORE:
             return True
         reason_code = str(prediction.get("reason_code", "") or "")
         ready_codes = {
@@ -3186,10 +4202,14 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         volume_delta = max(last["accum_volume"] - first["accum_volume"], 0)
         volume_speed = volume_delta / elapsed_secs
         turnover_speed_per_min = volume_speed * current_price * 60
-        time_filter = self.evaluate_time_filter(
-            code,
-            current_price=current_price,
-            accum_volume=last.get("accum_volume", 0),
+        time_filter = (
+            self.evaluate_time_filter(
+                code,
+                current_price=current_price,
+                accum_volume=last.get("accum_volume", 0),
+            )
+            if hasattr(self, "evaluate_time_filter")
+            else {"ok": True, "phase": "", "weight": 1.0}
         )
         if not time_filter.get("ok"):
             return {
@@ -3241,9 +4261,17 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # === ATR / VWAP 보강 (W1: 동적 풀백 밴드 + 고점추매 차단) ===
         # atr_pct 가 None 이면 0.0 으로 떨어뜨려 entry_strategy 가 정적 fallback 사용.
         atr_5m_pct = float(getattr(five_min_ind, "atr_pct", None) or 0.0) if five_min_ind else 0.0
-        intraday_vwap = float(self.minute_aggregator.intraday_vwap(code) or 0.0)
+        intraday_vwap = (
+            float(self.minute_aggregator.intraday_vwap(code) or 0.0)
+            if hasattr(self.minute_aggregator, "intraday_vwap")
+            else 0.0
+        )
         # 풀백 저점은 minute_aggregator 의 1분봉 lookback 에서 직접 추출(고점→저점 시퀀스 보장).
-        pullback_low_after_high = int(self.minute_aggregator.pullback_low_after_high(code) or 0)
+        pullback_low_after_high = (
+            int(self.minute_aggregator.pullback_low_after_high(code) or 0)
+            if hasattr(self.minute_aggregator, "pullback_low_after_high")
+            else 0
+        )
 
         # 매크로 dry-run 게이트 — 이번 PR 은 status/ratio 변경 없이 메타만 부여.
         market_snapshot = self.market_state.snapshot()
@@ -3435,6 +4463,15 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return self.maybe_promote_ai_candidate(prediction)
         return prediction
 
+    def entry_watch_log_label(self, code, stage, status):
+        position = self.portfolio.get(code) if hasattr(self, "portfolio") else None
+        has_first_entry = position is not None and getattr(position, "entry_stage", 0) >= 1
+        if int(stage or 1) >= 2 and not has_first_entry:
+            return "신규진입 후보감시" if status == "wait" else "신규진입 차단"
+        if status == "wait":
+            return "{}차 매수 대기".format(stage)
+        return "{}차 매수 제외".format(stage)
+
     def handle_condition_stock(self, code):
         code = self.normalize_code(code)
         if code in self.no_tick_codes:
@@ -3468,17 +4505,40 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 return
             self.requeue_condition_stock(code)
             if self.should_print_wait_log(code):
+                logger.info(
+                    "[%s] %s %s",
+                    self.entry_watch_log_label(code, stage, "wait"),
+                    code,
+                    prediction.get("reason", ""),
+                )
+                return
+            if self.should_print_wait_log(code):
                 logger.info("[{}차 매수 대기] {} {}".format(stage, code, prediction.get("reason", "")))
             return
         if status == "blocked":
             if hasattr(self, "should_watch_pullback_recovery") and self.should_watch_pullback_recovery(prediction):
                 self.requeue_condition_stock(code)
                 if self.should_print_wait_log(code):
+                    logger.info(
+                        "[%s] %s recovery watch: %s",
+                        self.entry_watch_log_label(code, stage, "wait"),
+                        code,
+                        prediction.get("reason", ""),
+                    )
+                    return
+                if self.should_print_wait_log(code):
                     logger.info("[{}차 매수 대기] {} 회복 감시: {}".format(stage, code, prediction.get("reason", "")))
                 return
             if hasattr(self, "ai_candidate_watchlist"):
                 self.ai_candidate_watchlist.pop(code, None)
             self.risk_too_wide_watchlist.pop(code, None)
+            logger.info(
+                "[%s] %s %s",
+                self.entry_watch_log_label(code, stage, "blocked"),
+                code,
+                prediction.get("reason", ""),
+            )
+            return
             logger.info("[{}차 매수 제외] {} {}".format(stage, code, prediction.get("reason", "")))
             return
 
@@ -3492,6 +4552,33 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             and prediction.get("reason_code") == entry_strategy.READY_AGRADE_FIRST
         ):
             logger.info("[매수 제외] %s weak market chase block", code)
+            return
+
+        if prediction.get("final_entry_allowed") is not True:
+            logger.info(
+                "[FinalEntryDecision block] %s final_entry_allowed=%s reason=%s",
+                code,
+                prediction.get("final_entry_allowed"),
+                prediction.get("final_reason", prediction.get("reason", "")),
+            )
+            self.append_trade_log(
+                "buy_skip",
+                code=code,
+                name=prediction.get("name", ""),
+                side="buy",
+                quantity=0,
+                current_price=prediction.get("current_price", ""),
+                score=prediction.get("score", ""),
+                reason="FinalEntryDecision block",
+                reason_code=prediction.get(
+                    "final_reason_code",
+                    prediction.get("reason_code", "MISSING_FINAL_ENTRY_DECISION"),
+                ),
+                message=prediction.get("final_reason", "missing FinalEntryDecision approval"),
+                market_regime=prediction.get("market_regime", ""),
+                market_gate_action=prediction.get("market_gate_action", ""),
+                market_gate_reason=prediction.get("market_gate_reason", ""),
+            )
             return
 
         self.update_account_status()
@@ -3566,6 +4653,31 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         current_price = self.parse_int(prediction.get("current_price", 0))
         if current_price <= 0:
             logger.info("[매수 보류] {} 현재가 0".format(code))
+            return
+        if prediction.get("final_entry_allowed") is not True:
+            logger.info(
+                "[FinalEntryDecision block] place_buy_order %s reason=%s",
+                code,
+                prediction.get("final_reason", prediction.get("reason", "")),
+            )
+            self.append_trade_log(
+                "buy_skip",
+                code=code,
+                name=prediction.get("name", ""),
+                side="buy",
+                quantity=0,
+                current_price=current_price,
+                score=prediction.get("score", ""),
+                reason="FinalEntryDecision block",
+                reason_code=prediction.get(
+                    "final_reason_code",
+                    prediction.get("reason_code", "MISSING_FINAL_ENTRY_DECISION"),
+                ),
+                message=prediction.get("final_reason", "missing FinalEntryDecision approval"),
+                market_regime=prediction.get("market_regime", ""),
+                market_gate_action=prediction.get("market_gate_action", ""),
+                market_gate_reason=prediction.get("market_gate_reason", ""),
+            )
             return
         entry_limit_price = self.parse_int(prediction.get("entry_limit_price", 0))
         stop_price = self.parse_int(prediction.get("stop_price", 0))
@@ -3769,8 +4881,6 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 )
                 return
 
-        send_order_price = 0 if order_gubun == "03" else entry_limit_price
-        result = self.send_order("buy", ORDER_SCREEN_NO, 1, code, order_quantity, send_order_price, order_gubun)
         if prediction.get("plan_source") == QUANT_PLAN_SOURCE or grade == QUANT_GRADE:
             reason_label = "퀀트조건식 눌림 매수"
         elif pullback_lump_sum and grade == "A":
@@ -3783,6 +4893,43 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             reason_label = "단테 B급 일괄 매수"
         else:
             reason_label = "단테 {}차 매수 (A급)".format(stage)
+        send_order_price = 0 if order_gubun == "03" else entry_limit_price
+        order_context = dict(prediction)
+        order_context["exit_escalation_active"] = bool(getattr(self, "exit_escalation_active", False))
+        order_request = OrderRequest(
+            rqname="buy",
+            screen_no=ORDER_SCREEN_NO,
+            order_type=1,
+            code=code,
+            quantity=order_quantity,
+            price=send_order_price,
+            order_gubun=order_gubun,
+            side="buy",
+            name=prediction.get("name", ""),
+            reason=reason_label,
+            current_price=current_price,
+            entry_price=entry_limit_price,
+            target_price=take_profit_price,
+            stop_price=stop_price,
+            plan_source=prediction.get("plan_source", ""),
+            context=order_context,
+        )
+        if hasattr(self, "submit_order_guarded"):
+            result = self.submit_order_guarded(order_request)
+            guard_decision = getattr(self, "last_order_guard_decision", None)
+        else:
+            logger.error("[OrderGuard 차단] submit_order_guarded 누락: buy %s", code)
+            result = -9904
+            guard_decision = GuardDecision(
+                False,
+                False,
+                False,
+                "missing_submit_order_guarded",
+                blocked_by="order_guard",
+                symbol=code,
+            )
+        is_guarded_non_live = bool(guard_decision is not None and not getattr(guard_decision, "live", False))
+        is_paper_order = bool(getattr(guard_decision, "paper", False))
         self.order_context[code] = {
             "side": "buy",
             "name": prediction.get("name", ""),
@@ -3799,6 +4946,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "model_action": prediction.get("model_action", ""),
             "model_target": prediction.get("model_target", ""),
             "model_threshold": prediction.get("model_threshold", ""),
+            "candidate_id": prediction.get("candidate_id", ""),
             "capture_price": prediction.get("capture_price", ""),
             "safe_target_price": prediction.get("safe_target_price", ""),
             "entry_limit_price": entry_limit_price,
@@ -3821,12 +4969,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "order_no": "",
         }
         self.append_trade_log(
-            "buy_order",
+            "would_order" if is_guarded_non_live else "buy_order",
             code=code,
             name=prediction.get("name", ""),
             side="buy",
             order_type="시장가" if order_gubun == "03" else "지정가",
-            order_result=result,
+            order_result="DRY_RUN" if is_guarded_non_live else result,
             quantity=order_quantity,
             order_price=send_order_price,
             current_price=current_price,
@@ -3838,6 +4986,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             model_action=prediction.get("model_action", ""),
             model_target=prediction.get("model_target", ""),
             model_threshold=prediction.get("model_threshold", ""),
+            candidate_id=prediction.get("candidate_id", ""),
             reason_code=prediction.get("reason_code", ""),
             reason=reason_label,
             plan_source=prediction.get("plan_source", ""),
@@ -3858,6 +5007,22 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             market_gate_action=prediction.get("market_gate_action", ""),
             market_gate_reason=prediction.get("market_gate_reason", ""),
         )
+        if is_guarded_non_live and result == 0:
+            if safe_pullback_entry and stage != 1:
+                self.clear_monitoring_stock(code, "paper 매수 체결" if is_paper_order else "dry-run 주문 기록")
+            if pullback_lump_sum and grade == "A":
+                self.dante_a_watchlist.pop(code, None)
+            logger.info(
+                "[%s 매수 기록] %s %s 수량 %s 기준가 %s stop %s target %s",
+                "paper" if is_paper_order else "dry-run",
+                code,
+                prediction.get("name", ""),
+                order_quantity,
+                entry_limit_price,
+                stop_price,
+                take_profit_price,
+            )
+            return
         if result == 0:
             self.order_prices[code] = entry_limit_price
             self.entry_times[code] = time.time()
@@ -3869,7 +5034,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.save_best()
             if prediction.get("reason_code") == entry_strategy.READY_REENTRY_PULLBACK:
                 self.dante_reentry_watchlist.pop(code, None)
-            if safe_pullback_entry:
+            if safe_pullback_entry and stage != 1:
                 self.clear_monitoring_stock(code, "매수 주문 접수")
             if pullback_lump_sum and grade == "A":
                 self.dante_a_watchlist.pop(code, None)
@@ -3885,6 +5050,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             position.pending_buy = True
             position.bought_today = True
             position.order_context = dict(self.order_context.get(code, {}))
+            if position.order_context.get("candidate_id"):
+                position.candidate_id = str(position.order_context.get("candidate_id") or "")
             if grade and not position.breakout_grade:
                 position.breakout_grade = grade
             if stage == 1:
@@ -3959,16 +5126,33 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             if cancel_requested_at > 0 and now - cancel_requested_at < 10.0:
                 continue
 
-            result = self.send_order(
-                "buy_cancel",
-                ORDER_SCREEN_NO,
-                3,
-                code,
-                0,
-                0,
-                "00",
-                order_no,
+            cancel_request = OrderRequest(
+                rqname="buy_cancel",
+                screen_no=ORDER_SCREEN_NO,
+                order_type=3,
+                code=code,
+                quantity=0,
+                price=0,
+                order_gubun="00",
+                order_no=order_no,
+                side="buy",
+                name=ctx.get("name", ""),
+                reason="buy_order_expired",
+                entry_price=int(ctx.get("entry_limit_price", 0) or 0),
+                target_price=int(ctx.get("take_profit_price", 0) or 0),
+                plan_source=ctx.get("plan_source", ""),
+                context=dict(
+                    ctx,
+                    cancel_policy_allowed=True,
+                    cancel_policy_reason="buy_order_expired",
+                    original_order_no=order_no,
+                ),
             )
+            if hasattr(self, "submit_order_guarded"):
+                result = self.submit_order_guarded(cancel_request)
+            else:
+                logger.error("[OrderGuard 차단] submit_order_guarded 누락: buy_cancel %s", code)
+                result = -9904
             ctx["cancel_requested_at"] = now
             logger.info(
                 "[매수 미체결 취소] %s order_no=%s elapsed=%.0fs expiry=%.0fs result=%s",
@@ -4050,6 +5234,63 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         screen_offset = len(self.realtime_registered_codes) // REALTIME_CODES_PER_SCREEN
         return str(int(REALTIME_SCREEN_NO) + screen_offset).zfill(4)
 
+    def check_paper_position_exit(self, code, current_price):
+        paper = getattr(self, "paper_portfolio", None)
+        if not TRADE_CONFIG.dry_run or paper is None:
+            return
+        code = self.normalize_code(code)
+        position = paper.positions.get(code)
+        if position is None or position.quantity <= 0 or current_price <= 0:
+            return
+        paper.update_highest(code, int(current_price))
+        reason = ""
+        if position.target_price > 0 and current_price >= position.target_price:
+            reason = "paper +2% 익절"
+        elif position.stop_price > 0 and current_price <= position.stop_price:
+            reason = "paper -1.5% 손절"
+        if not reason:
+            return
+        sell_quantity = position.quantity
+        request = OrderRequest(
+            rqname="paper_sell",
+            screen_no=ORDER_SCREEN_NO,
+            order_type=2,
+            code=code,
+            quantity=sell_quantity,
+            price=0,
+            order_gubun="03",
+            side="sell",
+            name=position.name,
+            reason=reason,
+            current_price=int(current_price),
+            entry_price=position.entry_price,
+            target_price=position.target_price,
+            stop_price=position.stop_price,
+            plan_source=position.plan_source,
+            context={
+                "exit_policy_allowed": True,
+                "exit_policy_reason": reason,
+                "exit_policy_source": "paper_portfolio_exit",
+            },
+        )
+        result = self.submit_order_guarded(request)
+        self.append_trade_log(
+            "would_order",
+            code=code,
+            name=position.name,
+            side="sell",
+            order_type="시장가",
+            order_result="DRY_RUN",
+            quantity=sell_quantity,
+            order_price=0,
+            current_price=current_price,
+            entry_price=position.entry_price,
+            target_price=position.target_price,
+            reason=reason,
+            profit_rate=position.profit_rate(int(current_price)),
+            message="paper portfolio virtual exit result={}".format(result),
+        )
+
     def score_exit_timing(self, code, current_price):
         """단테 R-multiple 하이브리드 청산 평가."""
         code = self.normalize_code(code)
@@ -4070,21 +5311,38 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 position = self.portfolio.get_or_create(code)
             position.entry_price = entry_price
 
-        if self.current_hhmmss() >= OPENING_FORCE_EXIT:
+        hhmmss = self.current_hhmmss()
+        if hhmmss >= CLOSING_AUCTION_START:
             return {
-                "action": "sell",
+                "action": exit_strategy.ACTION_FORCE_EXIT,
                 "qty_ratio": 1.0,
-                "reason": "장 마감 직전 강제 청산({})".format(OPENING_FORCE_EXIT),
+                "reason": "closing auction emergency exit",
+                "exit_type": exit_strategy.EXIT_TYPE_CLOSING_AUCTION_EMERGENCY_EXIT,
+                "exit_reason_code": exit_strategy.REASON_CLOSING_AUCTION_EMERGENCY_EXIT,
+                "stop_reason": exit_strategy.REASON_CLOSING_AUCTION_EMERGENCY_EXIT,
+                "exit_policy_source": "score_exit_timing",
+                "exit_decision_trace": {"matched_rule": exit_strategy.REASON_CLOSING_AUCTION_EMERGENCY_EXIT, "hhmmss": hhmmss},
+            }
+        if hhmmss >= OPENING_FORCE_EXIT:
+            return {
+                "action": exit_strategy.ACTION_FORCE_EXIT,
+                "qty_ratio": 1.0,
+                "reason": "force exit window ({})".format(OPENING_FORCE_EXIT),
+                "exit_type": exit_strategy.EXIT_TYPE_FORCE_EXIT,
+                "exit_reason_code": exit_strategy.REASON_FORCE_EXIT_AFTER_1505,
+                "stop_reason": exit_strategy.REASON_FORCE_EXIT_AFTER_1505,
+                "exit_policy_source": "score_exit_timing",
+                "exit_decision_trace": {"matched_rule": exit_strategy.REASON_FORCE_EXIT_AFTER_1505, "hhmmss": hhmmss},
             }
         if not entry_price or position is None:
-            return {"action": "hold", "qty_ratio": 0.0, "reason": "진입가/Position 정보 부족"}
+            return {"action": exit_strategy.ACTION_HOLD, "qty_ratio": 0.0, "reason": "진입가/Position 정보 부족"}
 
         order_context = getattr(position, "order_context", {}) or {}
         is_quant_position = (
             getattr(position, "breakout_grade", "") == QUANT_GRADE
             or order_context.get("plan_source") == QUANT_PLAN_SOURCE
         )
-        if is_quant_position:
+        if False and is_quant_position:
             quant_exit = self.quant_strategy.evaluate_exit(
                 entry_price=entry_price,
                 current_price=current_price,
@@ -4119,6 +5377,30 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
 
         ticks = self.realtime_ticks.get(code, [])
         chejan_strength = float(ticks[-1].get("chejan_strength", 0.0)) if ticks else 0.0
+        chejan_strength_history = [
+            float(tick.get("chejan_strength", 0.0) or 0.0)
+            for tick in ticks[-6:]
+            if isinstance(tick, dict)
+        ]
+        intraday_vwap = 0.0
+        if hasattr(self.minute_aggregator, "intraday_vwap"):
+            intraday_vwap = float(self.minute_aggregator.intraday_vwap(code) or 0.0)
+        position_context = getattr(position, "order_context", {}) or {}
+        if not isinstance(position_context, dict):
+            position_context = {}
+        if intraday_vwap > 0 and current_price < intraday_vwap:
+            position_context.setdefault("vwap_below_since", now_ts)
+        else:
+            position_context["vwap_below_since"] = 0.0
+        position.order_context = position_context
+        orderbook = self.orderbook_snapshots.get(code, {})
+        ask_volume = self.parse_int(orderbook.get("ask_volume", 0)) if isinstance(orderbook, dict) else 0
+        bid_volume = self.parse_int(orderbook.get("bid_volume", 0)) if isinstance(orderbook, dict) else 0
+        pressure_ratio = float(getattr(TRADE_CONFIG, "orderbook_sell_pressure_ratio", 2.0) or 2.0)
+        orderbook_sell_pressure = bool(bid_volume > 0 and ask_volume / bid_volume >= pressure_ratio)
+        signal_bar_low = self.parse_int(position_context.get("signal_bar_low", 0))
+        if signal_bar_low <= 0:
+            signal_bar_low = self.parse_int(position_context.get("prior_low", 0))
 
         ctx = exit_strategy.ExitContext(
             position=position,
@@ -4127,6 +5409,17 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             minute_bars=self.minute_aggregator.all_bars(code),
             five_min_ind=self.five_min_cache.get(code),
             now_ts=now_ts,
+            symbol=code,
+            position_id=str(getattr(position, "candidate_id", "") or ""),
+            intraday_vwap=intraday_vwap,
+            vwap_below_since=float(position_context.get("vwap_below_since", 0.0) or 0.0),
+            signal_bar_low=signal_bar_low,
+            chejan_strength_history=chejan_strength_history,
+            orderbook_sell_pressure=orderbook_sell_pressure,
+            force_exit=OPENING_FORCE_EXIT <= hhmmss < CLOSING_AUCTION_START,
+            force_exit_deadline=FORCE_EXIT_DEADLINE <= hhmmss < CLOSING_AUCTION_START,
+            closing_auction_emergency=hhmmss >= CLOSING_AUCTION_START,
+            config=TRADE_CONFIG,
         )
         decision = exit_strategy.evaluate_exit(ctx)
 
@@ -4146,6 +5439,23 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "qty_ratio": decision.qty_ratio,
             "reason": decision.reason,
             "mark_partial_taken": decision.mark_partial_taken,
+            "exit_type": decision.exit_type,
+            "exit_reason_code": decision.exit_reason_code,
+            "stop_reason": decision.as_log_fields().get("stop_reason", ""),
+            "exit_policy_source": decision.exit_policy_source,
+            "exit_decision_trace": decision.decision_trace,
+            "qty_to_sell": decision.qty_to_sell,
+            "entry_price": decision.entry_price,
+            "current_price": decision.current_price,
+            "stop_price": decision.stop_price,
+            "take_profit_price": decision.take_profit_price,
+            "trailing_stop_price": decision.trailing_stop_price,
+            "high_since_entry": decision.high_since_entry,
+            "low_since_entry": decision.low_since_entry,
+            "pnl_pct": decision.pnl_pct,
+            "mfe_pct": decision.mfe_pct,
+            "mae_pct": decision.mae_pct,
+            "holding_minutes": decision.holding_minutes,
         }
 
     def check_sell_signal(self, code, current_price):
@@ -4161,11 +5471,27 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         exit_decision = self.score_exit_timing(code, current_price)
         action = exit_decision.get("action", "hold")
 
-        if action == "sell":
-            self.place_sell_order(code, 0, "03", exit_decision.get("reason", "매도 신호"))
+        sell_all_actions = {
+            "sell",
+            exit_strategy.ACTION_SELL_ALL,
+            exit_strategy.ACTION_STOP_LOSS,
+            exit_strategy.ACTION_TRAILING_STOP,
+            exit_strategy.ACTION_TIME_STOP,
+            exit_strategy.ACTION_FORCE_EXIT,
+        }
+        partial_actions = {"partial_sell", exit_strategy.ACTION_SELL_PARTIAL}
+
+        if action in sell_all_actions:
+            self.place_sell_order(
+                code,
+                0,
+                "03",
+                exit_decision.get("reason", "매도 신호"),
+                exit_meta=exit_decision,
+            )
             return
 
-        if action == "partial_sell":
+        if action in partial_actions:
             qty_ratio = float(exit_decision.get("qty_ratio", 0.5))
             if position is None or position.quantity <= 0:
                 return
@@ -4179,6 +5505,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.place_sell_order(
                 code, 0, "03", exit_decision.get("reason", "부분 익절"),
                 desired_quantity=partial_quantity,
+                exit_meta=exit_decision,
             )
 
     def get_balance_current_price(self, code):
@@ -4303,9 +5630,28 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                            code, position.quantity, position.entry_price,
                            position.pending_buy, position.pending_sell)
 
+    def check_sell_unfilled_timeouts(self):
+        timeout = float(getattr(TRADE_CONFIG, "sell_unfilled_timeout_sec", 10) or 10)
+        if timeout <= 0:
+            return
+        now = time.time()
+        for code in list(self.pending_sell_order_codes):
+            ctx = self.order_context.get(code, {})
+            if not isinstance(ctx, dict):
+                continue
+            submitted_at = float(ctx.get("submitted_at", 0) or 0)
+            if submitted_at <= 0 or now - submitted_at < timeout:
+                continue
+            retry_count = int(ctx.get("sell_retry_count", 0) or 0) + 1
+            ctx["sell_retry_count"] = retry_count
+            ctx["sell_order_result"] = "sell_order_unfilled_timeout"
+            ctx["unfilled_exit_qty"] = ctx.get("quantity", "")
+            self._mark_exit_escalation(code, "sell_order_unfilled_timeout", ctx)
+
     def check_pending_sells(self):
         # 실시간 슬롯에서 매 틱마다 동기 HTTP를 부르지 않도록, 일정 주기로 모아서 매도 판단을 수행한다.
         # 매도 의도 큐도 함께 재시도해 매매가능수량이 늦게 갱신되는 케이스를 빠르게 회수한다.
+        self.check_sell_unfilled_timeouts()
         try:
             self.process_pending_sell_intents()
         except Exception as e:
@@ -4345,7 +5691,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.save_best()
         logger.info("[best 정리] 보유/미체결 없음 종목 제거: {}".format(stale))
 
-    def place_sell_order(self, code, order_price, order_gubun, reason, *, desired_quantity=None):
+    def place_sell_order(self, code, order_price, order_gubun, reason, *, desired_quantity=None, exit_meta=None, sell_retry_count=None):
         """매도 주문 발주.
 
         desired_quantity:
@@ -4361,11 +5707,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return
         self._selling_codes.add(code)
         try:
-            self._do_place_sell_order(code, order_price, order_gubun, reason, desired_quantity=desired_quantity)
+            self._do_place_sell_order(
+                code,
+                order_price,
+                order_gubun,
+                reason,
+                desired_quantity=desired_quantity,
+                exit_meta=exit_meta,
+                sell_retry_count=sell_retry_count,
+            )
         finally:
             self._selling_codes.discard(code)
 
-    def _do_place_sell_order(self, code, order_price, order_gubun, reason, *, desired_quantity=None):
+    def _do_place_sell_order(self, code, order_price, order_gubun, reason, *, desired_quantity=None, exit_meta=None, sell_retry_count=None):
         chejan_quantity = self.parse_int(self.position_quantities.get(code, 0))
         balance_quantity, available_quantity = self._lookup_balance_quantity(code)
         balance_quantity = self.parse_int(balance_quantity)
@@ -4381,6 +5735,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         sell_quantity = available_quantity
         if desired_quantity is not None and desired_quantity > 0:
             sell_quantity = min(int(desired_quantity), available_quantity)
+        exit_fields = self._exit_log_fields(
+            exit_meta,
+            sell_retry_count=sell_retry_count if sell_retry_count is not None else (
+                exit_meta.get("sell_retry_count", "") if isinstance(exit_meta, dict) else ""
+            ),
+            unfilled_exit_qty=available_quantity,
+        )
 
         # 매매가능수량이 아직 갱신되지 않은 경우, 메인 스레드를 블로킹하지 않도록 sleep 없이
         # 매도 의도만 큐에 등록하고 sell_check_timer / process_pending_sell_intents가 재시도하게 둔다.
@@ -4407,11 +5768,21 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     reason=reason,
                     message="매매가능수량 없음 chejan={} 잔고={} 가능={}".format(
                         chejan_quantity, balance_quantity, available_quantity),
+                    **exit_fields,
                 )
             if stale:
                 self._discard_position(code)
             elif held_quantity > 0:
-                self.queue_sell_intent(code, reason, order_price, order_gubun)
+                self.queue_sell_intent(
+                    code,
+                    reason,
+                    order_price,
+                    order_gubun,
+                    exit_meta=exit_fields,
+                    retry_count=self.parse_int(exit_fields.get("sell_retry_count", 0)),
+                    unfilled_exit_qty=held_quantity,
+                    sell_order_result="no_available_quantity",
+                )
             return
 
         entry_price = self.order_prices.get(code)
@@ -4424,31 +5795,85 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             if last_price:
                 gross_profit_rate = last_price / entry_price - 1
                 profit_rate = self.gross_to_net_return(gross_profit_rate)
-        result = self.send_order("sell", ORDER_SCREEN_NO, 2, code, sell_quantity, order_price, order_gubun)
+        position = self.portfolio.get(code)
+        position_context = getattr(position, "order_context", {}) if position is not None else {}
+        if not isinstance(position_context, dict):
+            position_context = {}
+        candidate_id = str(
+            getattr(position, "candidate_id", "")
+            or position_context.get("candidate_id", "")
+            or ""
+        )
+        exit_fields = self._exit_log_fields(
+            exit_meta,
+            sell_retry_count=sell_retry_count if sell_retry_count is not None else (
+                exit_meta.get("sell_retry_count", "") if isinstance(exit_meta, dict) else ""
+            ),
+            unfilled_exit_qty=available_quantity,
+        )
+        sell_request = OrderRequest(
+            rqname="sell",
+            screen_no=ORDER_SCREEN_NO,
+            order_type=2,
+            code=code,
+            quantity=sell_quantity,
+            price=order_price,
+            order_gubun=order_gubun,
+            side="sell",
+            name=self.get_code_name(code),
+            reason=reason,
+            current_price=self.realtime_ticks.get(code, [{}])[-1].get("close", order_price),
+            entry_price=self.parse_int(entry_price or 0),
+            target_price=self.parse_int(self.best.get(code, 0)),
+            context={
+                "exit_policy_allowed": True,
+                "exit_policy_reason": reason,
+                "exit_policy_source": exit_fields.get("exit_policy_source", "score_exit_timing"),
+                "candidate_id": candidate_id,
+                "profit_rate": profit_rate,
+                "hold_seconds": hold_seconds,
+                **exit_fields,
+            },
+        )
+        result = self.submit_order_guarded(sell_request)
+        guard_decision = getattr(self, "last_order_guard_decision", None)
+        is_guarded_non_live = bool(guard_decision is not None and not getattr(guard_decision, "live", False))
         self.order_context[code] = {
             "side": "sell",
             "name": self.get_code_name(code),
+            "candidate_id": candidate_id,
             "reason": reason,
             "entry_price": entry_price or "",
             "target_price": self.best.get(code, ""),
             "hold_seconds": hold_seconds,
             "profit_rate": profit_rate,
+            "quantity": sell_quantity,
+            "submitted_at": time.time(),
+            **exit_fields,
         }
+        logged_exit_fields = dict(exit_fields)
+        logged_exit_fields["sell_order_result"] = "DRY_RUN" if is_guarded_non_live else result
+        self.order_context[code]["sell_order_result"] = logged_exit_fields["sell_order_result"]
         self.append_trade_log(
-            "sell_order",
+            "would_order" if is_guarded_non_live else "sell_order",
             code=code,
             name=self.get_code_name(code),
             side="sell",
             order_type="시장가" if order_gubun == "03" else "지정가",
-            order_result=result,
+            order_result="DRY_RUN" if is_guarded_non_live else result,
             quantity=sell_quantity,
             order_price=order_price,
             entry_price=entry_price or "",
             target_price=self.best.get(code, ""),
+            candidate_id=candidate_id,
             reason=reason,
             hold_seconds=hold_seconds,
             profit_rate=profit_rate,
+            **logged_exit_fields,
         )
+        if is_guarded_non_live and result == 0:
+            logger.info("[dry-run 매도 기록] {} {} 수량 {} 가격 {} 구분 {}".format(code, reason, sell_quantity, order_price, order_gubun))
+            return
         if result == 0:
             self.pending_order_codes.add(code)
             self.pending_sell_order_codes.add(code)
@@ -4456,7 +5881,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             logger.info("[매도 주문] {} {} 수량 {} 가격 {} 구분 {}".format(code, reason, sell_quantity, order_price, order_gubun))
         else:
             logger.error("[매도 실패] {} SendOrder 결과 {}".format(code, result))
-            self.queue_sell_intent(code, reason, order_price, order_gubun)
+            next_retry_count = self.parse_int(exit_fields.get("sell_retry_count", 0)) + 1
+            if next_retry_count >= int(getattr(TRADE_CONFIG, "escalate_after_retry_count", 2) or 2):
+                self._mark_exit_escalation(code, "stop_order_escalation", exit_fields)
+            self.queue_sell_intent(
+                code,
+                reason,
+                order_price,
+                order_gubun,
+                exit_meta=exit_fields,
+                retry_count=next_retry_count,
+                unfilled_exit_qty=sell_quantity,
+                sell_order_result="sell_order_failed",
+            )
 
     def predict_stock(self, code):
         code = self.normalize_code(code)
@@ -4474,36 +5911,106 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
 
 def _log_quant_condition_startup_banner():
     """퀀트조건식 운용 파라미터를 시작 시 로그에 한 번 출력한다."""
+    legacy_condition_text = (
+        " | legacy='{}'".format(LEGACY_CONDITION_NAME)
+        if LEGACY_CONDITION_NAME and LEGACY_CONDITION_NAME != CONDITION_NAME
+        else ""
+    )
     logger.info("=" * 78)
     logger.info(
-        "[%s] rule=%s | 조건식='%s' | 수식=%s",
+        "[전략] strategy=%s | rule=%s | entry_strategy=%s | signal_source=%s",
         TRADE_LOG_STRATEGY_NAME,
         TRADE_LOG_RULE_VERSION,
+        TRADE_CONFIG.entry_strategy_version,
+        TRADE_LOG_SIGNAL_SOURCE,
+    )
+    logger.info(
+        "[조건식] HTS='%s'%s | formula_version=%s | formula=%s",
         CONDITION_NAME,
+        legacy_condition_text,
+        TRADE_LOG_CONDITION_FORMULA_VERSION,
         TRADE_LOG_CONDITION_FORMULA,
     )
     logger.info("[조건식 상세] %s", TRADE_LOG_CONDITION_RULES)
     logger.info(
-        "[매수룰] 조건편입 즉시 SetRealReg -> 첫 실시간 체결가를 포착가로 저장 -> 현재가가 포착가 대비 -%.2f%% 이상 눌리고 체결강도 %.0f 이상이면 지정가 매수",
-        QUANT_ENTRY_PULLBACK_PCT * 100,
-        QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+        "[후보 수신] OnReceiveTrCondition/OnReceiveRealCondition -> TimePolicy(%s %s~%s) -> CandidateRegistry(TTL=%ds, candidate_id) -> condition_detected CSV -> SetRealReg(screen=%s, %d종목/스크린)",
+        TRADE_CONFIG.time_policy_config_version,
+        TRADE_CONFIG.candidate_capture_start,
+        TRADE_CONFIG.candidate_capture_end,
+        TRADE_CONFIG.candidate_expiry_seconds,
+        REALTIME_SCREEN_NO,
+        REALTIME_CODES_PER_SCREEN,
     )
     logger.info(
-        "[매도룰] 매수가 대비 +%.2f%% 전량 익절 / -%.2f%% 전량 손절",
+        "[포착가] 첫 실시간 체결가를 capture_price로 저장하고 trigger=capture*(1-%.2f%%), capture_price CSV에 candidate_id/strategy_name 함께 기록",
+        QUANT_ENTRY_PULLBACK_PCT * 100,
+    )
+    logger.info(
+        "[매수 판단] MomentumBreakoutStrategy BUY + 퀀트 필터 READY + FinalEntryDecision 통과 후 OrderGuard가 허용하면 지정가 매수",
+    )
+    logger.info(
+        "[퀀트 필터] pullback %.2f%%~%.2f%%, rebound>=%.2f%%, strength>=%.0f%%(weak>=%.0f%%), max_positions=%d",
+        QUANT_ENTRY_PULLBACK_PCT * 100,
+        SAFE_PULLBACK_MAX_DROP_PCT * 100,
+        SAFE_PULLBACK_REBOUND_CONFIRM_PCT * 100,
+        QUANT_ENTRY_CHEJAN_STRENGTH_MIN,
+        TRADE_CONFIG.weak_market_min_trade_strength,
+        MAX_CONCURRENT_POSITIONS,
+    )
+    logger.info(
+        "[매도룰] QUANT 포지션은 매수가 대비 +%.2f%% 전량 익절 / -%.2f%% 전량 손절, 장마감 강제청산 %s~%s",
         QUANT_TAKE_PROFIT_PCT * 100,
         QUANT_STOP_LOSS_PCT * 100,
+        TRADE_CONFIG.force_exit_start,
+        TRADE_CONFIG.force_exit_deadline,
     )
-    logger.info("[안전장치] 동시보유 %d, 일일매수상한 %d, 강제청산 %d, 주문간격 %.2fs(초당 5회 이하), AI서버=%s, 구학습=%s, 조건식학습=%s(%s), shadow=%s(%s)",
-                MAX_CONCURRENT_POSITIONS,
-                MAX_DAILY_BUY_COUNT,
-                OPENING_FORCE_EXIT,
-                ORDER_REQUEST_INTERVAL_SECONDS,
-                "ON" if AI_SERVER_ENABLED else "OFF",
-                "ON" if TRAINING_DATA_ENABLED else "OFF",
-                "ON" if DANTE_TRAINING_DATA_ENABLED else "OFF",
-                DANTE_TRAINING_CSV,
-                "ON" if DANTE_SHADOW_TRAINING_DATA_ENABLED else "OFF",
-                DANTE_SHADOW_TRAINING_CSV)
+    logger.info(
+        "[시간정책] timezone=%s regular=%s~%s entry_windows=%s no_new_entry_after=%s closing_auction=%s~%s",
+        TRADE_CONFIG.trading_timezone,
+        TRADE_CONFIG.krx_regular_open,
+        TRADE_CONFIG.krx_regular_close,
+        TRADE_CONFIG.entry_windows,
+        TRADE_CONFIG.no_new_entry_after,
+        TRADE_CONFIG.closing_auction_start,
+        TRADE_CONFIG.closing_auction_end,
+    )
+    logger.info(
+        "[리스크] profile=%s cash_usage=%.2f%% position_cash=%.2f%% min_order=%d max_position=%d daily_buy=%d daily_loss=%d daily_exposure=%d reentry_cooldown=%ds",
+        TRADE_CONFIG.risk_reward_profile_name,
+        TRADE_CONFIG.cash_usage_ratio * 100,
+        TRADE_CONFIG.max_position_cash_ratio * 100,
+        MIN_ORDER_CASH,
+        TRADE_CONFIG.max_position_size,
+        MAX_DAILY_BUY_COUNT,
+        TRADE_CONFIG.max_daily_loss,
+        TRADE_CONFIG.max_daily_exposure,
+        TRADE_CONFIG.reentry_cooldown_seconds,
+    )
+    logger.info(
+        "[OrderGuard] dry_run=%s live_enabled=%s paper=%s trading=%s max_orders=%d/s interval=%.2fs token_ttl=%.1fs final_entry_required=%s exit_policy_required=%s",
+        TRADE_CONFIG.dry_run,
+        TRADE_CONFIG.live_trading_enabled,
+        TRADE_CONFIG.paper_portfolio_enabled,
+        TRADE_CONFIG.trading_enabled,
+        TRADE_CONFIG.max_orders_per_second,
+        ORDER_REQUEST_INTERVAL_SECONDS,
+        TRADE_CONFIG.live_order_token_ttl_seconds,
+        True,
+        TRADE_CONFIG.require_exit_policy_for_sell,
+    )
+    logger.info(
+        "[보조/학습] AI서버=%s assist_only=%s promotion=%s watch=%s | condition_capture=%s | trade_log=%s | training=%s(%s) | shadow=%s(%s)",
+        "ON" if AI_SERVER_ENABLED else "OFF",
+        MODEL_ASSIST_ONLY,
+        AI_CANDIDATE_PROMOTION_ENABLED,
+        AI_CANDIDATE_WATCH_ENABLED,
+        CONDITION_CAPTURE_CSV,
+        TRADE_LOG_CSV,
+        "ON" if DANTE_TRAINING_DATA_ENABLED else "OFF",
+        DANTE_TRAINING_CSV,
+        "ON" if DANTE_SHADOW_TRAINING_DATA_ENABLED else "OFF",
+        DANTE_SHADOW_TRAINING_CSV,
+    )
     logger.info("=" * 78)
 
 
@@ -4513,35 +6020,13 @@ def main():
 
     _log_quant_condition_startup_banner()
 
-    my_deposit = kiwoom.get_deposit()
-    logger.info("남은 예수금 : %s", my_deposit)
-
     kiwoom.load_best()
     # portfolio_state 는 잔고 TR 호출 전에 미리 로드. 같은 거래일 내 재시작이면
     # entry_stage / planned_quantity / stop_price 등 전략 필드를 보존하고, 잔고 TR 응답이
     # quantity / entry_price 등 휘발성 필드만 덮어쓰게 한다.
     kiwoom.load_portfolio_state()
     kiwoom.reset_daily_state()
-    kiwoom.update_account_status()
-    logger.info("현재가지고 있는 종목: {}".format(kiwoom.get_balance()))
-    logger.info("미체결 종목: {}".format(kiwoom.pending_order_codes))
-
-    kiwoom._cleanup_stale_best()
-    startup_codes = set(kiwoom.best.keys()) | set(kiwoom.holding_codes)
-    for code in startup_codes:
-        if code:
-            kiwoom.register_realtime_stock(code)
-
-    kiwoom.check_open_positions()
-    kiwoom.position_check_timer.start(POSITION_CHECK_INTERVAL_MS)
-    kiwoom.sell_check_timer.start(SELL_CHECK_INTERVAL_MS)
-    kiwoom.buy_expiry_timer.start(BUY_ORDER_EXPIRY_CHECK_INTERVAL_MS)
-
-    # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 — 조건검색 시작 전에 1회 등록.
-    kiwoom.register_realtime_indices()
-
-    if not kiwoom.start_realtime_condition(CONDITION_NAME):
-        logger.error("실시간 조건검색을 시작하지 못했습니다. 조건식 설정을 확인해주세요.")
+    kiwoom.start_market_services_if_allowed()
 
     app.exec_()
 

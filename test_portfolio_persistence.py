@@ -34,7 +34,8 @@ def _make_full_position() -> Position:
         pending_buy=False,
         pending_sell=False,
         pending_sell_intent={"reason": "+1R 시간손절", "order_price": 0, "order_gubun": "03"},
-        order_context={"side": "buy", "name": "삼성전자"},
+        candidate_id="candidate-005930",
+        order_context={"side": "buy", "name": "삼성전자", "candidate_id": "candidate-005930"},
         entry_stage=2,
         planned_quantity=10,
         entry1_time=1_700_000_000.0,
@@ -60,7 +61,7 @@ class PositionSerializationTests(unittest.TestCase):
             "entry1_time", "entry2_time", "r_unit_pct",
             "pullback_window_deadline",
             "target_price", "target_return", "highest_price",
-            "entry_time", "bought_today",
+            "entry_time", "bought_today", "candidate_id",
         ):
             self.assertEqual(
                 getattr(restored, field), getattr(original, field),
@@ -92,6 +93,11 @@ class PositionSerializationTests(unittest.TestCase):
         original = _make_full_position()
         restored = Position.from_persisted_dict(original.to_persisted_dict())
         self.assertEqual(restored.pending_sell_intent, original.pending_sell_intent)
+
+    def test_order_context_round_trip(self):
+        original = _make_full_position()
+        restored = Position.from_persisted_dict(original.to_persisted_dict())
+        self.assertEqual(restored.order_context, original.order_context)
 
     def test_missing_code_raises(self):
         with self.assertRaises(ValueError):

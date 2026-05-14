@@ -1,0 +1,21 @@
+name: Safety Regression
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  safety-regression:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run guarded order regression tests
+        shell: pwsh
+        run: python -m unittest test_final_entry_decision test_order_guard test_order_safety test_risk_too_wide_watch
