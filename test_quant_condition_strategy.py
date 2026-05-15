@@ -211,6 +211,55 @@ class QuantConditionStrategyTests(unittest.TestCase):
         )
         self.assertEqual(weak.reason_code, "SAFE_CHEJAN_WAIT")
 
+    def test_high_since_capture_leader_score_gate(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            high_since_capture=10_800,
+            low_after_high=10_450,
+            current_price=10_500,
+            chejan_strength=125,
+            recent_low_price=10_450,
+            intraday_vwap=10_420,
+            one_min_reversal=True,
+            leader_score=40.0,
+        )
+
+        self.assertEqual(decision.status, "wait")
+        self.assertEqual(decision.reason_code, "WAIT_LEADER_SCORE")
+        self.assertEqual(decision.leader_score, 40.0)
+        self.assertEqual(
+            decision.min_leader_score,
+            self.strategy.config.min_leader_score
+            - self.strategy.config.first_pullback_leader_score_relief,
+        )
+
+    def test_observed_pullback_from_high_is_logged_even_when_too_deep(self):
+        decision = self.strategy.evaluate_entry(
+            capture_price=34_000,
+            high_since_capture=38_650,
+            low_after_high=34_500,
+            current_price=34_750,
+            chejan_strength=125,
+            recent_low_price=34_500,
+            intraday_vwap=34_600,
+            one_min_reversal=True,
+            leader_score=90.0,
+        )
+
+        self.assertEqual(decision.reason_code, "SAFE_PULLBACK_FROM_HIGH_TOO_DEEP")
+        self.assertAlmostEqual(
+            decision.observed_pullback_from_high_pct,
+            (38_650 - 34_750) / 38_650,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            decision.pullback_from_high_pct,
+            (38_650 - 34_750) / 38_650,
+            places=4,
+        )
+        self.assertEqual(decision.strategy_pullback_basis, 38_650)
+        self.assertFalse(decision.entry_pullback_eligible)
+
     def test_one_minute_reversal_can_confirm_with_positive_bar_or_prev_high_reclaim(self):
         positive_bar = [
             MinuteBar(0, 10_470, 10_520, 10_430, 10_500, 100, 0),

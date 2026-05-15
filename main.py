@@ -246,6 +246,10 @@ MAX_CONCURRENT_POSITIONS = SAFE_PULLBACK_MAX_POSITIONS
 MAX_DAILY_BUY_COUNT = TRADE_CONFIG.max_daily_buy_count
 CONDITION_PROCESS_INTERVAL_MS = 1000
 CONDITION_COOLDOWN_SECONDS = 60
+CONDITION_WAIT_LEADER_RECHECK_SECONDS = 15
+CONDITION_BLOCK_WEAK_LEADER_RECHECK_SECONDS = 60
+CONDITION_MIN_AGE_RECHECK_FLOOR_SECONDS = 1
+CONDITION_DEFAULT_WAIT_RECHECK_SECONDS = 3
 WAIT_LOG_COOLDOWN_SECONDS = 30
 REALTIME_TICK_WAIT_TIMEOUT_SECONDS = 60
 MAX_DAILY_CANDLE_COUNT = 120
@@ -273,6 +277,9 @@ def _first_pullback_log_fields(prediction):
         "high_since_capture": prediction.get("high_since_capture", ""),
         "low_after_high": prediction.get("low_after_high", ""),
         "pullback_from_high_pct": prediction.get("pullback_from_high_pct", ""),
+        "observed_pullback_from_high_pct": prediction.get("observed_pullback_from_high_pct", ""),
+        "strategy_pullback_basis": prediction.get("strategy_pullback_basis", ""),
+        "entry_pullback_eligible": prediction.get("entry_pullback_eligible", ""),
         "rebound_from_low_pct": prediction.get("rebound_from_low_pct", ""),
         "intraday_vwap": prediction.get("intraday_vwap", ""),
         "vwap_support_ok": prediction.get("vwap_support_ok", ""),
@@ -301,6 +308,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.conditions = {}
         self.selected_condition = None
         self.pending_condition_codes = []
+        self.condition_eval_state = {}
         self.processing_condition = False
         self.last_signal_at = {}
         self.last_wait_log_at = {}
@@ -1367,6 +1375,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return
 
         self.last_signal_at[code] = now
+        state = self._condition_eval_state(code)
+        state.setdefault("first_enqueued_at", now)
+        state["next_eval_at"] = min(float(state.get("next_eval_at", 0.0) or 0.0), now)
         self.pending_condition_codes.append(code)
         logger.info("[조건검색 대기열] {} {} {} 대기 {}건".format(code, condition_name, event_type, len(self.pending_condition_codes)))
     
@@ -2021,21 +2032,89 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
     def set_real_reg(self, str_screen_no, str_code_list, str_fid_list, str_opt_type):
         self.dynamicCall("SetRealReg(QString, QString, QString, QString)", str_screen_no, str_code_list, str_fid_list, str_opt_type)
 
+    def _condition_eval_state(self, code):
+        code = self.normalize_code(code)
+        if not hasattr(self, "condition_eval_state"):
+            self.condition_eval_state = {}
+        state = self.condition_eval_state.setdefault(
+            code,
+            {
+                "first_enqueued_at": time.time(),
+                "last_eval_at": 0.0,
+                "next_eval_at": 0.0,
+                "eval_count": 0,
+                "last_reason_code": "",
+                "first_pullback_ready": False,
+                "leader_score": 0.0,
+                "turnover_speed_per_min": 0.0,
+            },
+        )
+        return state
+
+    def condition_eval_priority(self, code, *, now_ts=None):
+        code = self.normalize_code(code)
+        now_ts = time.time() if now_ts is None else float(now_ts)
+        state = self._condition_eval_state(code)
+        watch = self.monitoring_dict.get(code, {}) if hasattr(self, "monitoring_dict") else {}
+        candidate = (
+            self.candidate_registry.get(code)
+            if hasattr(self, "candidate_registry") and self.candidate_registry is not None
+            else None
+        )
+        meta = dict(getattr(candidate, "meta", {}) or {})
+        combo = str(watch.get("condition_combo", meta.get("condition_combo", "")) or "")
+        combo_rank = 0 if combo == CONDITION_COMBO_QUANT_AND_DANTE else 1 if combo == CONDITION_COMBO_QUANT_ONLY else 2
+        first_pullback_ready = bool(
+            watch.get("first_pullback_ready", state.get("first_pullback_ready", False))
+        )
+        leader_score = self.parse_float(
+            watch.get("leader_score", state.get("leader_score", getattr(candidate, "leader_score", 0.0))),
+            0.0,
+        )
+        turnover_speed = self.parse_float(
+            watch.get(
+                "turnover_speed_per_min",
+                state.get("turnover_speed_per_min", getattr(candidate, "turnover_speed_per_min", 0.0)),
+            ),
+            0.0,
+        )
+        last_eval_at = float(state.get("last_eval_at", 0.0) or 0.0)
+        age_since_eval = now_ts - last_eval_at if last_eval_at > 0 else 999_999.0
+        return (
+            0 if first_pullback_ready else 1,
+            combo_rank,
+            -leader_score,
+            -turnover_speed,
+            -age_since_eval,
+            float(state.get("first_enqueued_at", now_ts) or now_ts),
+        )
+
     def process_next_condition_stock(self):
         self.reset_daily_state()
         self.expire_candidate_registry()
         if self.processing_condition or not self.pending_condition_codes:
             return
 
-        if hasattr(self, "candidate_registry"):
-            self.pending_condition_codes.sort(
-                key=lambda item: candidate_leader_priority(
-                    self.candidate_registry.get(self.normalize_code(item))
-                )
-                if self.candidate_registry.get(self.normalize_code(item)) is not None
-                else (3, 0.0, 999_999, 0.0)
-            )
-        code = self.pending_condition_codes.pop(0)
+        now_ts = time.time()
+        if not hasattr(self, "condition_eval_state"):
+            self.condition_eval_state = {}
+        due_codes = [
+            item
+            for item in self.pending_condition_codes
+            if self._condition_eval_state(self.normalize_code(item)).get("next_eval_at", 0.0)
+            <= now_ts
+        ]
+        if not due_codes:
+            return
+        due_codes.sort(key=lambda item: self.condition_eval_priority(item, now_ts=now_ts))
+        code = due_codes[0]
+        try:
+            self.pending_condition_codes.remove(code)
+        except ValueError:
+            return
+        state = self._condition_eval_state(code)
+        state["last_eval_at"] = now_ts
+        state["eval_count"] = int(state.get("eval_count", 0) or 0) + 1
         self.processing_condition = True
         try:
             self.handle_condition_stock(code)
@@ -2059,6 +2138,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     self.pending_condition_codes.remove(code)
                 except ValueError:
                     pass
+            if hasattr(self, "condition_eval_state"):
+                self.condition_eval_state.pop(code, None)
             logger.info(
                 "[후보 만료] %s age=%.0fs condition=%s",
                 code,
@@ -2075,6 +2156,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.last_signal_at.clear()
         self.no_tick_codes.clear()
         self.last_wait_log_at.clear()
+        if hasattr(self, "condition_eval_state"):
+            self.condition_eval_state.clear()
         self.volume_speed_wait_counts.clear()
         self.volume_speed_cooldown_until.clear()
         self.last_sell_skip_log_at.clear()
@@ -2729,12 +2812,71 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 sell_retry_count=retry_count,
             )
 
-    def requeue_condition_stock(self, code):
+    def requeue_condition_stock(self, code, *, delay_seconds=None, reason_code=""):
         code = self.normalize_code(code)
         if code in self.no_tick_codes:
             return
+        state = self._condition_eval_state(code)
+        now = time.time()
+        if delay_seconds is not None:
+            state["next_eval_at"] = max(now + max(float(delay_seconds or 0.0), 0.0), now)
+        else:
+            state.setdefault("next_eval_at", now)
+        if reason_code:
+            state["last_reason_code"] = str(reason_code or "")
         if code not in self.pending_condition_codes:
             self.pending_condition_codes.append(code)
+
+    def condition_recheck_delay_seconds(self, code, prediction):
+        prediction = prediction or {}
+        reason_code = str(
+            prediction.get("final_reason_code", prediction.get("reason_code", "")) or ""
+        ).upper()
+        if "WAIT_MIN_AGE" in reason_code:
+            candidate = (
+                self.candidate_registry.get(self.normalize_code(code))
+                if hasattr(self, "candidate_registry") and self.candidate_registry is not None
+                else None
+            )
+            age = candidate.age_seconds() if candidate is not None else 0.0
+            remaining = max(
+                float(getattr(TRADE_CONFIG, "min_candidate_age_seconds", 0.0) or 0.0)
+                - float(age or 0.0),
+                0.0,
+            )
+            return max(remaining, CONDITION_MIN_AGE_RECHECK_FLOOR_SECONDS)
+        if "WAIT_LEADER_SCORE" in reason_code:
+            return CONDITION_WAIT_LEADER_RECHECK_SECONDS
+        if "BLOCK_WEAK_LEADER" in reason_code:
+            return CONDITION_BLOCK_WEAK_LEADER_RECHECK_SECONDS
+        if "WAIT_DATA" in reason_code or "SAFE_WAIT_TICK" in reason_code or "WAIT_MIN_TICKS" in reason_code:
+            return CONDITION_DEFAULT_WAIT_RECHECK_SECONDS
+        return CONDITION_DEFAULT_WAIT_RECHECK_SECONDS
+
+    def mark_condition_eval_result(self, code, prediction):
+        code = self.normalize_code(code)
+        state = self._condition_eval_state(code)
+        prediction = prediction or {}
+        reason_code = str(
+            prediction.get("final_reason_code", prediction.get("reason_code", "")) or ""
+        )
+        state["last_reason_code"] = reason_code
+        state["first_pullback_ready"] = bool(prediction.get("first_pullback_ready", False))
+        state["leader_score"] = self.parse_float(prediction.get("leader_score", 0.0), 0.0)
+        state["turnover_speed_per_min"] = self.parse_float(
+            prediction.get("turnover_speed_per_min", prediction.get("volume_speed", 0.0)),
+            0.0,
+        )
+        watch = self.monitoring_dict.get(code) if hasattr(self, "monitoring_dict") else None
+        if isinstance(watch, dict):
+            watch["last_eval_at"] = state.get("last_eval_at", time.time())
+            watch["last_eval_reason_code"] = reason_code
+            watch["first_pullback_ready"] = bool(prediction.get("first_pullback_ready", False))
+            if "leader_score" in prediction:
+                watch["leader_score"] = prediction.get("leader_score", 0.0)
+            if "turnover_speed_per_min" in prediction:
+                watch["turnover_speed_per_min"] = prediction.get("turnover_speed_per_min", 0.0)
+        return state
 
     def ensure_monitoring_stock(self, code, *, capture_price=0):
         code = self.normalize_code(code)
@@ -3621,6 +3763,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             minute_bars=getattr(momentum_ctx, "minute_bars", ()),
             one_min_reversal=getattr(momentum_ctx, "one_min_reversal", None),
             leader_score=getattr(momentum_ctx, "leader_score", 0.0),
+            condition_combo=str(
+                (getattr(momentum_ctx.candidate, "meta", {}) or {}).get(
+                    "condition_combo",
+                    watch.get("condition_combo", ""),
+                )
+            ),
+            now_ts=getattr(momentum_ctx, "now_ts", None),
         )
         final_decision = self.build_final_entry_decision(momentum_decision, entry_decision)
         if hasattr(self, "log_final_entry_decision"):
@@ -3640,6 +3789,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     "high_since_capture": entry_decision.high_since_capture,
                     "low_after_high": entry_decision.low_after_high,
                     "pullback_from_high_pct": entry_decision.pullback_from_high_pct,
+                    "observed_pullback_from_high_pct": entry_decision.observed_pullback_from_high_pct,
+                    "strategy_pullback_basis": entry_decision.strategy_pullback_basis,
+                    "entry_pullback_eligible": entry_decision.entry_pullback_eligible,
                     "rebound_from_low_pct": entry_decision.rebound_from_low_pct,
                     "intraday_vwap": entry_decision.intraday_vwap,
                     "vwap_support_ok": entry_decision.vwap_support_ok,
@@ -3663,7 +3815,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     would_buy_under_relaxed_rules=relaxed_pullback
                     or getattr(momentum_decision, "action", None) == MomentumEntryDecision.BUY,
                 )
-            return self.final_entry_block_prediction(
+            blocked_prediction = self.final_entry_block_prediction(
                 code,
                 name,
                 current_price,
@@ -3672,6 +3824,66 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 legacy_decision=entry_decision,
                 stage=2,
             )
+            blocked_prediction.update(
+                {
+                    "safe_target_price": target_price,
+                    "candidate_id": watch.get(
+                        "candidate_id",
+                        getattr(momentum_ctx.candidate, "candidate_id", ""),
+                    ),
+                    "strategy_name": watch.get(
+                        "strategy_name",
+                        TRADE_CONFIG.strategy_name,
+                    ),
+                    "condition_name": watch.get("condition_name", CONDITION_NAME),
+                    "detected_at": watch.get("detected_at", ""),
+                    "chase_risk_score": momentum_decision.chase_risk_score,
+                    "momentum_metrics": momentum_decision.metrics,
+                    "daily_turnover": time_filter.get("daily_turnover", 0),
+                    "turnover_rank": time_filter.get("turnover_rank", 0),
+                    "ranked_count": time_filter.get("ranked_count", 0),
+                    "time_filter_phase": time_filter.get("phase", ""),
+                    "time_filter_weight": time_filter.get("weight", 1.0),
+                    "high_since_capture": entry_decision.high_since_capture,
+                    "low_after_high": entry_decision.low_after_high,
+                    "pullback_from_high_pct": entry_decision.pullback_from_high_pct,
+                    "observed_pullback_from_high_pct": entry_decision.observed_pullback_from_high_pct,
+                    "strategy_pullback_basis": entry_decision.strategy_pullback_basis,
+                    "entry_pullback_eligible": entry_decision.entry_pullback_eligible,
+                    "rebound_from_low_pct": entry_decision.rebound_from_low_pct,
+                    "intraday_vwap": entry_decision.intraday_vwap,
+                    "vwap_support_ok": entry_decision.vwap_support_ok,
+                    "first_pullback_ready": entry_decision.first_pullback_ready,
+                    "leader_score": getattr(momentum_ctx, "leader_score", 0.0),
+                    "trade_value_since_capture": getattr(
+                        momentum_ctx,
+                        "trade_value_since_capture",
+                        0,
+                    ),
+                    "turnover_speed_per_min": getattr(
+                        momentum_ctx,
+                        "turnover_speed_per_min",
+                        0.0,
+                    )
+                    or 0.0,
+                    "volume_ratio_1m": getattr(momentum_ctx, "volume_ratio_1m", 0.0)
+                    or 0.0,
+                    "volume_ratio_5m": getattr(momentum_ctx, "volume_ratio_5m", 0.0)
+                    or 0.0,
+                    "turnover_rank_market": getattr(
+                        momentum_ctx,
+                        "turnover_rank_market",
+                        0,
+                    ),
+                    "turnover_rank_sector": getattr(
+                        momentum_ctx,
+                        "turnover_rank_sector",
+                        0,
+                    ),
+                }
+            )
+            blocked_prediction.update(self._condition_log_meta(momentum_ctx.candidate, watch))
+            return blocked_prediction
 
         if watch.get("status") != "READY":
             watch["status"] = "READY"
@@ -3702,6 +3914,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "high_since_capture": entry_decision.high_since_capture,
             "low_after_high": entry_decision.low_after_high,
             "pullback_from_high_pct": entry_decision.pullback_from_high_pct,
+            "observed_pullback_from_high_pct": entry_decision.observed_pullback_from_high_pct,
+            "strategy_pullback_basis": entry_decision.strategy_pullback_basis,
+            "entry_pullback_eligible": entry_decision.entry_pullback_eligible,
             "rebound_from_low_pct": entry_decision.rebound_from_low_pct,
             "intraday_vwap": entry_decision.intraday_vwap,
             "vwap_support_ok": entry_decision.vwap_support_ok,
@@ -5089,7 +5304,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if code not in self.realtime_registered_codes:
             self.register_realtime_stock(code)
             self.condition_registered_at[code] = time.time()
-            self.requeue_condition_stock(code)
+            self.requeue_condition_stock(code, delay_seconds=1.0, reason_code="WAIT_REALTIME_REG")
             logger.info("[조건편입 관찰] {} 실시간 등록 - 퀀트조건식 눌림/체결강도 대기".format(code))
             return
         if not self.should_continue_risk_too_wide_watch(code):
@@ -5105,13 +5320,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         stage = int(prediction.get("stage", 1) or 1)
 
         if status == "wait":
+            self.mark_condition_eval_result(code, prediction)
+            recheck_delay = self.condition_recheck_delay_seconds(code, prediction)
             ticks = self.realtime_ticks.get(code, [])
             registered_at = self.condition_registered_at.get(code, time.time())
             if len(ticks) == 0 and time.time() - registered_at >= REALTIME_TICK_WAIT_TIMEOUT_SECONDS:
                 self.no_tick_codes.add(code)
                 logger.info("[매수 제외] {} 실시간 틱 수신 없음 {}초".format(code, REALTIME_TICK_WAIT_TIMEOUT_SECONDS))
                 return
-            self.requeue_condition_stock(code)
+            self.requeue_condition_stock(
+                code,
+                delay_seconds=recheck_delay,
+                reason_code=prediction.get("final_reason_code", prediction.get("reason_code", "")),
+            )
             if self.should_print_wait_log(code):
                 logger.info(
                     "[%s] %s %s",
@@ -5124,8 +5345,13 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 logger.info("[{}차 매수 대기] {} {}".format(stage, code, prediction.get("reason", "")))
             return
         if status == "blocked":
+            self.mark_condition_eval_result(code, prediction)
             if hasattr(self, "should_watch_pullback_recovery") and self.should_watch_pullback_recovery(prediction):
-                self.requeue_condition_stock(code)
+                self.requeue_condition_stock(
+                    code,
+                    delay_seconds=self.condition_recheck_delay_seconds(code, prediction),
+                    reason_code=prediction.get("final_reason_code", prediction.get("reason_code", "")),
+                )
                 if self.should_print_wait_log(code):
                     logger.info(
                         "[%s] %s recovery watch: %s",
@@ -5149,6 +5375,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return
             logger.info("[{}차 매수 제외] {} {}".format(stage, code, prediction.get("reason", "")))
             return
+
+        self.mark_condition_eval_result(code, prediction)
 
         market_gate_action = prediction.get("market_gate_action", "")
         if market_gate_action == entry_strategy.MARKET_ACTION_BLOCK_ALL:

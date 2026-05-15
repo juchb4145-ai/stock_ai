@@ -240,7 +240,10 @@ class MomentumBreakoutStrategy:
         flow_decision = self._flow_gate_decision(ctx, metrics)
         if flow_decision is not None:
             return flow_decision
-        if metrics["chase_distance_pct"] > self.config.max_chase_distance_pct:
+        if (
+            metrics["chase_distance_pct"] > self.config.max_chase_distance_pct
+            and not bool(metrics.get("first_pullback_ready", 0.0))
+        ):
             return MomentumDecision(
                 EntryDecision.BLOCK_CHASE,
                 "chase distance too high {:.2%} > {:.2%}".format(
@@ -266,7 +269,10 @@ class MomentumBreakoutStrategy:
         if hard_chase is not None:
             return hard_chase
 
-        if metrics["chase_risk_score"] > self.config.max_chase_risk_score:
+        if (
+            metrics["chase_risk_score"] > self.config.max_chase_risk_score
+            and not bool(metrics.get("first_pullback_ready", 0.0))
+        ):
             return MomentumDecision(
                 EntryDecision.BLOCK_CHASE,
                 "chase risk score {:.1f} > {:.1f}".format(
@@ -606,6 +612,11 @@ class MomentumBreakoutStrategy:
 
         if flow_ok:
             return None
+        if bool(metrics.get("first_pullback_ready", 0.0)):
+            metrics["flow_score_bucket"] = "first_pullback_leader_turnover_relief"
+            metrics["flow_gate_ok"] = 1.0
+            metrics["volume_gate_relaxed_by_first_pullback"] = 1.0
+            return None
         if self._weak_volume_partial_entry_relief(
             ctx,
             metrics,
@@ -711,6 +722,9 @@ class MomentumBreakoutStrategy:
         vwap_extension = metrics.get("extension_from_vwap_pct", 0.0)
         short_ma_extension = metrics.get("extension_from_short_ma_pct", 0.0)
         pullback_pct = metrics.get("pullback_pct", 0.0)
+        if bool(metrics.get("first_pullback_ready", 0.0)):
+            metrics["hard_chase_relaxed_by_first_pullback"] = 1.0
+            return None
 
         if candle_range > self.config.max_signal_candle_range_pct:
             return MomentumDecision(
@@ -771,7 +785,12 @@ class MomentumBreakoutStrategy:
         c = ctx.candidate
         prior_high, prior_high_source = self._prior_high_with_source(ctx)
         prior_low = self._prior_low(ctx)
-        pullback_pct = (
+        observed_pullback_from_high_pct = (
+            max((int(ctx.high_since_capture or 0) - ctx.current_price) / int(ctx.high_since_capture or 0), 0.0)
+            if int(ctx.high_since_capture or 0) > 0 and ctx.current_price > 0
+            else 0.0
+        )
+        capture_pullback_pct = (
             (c.capture_price - ctx.current_price) / c.capture_price
             if c.capture_price > 0
             else 0.0
@@ -860,6 +879,36 @@ class MomentumBreakoutStrategy:
         effective_pullback_pct = float(self.config.pullback_entry_pct)
         if bool(getattr(self.config, "adaptive_pullback_enabled", False)) and adaptive_pullback_pct > 0:
             effective_pullback_pct = min(effective_pullback_pct, adaptive_pullback_pct)
+        strategy_pullback_basis = (
+            int(ctx.high_since_capture or 0)
+            if int(ctx.high_since_capture or 0) > int(c.capture_price or 0)
+            else int(c.capture_price or 0)
+        )
+        pullback_pct = (
+            observed_pullback_from_high_pct
+            if strategy_pullback_basis == int(ctx.high_since_capture or 0)
+            and int(ctx.high_since_capture or 0) > int(c.capture_price or 0)
+            else capture_pullback_pct
+        )
+        entry_pullback_eligible = (
+            pullback_pct >= effective_pullback_pct
+            and pullback_pct <= float(getattr(self.config, "max_pullback_pct", 1.0) or 1.0)
+        )
+        vwap_support_ok = bool(
+            self._missing_number(ctx.intraday_vwap)
+            or float(ctx.intraday_vwap or 0.0) <= 0
+            or ctx.current_price >= float(ctx.intraday_vwap or 0.0)
+        )
+        first_pullback_quality = bool(
+            entry_pullback_eligible
+            and observed_pullback_from_high_pct >= effective_pullback_pct
+            and int(ctx.low_after_high or 0) > 0
+            and float(ctx.rebound_from_low_pct or 0.0) >= float(getattr(self.config, "rebound_confirm_pct", 0.0) or 0.0)
+            and vwap_support_ok
+            and float(ctx.leader_score or 0.0) >= 70.0
+            and turnover_speed >= 300_000_000.0
+            and float(ctx.chejan_strength or 0.0) >= 100.0
+        )
         pullback_dry_run = self._pullback_dry_run(c.capture_price, pullback_pct)
 
         risk = 0.0
@@ -900,6 +949,13 @@ class MomentumBreakoutStrategy:
             "bonus_condition_detected_at": condition_meta.get("bonus_condition_detected_at", ""),
             "time_between_conditions_sec": condition_meta.get("time_between_conditions_sec", ""),
             "pullback_pct": pullback_pct,
+            "capture_pullback_pct": capture_pullback_pct,
+            "observed_pullback_from_high_pct": observed_pullback_from_high_pct,
+            "pullback_from_high_pct": observed_pullback_from_high_pct,
+            "strategy_pullback_basis": float(strategy_pullback_basis),
+            "entry_pullback_eligible": 1.0 if entry_pullback_eligible else 0.0,
+            "first_pullback_ready": 1.0 if first_pullback_quality else 0.0,
+            "first_pullback_quality_relief": 1.0 if first_pullback_quality else 0.0,
             "chase_distance_pct": max(capture_chase_pct, prior_high_chase_pct),
             "capture_chase_pct": capture_chase_pct,
             "prior_high_chase_pct": prior_high_chase_pct,
@@ -948,25 +1004,62 @@ class MomentumBreakoutStrategy:
         end = self._hhmmss_value(getattr(self.config, "opening_leader_end", ""), 93000)
         return "opening" if start <= hhmmss <= end else "post_opening"
 
-    def _leader_score_threshold(self, now_ts: float) -> float:
+    def _leader_score_threshold(
+        self,
+        now_ts: float,
+        *,
+        condition_combo: str = "",
+        first_pullback_ready: bool = False,
+    ) -> float:
         phase = self._leader_phase(now_ts)
         if phase == "opening":
-            return float(
+            combo = str(condition_combo or "").upper()
+            if combo == "QUANT_AND_DANTE":
+                threshold = float(
+                    getattr(
+                        self.config,
+                        "opening_quant_and_dante_min_leader_score",
+                        60.0,
+                    )
+                    or 0.0
+                )
+            elif combo == "QUANT_ONLY":
+                threshold = float(
+                    getattr(
+                        self.config,
+                        "opening_quant_only_min_leader_score",
+                        65.0,
+                    )
+                    or 0.0
+                )
+            else:
+                threshold = float(
+                    getattr(
+                        self.config,
+                        "opening_min_leader_score",
+                        getattr(self.config, "min_leader_score", 60.0),
+                    )
+                    or 0.0
+                )
+        else:
+            threshold = float(
                 getattr(
                     self.config,
-                    "opening_min_leader_score",
+                    "post_opening_min_leader_score",
                     getattr(self.config, "min_leader_score", 60.0),
                 )
                 or 0.0
             )
-        return float(
-            getattr(
-                self.config,
-                "post_opening_min_leader_score",
-                getattr(self.config, "min_leader_score", 60.0),
+        if first_pullback_ready and threshold > 0:
+            threshold = max(
+                0.0,
+                threshold
+                - float(
+                    getattr(self.config, "first_pullback_leader_score_relief", 7.0)
+                    or 0.0
+                ),
             )
-            or 0.0
-        )
+        return threshold
 
     def _leader_score_decision(
         self,
@@ -976,10 +1069,21 @@ class MomentumBreakoutStrategy:
         if not bool(getattr(self.config, "leader_score_enabled", True)):
             return None
         phase = self._leader_phase(ctx.now_ts or time.time())
-        threshold = self._leader_score_threshold(ctx.now_ts or time.time())
+        base_threshold = self._leader_score_threshold(
+            ctx.now_ts or time.time(),
+            condition_combo=str(metrics.get("condition_combo", "") or ""),
+            first_pullback_ready=False,
+        )
+        threshold = self._leader_score_threshold(
+            ctx.now_ts or time.time(),
+            condition_combo=str(metrics.get("condition_combo", "") or ""),
+            first_pullback_ready=bool(metrics.get("first_pullback_ready", 0.0)),
+        )
         score = float(ctx.leader_score or metrics.get("leader_score", 0.0) or 0.0)
         metrics["leader_score_phase"] = phase
+        metrics["leader_score_base_min"] = base_threshold
         metrics["leader_score_min"] = threshold
+        metrics["leader_score_relief"] = max(base_threshold - threshold, 0.0)
         if threshold <= 0:
             return None
         if score <= 0:
@@ -1193,6 +1297,16 @@ class MomentumBreakoutStrategy:
             "short_reclaim_high": self._positive_optional_number(metrics.get("short_reclaim_high")),
             "vwap_reclaim_candidate": bool(metrics.get("vwap_reclaim_candidate", 0.0)),
             "pullback_pct": self._optional_number(metrics.get("pullback_pct")),
+            "capture_pullback_pct": self._optional_number(metrics.get("capture_pullback_pct")),
+            "pullback_from_high_pct": self._optional_number(metrics.get("pullback_from_high_pct")),
+            "observed_pullback_from_high_pct": self._optional_number(
+                metrics.get("observed_pullback_from_high_pct")
+            ),
+            "strategy_pullback_basis": self._positive_optional_number(
+                metrics.get("strategy_pullback_basis")
+            ),
+            "entry_pullback_eligible": bool(metrics.get("entry_pullback_eligible", 0.0)),
+            "first_pullback_ready": bool(metrics.get("first_pullback_ready", 0.0)),
             "effective_pullback_entry_pct": self._optional_number(metrics.get("effective_pullback_entry_pct")),
             "adaptive_pullback_entry_pct": self._optional_number(metrics.get("adaptive_pullback_entry_pct")),
             "pullback_dry_run": metrics.get("pullback_dry_run"),

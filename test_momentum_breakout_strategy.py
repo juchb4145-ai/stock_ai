@@ -324,6 +324,44 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         self.assertEqual(decision.action, EntryDecision.REJECT)
         self.assertEqual(decision.reason_code, "WEAK_VOLUME_RATIO")
 
+    def test_first_pullback_leader_turnover_relief_allows_weak_volume_ratio(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(
+                min_turnover_speed_per_min=500_000_000,
+                max_chase_distance_pct=0.03,
+                max_signal_candle_range_pct=0.02,
+                candidate_expiry_seconds=10_000_000_000,
+            )
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                current_price=10_500,
+                high_since_capture=10_800,
+                low_after_high=10_400,
+                pullback_from_high_pct=(10_800 - 10_500) / 10_800,
+                rebound_from_low_pct=10_500 / 10_400 - 1,
+                volume_ratio=0.5,
+                volume_ratio_1m=0.5,
+                volume_ratio_5m=0.5,
+                turnover_speed_per_min=300_000_000,
+                leader_score=75.0,
+                chejan_strength=120.0,
+                intraday_vwap=10_420,
+                short_ma=10_450,
+                signal_candle_range_pct=0.05,
+                position_in_signal_candle_pct=0.95,
+                recent_low_to_current_pct=0.009,
+                now_ts=_ts("09:15:00"),
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "BUY_PULLBACK_RECLAIM")
+        self.assertEqual(decision.metrics["flow_score_bucket"], "first_pullback_leader_turnover_relief")
+        self.assertEqual(decision.metrics["volume_gate_relaxed_by_first_pullback"], 1.0)
+        self.assertEqual(decision.metrics["hard_chase_relaxed_by_first_pullback"], 1.0)
+
     def test_marginal_spread_can_buy_as_partial_position_when_flow_confirms(self):
         strategy = MomentumBreakoutStrategy(
             TradeConfig(min_turnover_speed_per_min=999_999_999)

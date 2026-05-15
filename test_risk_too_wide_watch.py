@@ -143,6 +143,9 @@ class _WatchStub:
     def append_trade_log(self, *args, **kwargs):
         self.trade_logs.append((args, kwargs))
 
+    def mark_condition_eval_result(self, code, prediction):
+        return {}
+
 
 class RiskTooWideWatchTests(unittest.TestCase):
     def test_registers_high_score_risk_too_wide_candidate(self):

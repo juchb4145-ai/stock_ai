@@ -131,9 +131,12 @@ class TradeConfig:
     min_turnover_speed_per_min: float = 50_000_000.0
     leader_score_enabled: bool = True
     min_leader_score: float = 60.0
-    opening_min_leader_score: float = 70.0
+    opening_min_leader_score: float = 65.0
+    opening_quant_and_dante_min_leader_score: float = 60.0
+    opening_quant_only_min_leader_score: float = 65.0
+    first_pullback_leader_score_relief: float = 7.0
     post_opening_min_leader_score: float = 60.0
-    opening_leader_start: str = "09:03:00"
+    opening_leader_start: str = "09:00:00"
     opening_leader_end: str = "09:30:00"
     leader_score_turnover_speed_full: float = 200_000_000.0
     leader_score_trade_value_full: float = 500_000_000.0
@@ -472,6 +475,18 @@ class TradeConfig:
             opening_min_leader_score=_env_float(
                 "KIWOOM_OPENING_MIN_LEADER_SCORE",
                 cls.opening_min_leader_score,
+            ),
+            opening_quant_and_dante_min_leader_score=_env_float(
+                "KIWOOM_OPENING_QUANT_AND_DANTE_MIN_LEADER_SCORE",
+                cls.opening_quant_and_dante_min_leader_score,
+            ),
+            opening_quant_only_min_leader_score=_env_float(
+                "KIWOOM_OPENING_QUANT_ONLY_MIN_LEADER_SCORE",
+                cls.opening_quant_only_min_leader_score,
+            ),
+            first_pullback_leader_score_relief=_env_float(
+                "KIWOOM_FIRST_PULLBACK_LEADER_SCORE_RELIEF",
+                cls.first_pullback_leader_score_relief,
             ),
             post_opening_min_leader_score=_env_float(
                 "KIWOOM_POST_OPENING_MIN_LEADER_SCORE",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Dict, Optional, Sequence
 
 import scoring
@@ -18,6 +19,12 @@ class QuantStrategyConfig:
     min_chejan_strength: float = TRADE_CONFIG.min_trade_strength
     min_leader_score: float = TRADE_CONFIG.min_leader_score
     leader_score_enabled: bool = TRADE_CONFIG.leader_score_enabled
+    opening_min_leader_score: float = TRADE_CONFIG.opening_min_leader_score
+    opening_quant_and_dante_min_leader_score: float = TRADE_CONFIG.opening_quant_and_dante_min_leader_score
+    opening_quant_only_min_leader_score: float = TRADE_CONFIG.opening_quant_only_min_leader_score
+    first_pullback_leader_score_relief: float = TRADE_CONFIG.first_pullback_leader_score_relief
+    opening_leader_start: str = TRADE_CONFIG.opening_leader_start
+    opening_leader_end: str = TRADE_CONFIG.opening_leader_end
     market_min_chejan_strength: Dict[str, float] = field(
         default_factory=lambda: {"weak": TRADE_CONFIG.weak_market_min_trade_strength}
     )
@@ -45,6 +52,9 @@ class QuantEntryDecision:
     high_since_capture: int = 0
     low_after_high: int = 0
     pullback_from_high_pct: float = 0.0
+    observed_pullback_from_high_pct: float = 0.0
+    strategy_pullback_basis: int = 0
+    entry_pullback_eligible: bool = False
     rebound_from_low_pct: float = 0.0
     intraday_vwap: float = 0.0
     vwap_support_ok: bool = True
@@ -93,6 +103,9 @@ class QuantEntryDecision:
             "high_since_capture": self.high_since_capture,
             "low_after_high": self.low_after_high,
             "pullback_from_high_pct": self.pullback_from_high_pct,
+            "observed_pullback_from_high_pct": self.observed_pullback_from_high_pct,
+            "strategy_pullback_basis": self.strategy_pullback_basis,
+            "entry_pullback_eligible": self.entry_pullback_eligible,
             "rebound_from_low_pct": self.rebound_from_low_pct,
             "intraday_vwap": self.intraday_vwap,
             "vwap_support_ok": self.vwap_support_ok,
@@ -137,6 +150,41 @@ class QuantConditionStrategy:
         )
 
     @staticmethod
+    def _hhmmss_value(value: str, default: int) -> int:
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        if not digits:
+            return default
+        try:
+            return int(digits[:6].ljust(6, "0"))
+        except ValueError:
+            return default
+
+    def leader_score_threshold(
+        self,
+        *,
+        condition_combo: str = "",
+        first_pullback_ready: bool = False,
+        now_ts: Optional[float] = None,
+    ) -> float:
+        local = time.localtime(time.time() if now_ts is None else float(now_ts))
+        hhmmss = local.tm_hour * 10000 + local.tm_min * 100 + local.tm_sec
+        start = self._hhmmss_value(self.config.opening_leader_start, 90000)
+        end = self._hhmmss_value(self.config.opening_leader_end, 93000)
+        if start <= hhmmss <= end:
+            combo = str(condition_combo or "").upper()
+            if combo == "QUANT_AND_DANTE":
+                threshold = float(self.config.opening_quant_and_dante_min_leader_score or 0.0)
+            elif combo == "QUANT_ONLY":
+                threshold = float(self.config.opening_quant_only_min_leader_score or 0.0)
+            else:
+                threshold = float(self.config.opening_min_leader_score or self.config.min_leader_score or 0.0)
+        else:
+            threshold = float(self.config.min_leader_score or 0.0)
+        if first_pullback_ready and threshold > 0:
+            threshold = max(0.0, threshold - float(self.config.first_pullback_leader_score_relief or 0.0))
+        return threshold
+
+    @staticmethod
     def _one_min_reversal_ok(
         *,
         current_price: int,
@@ -175,9 +223,15 @@ class QuantConditionStrategy:
         minute_bars: Optional[Sequence[Any]] = None,
         one_min_reversal: Optional[bool] = None,
         leader_score: Optional[float] = None,
+        condition_combo: str = "",
+        now_ts: Optional[float] = None,
     ) -> QuantEntryDecision:
         min_chejan_strength = self.min_chejan_strength_for_market(market_state)
-        min_leader_score = float(getattr(self.config, "min_leader_score", 0.0) or 0.0)
+        min_leader_score = self.leader_score_threshold(
+            condition_combo=condition_combo,
+            first_pullback_ready=False,
+            now_ts=now_ts,
+        )
         normalized_leader_score = (
             float(leader_score or 0.0) if leader_score is not None else 0.0
         )
@@ -190,6 +244,13 @@ class QuantConditionStrategy:
             if normalized_recent_low > 0 and current_price > 0
             else 0.0
         )
+        observed_pullback_from_high_pct = (
+            max((high_since_capture - current_price) / high_since_capture, 0.0)
+            if high_since_capture > 0 and current_price > 0
+            else 0.0
+        )
+        strategy_pullback_basis_default = 0
+        entry_pullback_eligible_default = False
 
         def decision(
             *,
@@ -204,6 +265,8 @@ class QuantConditionStrategy:
             stop_price: int = 0,
             take_profit_price: int = 0,
             safe_target_price: int = 0,
+            strategy_pullback_basis: int = 0,
+            entry_pullback_eligible: Optional[bool] = None,
         ) -> QuantEntryDecision:
             return QuantEntryDecision(
                 status=status,
@@ -219,8 +282,15 @@ class QuantConditionStrategy:
                 rebound_pct=rebound_pct,
                 high_since_capture=high_since_capture,
                 low_after_high=low_after_high,
-                pullback_from_high_pct=(
-                    pullback_pct if high_since_capture > capture_price else 0.0
+                pullback_from_high_pct=observed_pullback_from_high_pct,
+                observed_pullback_from_high_pct=observed_pullback_from_high_pct,
+                strategy_pullback_basis=int(
+                    strategy_pullback_basis or strategy_pullback_basis_default or 0
+                ),
+                entry_pullback_eligible=(
+                    bool(entry_pullback_eligible)
+                    if entry_pullback_eligible is not None
+                    else bool(entry_pullback_eligible_default)
                 ),
                 rebound_from_low_pct=rebound_from_low_pct,
                 intraday_vwap=intraday_vwap_value,
@@ -246,21 +316,6 @@ class QuantConditionStrategy:
                 reason="capture price missing",
                 reason_code="SAFE_NO_CAPTURE",
             )
-        if (
-            leader_score is not None
-            and bool(getattr(self.config, "leader_score_enabled", True))
-            and normalized_leader_score < min_leader_score
-        ):
-            return decision(
-                status="wait",
-                reason="leader score wait {:.1f} < {:.1f}".format(
-                    normalized_leader_score,
-                    min_leader_score,
-                ),
-                reason_code="WAIT_LEADER_SCORE",
-                safe_target_price=self.trigger_price(capture_price),
-            )
-
         high_extension_pct = (
             high_since_capture / capture_price - 1
             if high_since_capture > capture_price
@@ -283,10 +338,15 @@ class QuantConditionStrategy:
             use_high_basis = True
 
         pullback_basis = high_since_capture if use_high_basis else capture_price
+        strategy_pullback_basis_default = pullback_basis
         target_price = scoring.round_down_to_tick(
             pullback_basis * (1 - self.config.entry_pullback_pct)
         )
         pullback_pct = (pullback_basis - current_price) / pullback_basis
+        entry_pullback_eligible_default = (
+            pullback_pct >= self.config.entry_pullback_pct
+            and pullback_pct <= self.config.max_pullback_pct
+        )
 
         shallow_code = (
             "SAFE_PULLBACK_FROM_HIGH_SHALLOW"
@@ -396,6 +456,29 @@ class QuantConditionStrategy:
                 status="wait",
                 reason="one-minute reversal confirmation wait",
                 reason_code="SAFE_ONE_MIN_REVERSAL_WAIT",
+                pullback_pct=pullback_pct,
+                rebound_from_low_pct=rebound_from_low_pct,
+                vwap_support_ok=vwap_support_ok,
+                safe_target_price=target_price,
+            )
+
+        min_leader_score = self.leader_score_threshold(
+            condition_combo=condition_combo,
+            first_pullback_ready=True,
+            now_ts=now_ts,
+        )
+        if (
+            leader_score is not None
+            and bool(getattr(self.config, "leader_score_enabled", True))
+            and normalized_leader_score < min_leader_score
+        ):
+            return decision(
+                status="wait",
+                reason="leader score wait {:.1f} < {:.1f}".format(
+                    normalized_leader_score,
+                    min_leader_score,
+                ),
+                reason_code="WAIT_LEADER_SCORE",
                 pullback_pct=pullback_pct,
                 rebound_from_low_pct=rebound_from_low_pct,
                 vwap_support_ok=vwap_support_ok,

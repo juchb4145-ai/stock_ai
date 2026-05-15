@@ -9,9 +9,17 @@ from final_entry_decision import (
     FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
     LIVE_BREAKOUT_BLOCK_REASON_CODE,
     build_final_entry_decision,
+    is_breakout_probe_entry,
 )
 from momentum_breakout_strategy import EntryDecision, MomentumDecision
+from order_guard import (
+    LIVE_BREAKOUT_BLOCKED_BY,
+    OrderGuard,
+    RiskState,
+)
+from portfolio import PortfolioState
 from quant_condition_strategy import QuantEntryDecision
+from trade_config import TradeConfig
 
 
 def _ensure_external_stubs() -> None:
@@ -78,7 +86,108 @@ def _legacy(status: str, reason_code: str = "LEGACY_READY") -> QuantEntryDecisio
     )
 
 
+class _LivePlaceBuyStub:
+    parse_int = main.Kiwoom.parse_int
+    current_open_position_risk = main.Kiwoom.current_open_position_risk
+    build_position_size_plan = main.Kiwoom.build_position_size_plan
+    format_position_size_plan = main.Kiwoom.format_position_size_plan
+    place_buy_order = main.Kiwoom.place_buy_order
+    submit_order_guarded = main.Kiwoom.submit_order_guarded
+
+    def __init__(self):
+        self.deposit = 10_000_000
+        self.portfolio = PortfolioState()
+        self.order_context = {}
+        self.order_prices = {}
+        self.entry_times = {}
+        self.highest_prices = {}
+        self.pending_order_codes = set()
+        self.bought_codes = set()
+        self.best = {}
+        self.target_returns = {}
+        self.dante_reentry_watchlist = {}
+        self.dante_a_watchlist = {}
+        self.trade_log_calls = []
+        self.last_order_guard_decision = None
+        self.send_order_calls = 0
+        self.order_guard = OrderGuard(
+            TradeConfig(
+                dry_run=False,
+                live_trading_enabled=True,
+                paper_portfolio_enabled=False,
+                max_position_size=1_000_000,
+                max_daily_exposure=10_000_000,
+                time_policy_enabled=False,
+            )
+        )
+
+    def normalize_code(self, code):
+        return str(code).strip().lstrip("A")
+
+    def get_deposit(self, force=False):
+        return self.deposit
+
+    def build_order_risk_state(self, request):
+        return RiskState(
+            mode="live",
+            account_state_available=True,
+            daily_loss_available=True,
+        )
+
+    def append_trade_log(self, *args, **kwargs):
+        self.trade_log_calls.append((args, kwargs))
+
+    def estimate_net_target_return(self, entry_price, target_price):
+        return target_price / entry_price - 1 if entry_price else 0.0
+
+    def save_best(self):
+        raise AssertionError("blocked live breakout probe must not save order state")
+
+    def save_portfolio_state(self):
+        raise AssertionError("blocked live breakout probe must not save portfolio state")
+
+    def register_realtime_stock(self, code):
+        raise AssertionError("blocked live breakout probe must not register order state")
+
+    def send_order(self, *args, **kwargs):
+        self.send_order_calls += 1
+        raise AssertionError("blocked live breakout probe must not call SendOrder")
+
+
+def _ready_buy_prediction(**overrides):
+    payload = {
+        "code": "000001",
+        "name": "test",
+        "current_price": 10_000,
+        "entry_limit_price": 10_000,
+        "stop_price": 9_850,
+        "take_profit_price": 10_300,
+        "ratio": 1.0,
+        "grade": main.QUANT_GRADE,
+        "plan_source": main.QUANT_PLAN_SOURCE,
+        "order_gubun": "00",
+        "score": 0.9,
+        "reason": "test ready",
+        "reason_code": "BUY_PULLBACK_RECLAIM",
+        "final_entry_allowed": True,
+        "final_reason": "test final pass",
+        "final_reason_code": "FINAL_BUY_READY",
+        "strategy_version": "test",
+        "legacy_filter_enabled": True,
+        "decision_trace": {"test": True},
+    }
+    payload.update(overrides)
+    return payload
+
+
 class FinalEntryDecisionTests(unittest.TestCase):
+    def test_final_paper_only_reason_is_breakout_probe_reason(self):
+        self.assertTrue(
+            is_breakout_probe_entry(
+                reason_code=FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+            )
+        )
+
     def test_momentum_buy_legacy_block_prevents_final_buy(self):
         momentum = MomentumDecision(
             EntryDecision.BUY,
@@ -181,6 +290,35 @@ class FinalEntryDecisionTests(unittest.TestCase):
         self.assertEqual(final.reason_code, FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE)
         self.assertEqual(final.decision_trace["live_block_reason_code"], LIVE_BREAKOUT_BLOCK_REASON_CODE)
         self.assertTrue(final.decision_trace["blocked_live_breakout_probe"])
+
+    def test_place_buy_order_logs_live_breakout_block_without_send_order(self):
+        stub = _LivePlaceBuyStub()
+        prediction = _ready_buy_prediction(
+            reason_code="BUY_BREAKOUT_SMALL",
+            momentum_reason_code="BUY_BREAKOUT_SMALL",
+            final_reason_code=FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+            final_reason="Momentum breakout probe is paper-only",
+            entry_type="BREAKOUT_SMALL",
+            position_size_multiplier=0.25,
+            decision_trace={
+                "paper_only_breakout_probe": True,
+                "blocked_live_breakout_probe": True,
+            },
+        )
+
+        stub.place_buy_order("A000001", prediction, ratio=1.0, stage=2)
+
+        self.assertEqual(stub.send_order_calls, 0)
+        self.assertIsNotNone(stub.last_order_guard_decision)
+        self.assertFalse(stub.last_order_guard_decision.allowed)
+        self.assertEqual(stub.last_order_guard_decision.reason, LIVE_BREAKOUT_BLOCK_REASON_CODE)
+        self.assertEqual(stub.last_order_guard_decision.blocked_by, LIVE_BREAKOUT_BLOCKED_BY)
+        self.assertEqual(len(stub.trade_log_calls), 1)
+        event_args, row = stub.trade_log_calls[0]
+        self.assertEqual(event_args[0], "buy_skip")
+        self.assertEqual(row["reason_code"], LIVE_BREAKOUT_BLOCK_REASON_CODE)
+        self.assertEqual(row["blocked_by"], LIVE_BREAKOUT_BLOCKED_BY)
+        self.assertEqual(row["plan_source"], "paper_only_breakout_probe")
 
     def test_place_buy_order_blocks_missing_final_entry_approval(self):
         class Stub:

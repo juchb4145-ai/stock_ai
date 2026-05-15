@@ -1,4 +1,7 @@
+import ast
+import importlib
 import os
+from pathlib import Path
 import unittest
 from unittest import mock
 
@@ -58,6 +61,19 @@ class TradeConfigBoolEnvTests(unittest.TestCase):
         self.assertEqual(config.entry_strategy_version, "quant_first_pullback_v1")
         self.assertFalse(config.allow_breakout_probe_entry)
         self.assertEqual(config.breakout_probe_entry_ratio, 0.0)
+        self.assertTrue(config.leader_score_enabled)
+        self.assertEqual(config.min_leader_score, 60.0)
+        self.assertEqual(config.opening_min_leader_score, 65.0)
+        self.assertEqual(config.opening_quant_and_dante_min_leader_score, 60.0)
+        self.assertEqual(config.opening_quant_only_min_leader_score, 65.0)
+        self.assertEqual(config.first_pullback_leader_score_relief, 7.0)
+        self.assertEqual(config.post_opening_min_leader_score, 60.0)
+        self.assertEqual(config.opening_leader_start, "09:00:00")
+        self.assertEqual(config.opening_leader_end, "09:30:00")
+        self.assertEqual(config.leader_score_turnover_speed_full, 200_000_000.0)
+        self.assertEqual(config.leader_score_trade_value_full, 500_000_000.0)
+        self.assertEqual(config.leader_score_volume_ratio_full, 2.0)
+        self.assertEqual(config.leader_score_chejan_full, 200.0)
         self.assertEqual(config.cash_usage_ratio, 0.98)
         self.assertEqual(config.max_position_cash_ratio, 0.10)
         self.assertEqual(config.default_stop_loss_pct, 0.015)
@@ -144,6 +160,87 @@ class TradeConfigBoolEnvTests(unittest.TestCase):
         self.assertEqual(config.bonus_condition_name, "bonus-legacy-env")
         self.assertEqual(config.condition_name, "primary-legacy-env")
         self.assertEqual(config.legacy_condition_name, "bonus-legacy-env")
+
+    def test_leader_score_env_overrides_are_loaded(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KIWOOM_LEADER_SCORE_ENABLED": "false",
+                "KIWOOM_MIN_LEADER_SCORE": "55",
+                "KIWOOM_OPENING_MIN_LEADER_SCORE": "75",
+                "KIWOOM_OPENING_QUANT_AND_DANTE_MIN_LEADER_SCORE": "61",
+                "KIWOOM_OPENING_QUANT_ONLY_MIN_LEADER_SCORE": "66",
+                "KIWOOM_FIRST_PULLBACK_LEADER_SCORE_RELIEF": "8",
+                "KIWOOM_POST_OPENING_MIN_LEADER_SCORE": "62",
+                "KIWOOM_OPENING_LEADER_START": "09:04:00",
+                "KIWOOM_OPENING_LEADER_END": "09:25:00",
+                "KIWOOM_LEADER_SCORE_TURNOVER_SPEED_FULL": "300000000",
+                "KIWOOM_LEADER_SCORE_TRADE_VALUE_FULL": "700000000",
+                "KIWOOM_LEADER_SCORE_VOLUME_RATIO_FULL": "3.5",
+                "KIWOOM_LEADER_SCORE_CHEJAN_FULL": "240",
+            },
+            clear=True,
+        ):
+            config = TradeConfig.from_env()
+
+        self.assertFalse(config.leader_score_enabled)
+        self.assertEqual(config.min_leader_score, 55.0)
+        self.assertEqual(config.opening_min_leader_score, 75.0)
+        self.assertEqual(config.opening_quant_and_dante_min_leader_score, 61.0)
+        self.assertEqual(config.opening_quant_only_min_leader_score, 66.0)
+        self.assertEqual(config.first_pullback_leader_score_relief, 8.0)
+        self.assertEqual(config.post_opening_min_leader_score, 62.0)
+        self.assertEqual(config.opening_leader_start, "09:04:00")
+        self.assertEqual(config.opening_leader_end, "09:25:00")
+        self.assertEqual(config.leader_score_turnover_speed_full, 300_000_000.0)
+        self.assertEqual(config.leader_score_trade_value_full, 700_000_000.0)
+        self.assertEqual(config.leader_score_volume_ratio_full, 3.5)
+        self.assertEqual(config.leader_score_chejan_full, 240.0)
+
+    def test_first_pullback_modules_import_cleanly(self):
+        for module_name in (
+            "trade_config",
+            "quant_condition_strategy",
+            "momentum_breakout_strategy",
+            "candidate_registry",
+            "final_entry_decision",
+            "order_guard",
+        ):
+            with self.subTest(module=module_name):
+                importlib.import_module(module_name)
+
+    def test_direct_trade_config_references_exist(self):
+        root = Path(__file__).resolve().parent
+        config_tree = ast.parse((root / "trade_config.py").read_text(encoding="utf-8"))
+        trade_config_fields = set()
+        for node in ast.walk(config_tree):
+            if isinstance(node, ast.ClassDef) and node.name == "TradeConfig":
+                for stmt in node.body:
+                    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        trade_config_fields.add(stmt.target.id)
+                break
+
+        target_files = (
+            "quant_condition_strategy.py",
+            "momentum_breakout_strategy.py",
+            "candidate_registry.py",
+            "final_entry_decision.py",
+            "order_guard.py",
+            "main.py",
+        )
+        missing = {}
+        for filename in target_files:
+            tree = ast.parse((root / filename).read_text(encoding="utf-8"))
+            refs = {
+                node.attr
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "TRADE_CONFIG"
+            }
+            missing[filename] = sorted(refs - trade_config_fields)
+
+        self.assertEqual({k: v for k, v in missing.items() if v}, {})
 
 
 if __name__ == "__main__":

@@ -6,7 +6,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from order_guard import OrderGuard, OrderRequest, PaperPortfolio, RiskState
+from final_entry_decision import FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE
+from order_guard import (
+    LIVE_ANALYSIS_ONLY_BLOCKED_BY,
+    LIVE_ANALYSIS_ONLY_REASON_CODE,
+    LIVE_BREAKOUT_BLOCKED_BY,
+    LIVE_BREAKOUT_BLOCK_REASON_CODE,
+    OrderGuard,
+    OrderRequest,
+    PaperPortfolio,
+    RiskState,
+)
 from time_policy import TimeDecision
 from trade_config import TradeConfig
 
@@ -314,6 +324,143 @@ class OrderSafetyTests(unittest.TestCase):
 
         self.assertEqual(result, -9902)
         self.assertFalse(stub.last_order_guard_decision.allowed)
+
+    def test_live_breakout_small_reject_does_not_call_send_order(self):
+        request = _buy_request(
+            context={
+                "final_entry_allowed": True,
+                "strategy_version": "test",
+                "decision_trace": {"paper_only_breakout_probe": True},
+                "reason_code": "BUY_BREAKOUT_SMALL",
+                "momentum_reason_code": "BUY_BREAKOUT_SMALL",
+                "final_reason_code": FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+                "entry_type": "BREAKOUT_SMALL",
+            }
+        )
+
+        class Stub:
+            order_guard = OrderGuard(
+                TradeConfig(
+                    dry_run=False,
+                    live_trading_enabled=True,
+                    paper_portfolio_enabled=False,
+                    time_policy_enabled=False,
+                )
+            )
+            last_order_guard_decision = None
+            send_order_calls = 0
+
+            def build_order_risk_state(self, request):
+                return RiskState(
+                    mode="live",
+                    account_state_available=True,
+                    daily_loss_available=True,
+                )
+
+            def send_order(self, *args, **kwargs):
+                self.send_order_calls += 1
+                raise AssertionError("live breakout probe must not call send_order")
+
+        stub = Stub()
+        result = main.Kiwoom.submit_order_guarded(stub, request)
+
+        self.assertEqual(result, -9902)
+        self.assertEqual(stub.send_order_calls, 0)
+        self.assertFalse(stub.last_order_guard_decision.allowed)
+        self.assertEqual(stub.last_order_guard_decision.reason, LIVE_BREAKOUT_BLOCK_REASON_CODE)
+        self.assertEqual(stub.last_order_guard_decision.blocked_by, LIVE_BREAKOUT_BLOCKED_BY)
+
+    def test_dante_only_live_reject_does_not_call_send_order(self):
+        request = _buy_request(
+            context={
+                "final_entry_allowed": True,
+                "strategy_version": "test",
+                "decision_trace": {"test": True},
+                "reason_code": "BUY_PULLBACK_RECLAIM",
+                "momentum_reason_code": "BUY_PULLBACK_RECLAIM",
+                "entry_type": "PULLBACK_RECLAIM",
+                "condition_combo": "DANTE_ONLY",
+                "candidate_role": "analysis_only",
+            }
+        )
+
+        class Stub:
+            order_guard = OrderGuard(
+                TradeConfig(
+                    dry_run=False,
+                    live_trading_enabled=True,
+                    paper_portfolio_enabled=False,
+                    time_policy_enabled=False,
+                )
+            )
+            last_order_guard_decision = None
+            send_order_calls = 0
+
+            def build_order_risk_state(self, request):
+                return RiskState(
+                    mode="live",
+                    account_state_available=True,
+                    daily_loss_available=True,
+                )
+
+            def send_order(self, *args, **kwargs):
+                self.send_order_calls += 1
+                raise AssertionError("DANTE_ONLY analysis candidate must not call send_order")
+
+        stub = Stub()
+        result = main.Kiwoom.submit_order_guarded(stub, request)
+
+        self.assertEqual(result, -9902)
+        self.assertEqual(stub.send_order_calls, 0)
+        self.assertFalse(stub.last_order_guard_decision.allowed)
+        self.assertEqual(stub.last_order_guard_decision.reason, LIVE_ANALYSIS_ONLY_REASON_CODE)
+        self.assertEqual(stub.last_order_guard_decision.blocked_by, LIVE_ANALYSIS_ONLY_BLOCKED_BY)
+
+    def test_dry_run_breakout_probe_stays_paper_even_with_live_flag(self):
+        request = _buy_request(
+            context={
+                "final_entry_allowed": True,
+                "strategy_version": "test",
+                "decision_trace": {"paper_only_breakout_probe": True},
+                "reason_code": FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+                "momentum_reason_code": "BUY_BREAKOUT_SMALL",
+                "entry_type": "BREAKOUT_SMALL",
+            }
+        )
+        paper = PaperPortfolio(initial_cash=1_000_000)
+
+        class Stub:
+            order_guard = OrderGuard(
+                TradeConfig(
+                    dry_run=True,
+                    live_trading_enabled=True,
+                    paper_portfolio_enabled=True,
+                    time_policy_enabled=False,
+                ),
+                paper,
+            )
+            paper_portfolio = paper
+            last_order_guard_decision = None
+            send_order_calls = 0
+
+            def build_order_risk_state(self, request):
+                return paper.to_risk_state()
+
+            def parse_int(self, value):
+                return int(value or 0)
+
+            def send_order(self, *args, **kwargs):
+                self.send_order_calls += 1
+                raise AssertionError("dry_run breakout probe must not call live send_order")
+
+        stub = Stub()
+        result = main.Kiwoom.submit_order_guarded(stub, request)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stub.send_order_calls, 0)
+        self.assertTrue(stub.last_order_guard_decision.allowed)
+        self.assertFalse(stub.last_order_guard_decision.live)
+        self.assertTrue(stub.last_order_guard_decision.paper)
 
     def test_live_time_policy_reject_does_not_call_send_order(self):
         request = _buy_request(

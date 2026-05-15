@@ -19,6 +19,8 @@ def is_breakout_probe_entry(*, entry_type: str = "", reason_code: str = "") -> b
     return entry_type_norm == ENTRY_TYPE_BREAKOUT_SMALL or reason_norm in {
         ENTRY_TYPE_BREAKOUT_SMALL,
         MOMENTUM_REASON_BUY_BREAKOUT_SMALL,
+        FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+        "PAPER_ONLY_BREAKOUT_PROBE",
     }
 
 
