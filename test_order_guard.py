@@ -21,6 +21,8 @@ SEOUL = load_timezone("Asia/Seoul")
 ALLOWED_TS = datetime(2026, 5, 13, 9, 5, 0, tzinfo=SEOUL).timestamp()
 PRE_OPEN_TS = datetime(2026, 5, 13, 8, 59, 0, tzinfo=SEOUL).timestamp()
 FORCE_EXIT_TS = datetime(2026, 5, 13, 15, 10, 0, tzinfo=SEOUL).timestamp()
+MIDDAY_TS = datetime(2026, 5, 13, 10, 45, 0, tzinfo=SEOUL).timestamp()
+AFTER_CUTOFF_TS = datetime(2026, 5, 13, 14, 25, 0, tzinfo=SEOUL).timestamp()
 
 
 def _buy_request(code="005930", quantity=10, final_entry_allowed=True):
@@ -200,6 +202,54 @@ class OrderGuardTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertFalse(decision.live)
         self.assertTrue(decision.paper)
+
+    def test_paper_only_strategy_can_record_during_midday_time_block(self):
+        config = TradeConfig(dry_run=True, paper_portfolio_enabled=True)
+        guard = OrderGuard(config, PaperPortfolio(initial_cash=1_000_000))
+        request = _buy_request()
+        request.context.update(
+            {
+                "reason_code": "MIDDAY_VWAP_RECLAIM_PAPER_ONLY",
+                "momentum_reason_code": "MIDDAY_VWAP_RECLAIM_PAPER_ONLY",
+                "entry_type": "MIDDAY_VWAP_RECLAIM",
+                "decision_trace": {"paper_only_strategy": True},
+            }
+        )
+
+        decision = guard.validate(request, now=MIDDAY_TS)
+
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.live)
+        self.assertTrue(decision.paper)
+
+    def test_live_blocks_paper_only_strategy_after_cutoff(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+        )
+        guard = OrderGuard(config)
+        request = _buy_request()
+        request.context.update(
+            {
+                "reason_code": "CLOSING_STRENGTH_PAPER_ONLY",
+                "momentum_reason_code": "CLOSING_STRENGTH_PAPER_ONLY",
+                "entry_type": "CLOSING_STRENGTH",
+                "decision_trace": {"paper_only_strategy": True},
+            }
+        )
+
+        decision = guard.validate(
+            request,
+            now=AFTER_CUTOFF_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+            ),
+        )
+
+        self.assertFalse(decision.allowed)
 
     def test_live_allows_pullback_reclaim_when_other_gates_pass(self):
         config = TradeConfig(

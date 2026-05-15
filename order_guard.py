@@ -23,6 +23,17 @@ _LIVE_BLOCKED_BREAKOUT_VALUES = {
     "BUY_BREAKOUT_SMALL",
     "READY_AGRADE_FIRST",
     "FINAL_PAPER_ONLY_BREAKOUT_PROBE",
+    "FINAL_PAPER_ONLY_STRATEGY",
+    "MIDDAY_VWAP_RECLAIM",
+    "AFTERNOON_SECOND_WAVE",
+    "CLOSING_STRENGTH",
+    "TREND_CONTINUATION",
+    "WEAK_VOLUME_RELIEF_PAPER_ONLY",
+    "MIDDAY_VWAP_RECLAIM_PAPER_ONLY",
+    "AFTERNOON_SECOND_WAVE_PAPER_ONLY",
+    "CLOSING_STRENGTH_PAPER_ONLY",
+    "TREND_CONTINUATION_PAPER_ONLY",
+    "WEAK_VOLUME_RELIEF_PAPER_ONLY",
     "PAPER_ONLY_BREAKOUT_PROBE",
 }
 
@@ -36,6 +47,8 @@ def is_live_breakout_probe_context(context: Dict[str, object]) -> bool:
     context = context or {}
     trace = context.get("decision_trace", {})
     if isinstance(trace, dict) and trace.get("paper_only_breakout_probe"):
+        return True
+    if isinstance(trace, dict) and trace.get("paper_only_strategy"):
         return True
     for key in ("entry_type", "reason_code", "momentum_reason_code", "final_reason_code"):
         if _context_value(context, key).upper() in _LIVE_BLOCKED_BREAKOUT_VALUES:
@@ -708,22 +721,30 @@ class OrderGuard:
                 },
             )
             if not time_decision.allowed:
-                self._log_order_blocked_by_time_policy(
-                    request,
-                    time_decision,
-                    mode=mode,
-                    requested_amount=requested_amount,
-                )
-                return self._decision(
-                    allowed=False,
-                    mode=mode,
-                    reason=time_decision.reason_code.lower(),
-                    request=request,
-                    risk_state=risk_state,
-                    requested_amount=requested_amount,
-                    blocked_by="time_policy",
-                    time_decision=time_decision,
-                )
+                if (
+                    mode == "paper"
+                    and request.normalized_side == "buy"
+                    and is_live_breakout_probe_context(request.context)
+                    and self.time_policy.paper_strategy_allowed(now=now)
+                ):
+                    pass
+                else:
+                    self._log_order_blocked_by_time_policy(
+                        request,
+                        time_decision,
+                        mode=mode,
+                        requested_amount=requested_amount,
+                    )
+                    return self._decision(
+                        allowed=False,
+                        mode=mode,
+                        reason=time_decision.reason_code.lower(),
+                        request=request,
+                        risk_state=risk_state,
+                        requested_amount=requested_amount,
+                        blocked_by="time_policy",
+                        time_decision=time_decision,
+                    )
 
         if request.normalized_side == "buy" and not request.is_cancel:
             if (

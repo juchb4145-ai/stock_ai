@@ -1906,6 +1906,9 @@ def write_markdown_summary(result: ReviewResult, path: str | Path) -> None:
     lines.append("## Time Bucket Analysis")
     lines.extend(_time_bucket_lines(rows))
     lines.append("")
+    lines.append("## Paper Strategy Performance")
+    lines.extend(_paper_strategy_performance_lines(rows))
+    lines.append("")
     lines.append("## Parameter Tuning Hints")
     lines.extend(_hint_lines(rows))
     lines.append("")
@@ -2350,8 +2353,8 @@ def _time_bucket_lines(rows: Sequence[ReviewRow]) -> List[str]:
         ("14:20 이후", "14:20:00", "23:59:59"),
     ]
     lines = [
-        "| time_bucket | capture_count | traded_count | non_traded_count | missed_opportunity_count | good_reject_count | avg_mfe_pct | avg_mae_pct | n_mfe | n_mae |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| time_bucket | capture_count | strategy_candidate_count | paper_only_count | traded_count | non_traded_count | missed_opportunity_count | good_reject_count | avg_mfe_pct | avg_mae_pct | n_mfe | n_mae |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for label, start_text, end_text in buckets:
         start = datetime.strptime(start_text, "%H:%M:%S").time()
@@ -2361,12 +2364,74 @@ def _time_bucket_lines(rows: Sequence[ReviewRow]) -> List[str]:
             if row.detected_at is not None and start <= row.detected_at.time() < end
         ]
         traded_count = sum(1 for row in members if row.traded)
+        strategy_count = sum(1 for row in members if _paper_strategy_key(row))
+        paper_count = sum(1 for row in members if _is_paper_only_candidate(row))
         missed_count = sum(1 for row in members if row.missed_opportunity)
         good_count = sum(1 for row in members if row.review_category in {"GOOD_REJECT", "GOOD_BLOCK_CHASE"})
         mfe_stats = _metric_stats([row.mfe_pct for row in members])
         mae_stats = _metric_stats([row.mae_pct for row in members])
         lines.append(
-            f"| {label} | {len(members)} | {traded_count} | {len(members) - traded_count} | {missed_count} | {good_count} | {_fmt_pct(mfe_stats['avg'])} | {_fmt_pct(mae_stats['avg'])} | {mfe_stats['n']} | {mae_stats['n']} |"
+            f"| {label} | {len(members)} | {strategy_count} | {paper_count} | {traded_count} | {len(members) - traded_count} | {missed_count} | {good_count} | {_fmt_pct(mfe_stats['avg'])} | {_fmt_pct(mae_stats['avg'])} | {mfe_stats['n']} | {mae_stats['n']} |"
+        )
+    return lines
+
+
+PAPER_STRATEGY_ENTRY_TYPES = {
+    "MIDDAY_VWAP_RECLAIM",
+    "AFTERNOON_SECOND_WAVE",
+    "CLOSING_STRENGTH",
+    "TREND_CONTINUATION",
+    "WEAK_VOLUME_RELIEF_PAPER_ONLY",
+}
+
+
+def _paper_strategy_key(row: ReviewRow) -> str:
+    entry_type = str(row.entry_type or "").upper()
+    reason_code = str(row.reason_code or "").upper()
+    if entry_type in PAPER_STRATEGY_ENTRY_TYPES:
+        return entry_type
+    for key in PAPER_STRATEGY_ENTRY_TYPES:
+        if key in reason_code:
+            return key
+    return ""
+
+
+def _is_paper_only_candidate(row: ReviewRow) -> bool:
+    if _paper_strategy_key(row):
+        return True
+    trace = row.decision_trace if isinstance(row.decision_trace, dict) else {}
+    return bool(trace.get("paper_only_strategy") or trace.get("paper_only_breakout_probe"))
+
+
+def _paper_strategy_performance_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    by_strategy: Dict[str, List[ReviewRow]] = defaultdict(list)
+    for row in rows:
+        key = _paper_strategy_key(row)
+        if key:
+            by_strategy[key].append(row)
+    if not by_strategy:
+        return ["No paper-only strategy candidates."]
+    lines = [
+        "| strategy_type | candidate_count | paper_only_count | traded_count | missed_count | good_reject_count | avg_mfe_pct | avg_mae_pct | n_mfe | n_mae |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for strategy_type in sorted(by_strategy):
+        members = by_strategy[strategy_type]
+        mfe_stats = _metric_stats([row.mfe_pct for row in members])
+        mae_stats = _metric_stats([row.mae_pct for row in members])
+        lines.append(
+            "| {strategy} | {count} | {paper} | {traded} | {missed} | {good} | {mfe} | {mae} | {n_mfe} | {n_mae} |".format(
+                strategy=strategy_type,
+                count=len(members),
+                paper=sum(1 for row in members if _is_paper_only_candidate(row)),
+                traded=sum(1 for row in members if row.traded),
+                missed=sum(1 for row in members if row.missed_opportunity),
+                good=sum(1 for row in members if row.review_category in {"GOOD_REJECT", "GOOD_BLOCK_CHASE"}),
+                mfe=_fmt_pct(mfe_stats["avg"]),
+                mae=_fmt_pct(mae_stats["avg"]),
+                n_mfe=mfe_stats["n"],
+                n_mae=mae_stats["n"],
+            )
         )
     return lines
 

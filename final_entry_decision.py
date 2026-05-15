@@ -6,8 +6,17 @@ from typing import Any, Dict, Optional
 
 FINAL_ENTRY_STRATEGY_VERSION = "quant_first_pullback_v1"
 ENTRY_TYPE_BREAKOUT_SMALL = "BREAKOUT_SMALL"
+PAPER_ONLY_ENTRY_TYPES = {
+    ENTRY_TYPE_BREAKOUT_SMALL,
+    "MIDDAY_VWAP_RECLAIM",
+    "AFTERNOON_SECOND_WAVE",
+    "CLOSING_STRENGTH",
+    "TREND_CONTINUATION",
+    "WEAK_VOLUME_RELIEF_PAPER_ONLY",
+}
 MOMENTUM_REASON_BUY_BREAKOUT_SMALL = "BUY_BREAKOUT_SMALL"
 FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE = "FINAL_PAPER_ONLY_BREAKOUT_PROBE"
+FINAL_REASON_PAPER_ONLY_STRATEGY = "FINAL_PAPER_ONLY_STRATEGY"
 LIVE_BREAKOUT_BLOCK_REASON_CODE = "BLOCK_LIVE_BREAKOUT_SMALL"
 LIVE_BREAKOUT_BLOCKED_BY = "live_breakout_probe_disabled"
 PAPER_ONLY_BREAKOUT_PLAN_SOURCE = "paper_only_breakout_probe"
@@ -22,6 +31,12 @@ def is_breakout_probe_entry(*, entry_type: str = "", reason_code: str = "") -> b
         FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
         "PAPER_ONLY_BREAKOUT_PROBE",
     }
+
+
+def is_paper_only_entry(*, entry_type: str = "", reason_code: str = "") -> bool:
+    entry_type_norm = str(entry_type or "").upper()
+    reason_norm = str(reason_code or "").upper()
+    return entry_type_norm in PAPER_ONLY_ENTRY_TYPES or reason_norm.endswith("_PAPER_ONLY")
 
 
 @dataclass(frozen=True)
@@ -72,17 +87,22 @@ def build_final_entry_decision(
         entry_type=entry_type,
         reason_code=momentum_reason_code,
     )
+    is_paper_only = is_paper_only_entry(
+        entry_type=entry_type,
+        reason_code=momentum_reason_code,
+    )
     trace: Dict[str, Any] = {
         "strategy_version": strategy_version,
         "legacy_filter_enabled": bool(legacy_filter_enabled),
         "entry_type": entry_type,
         "position_size_multiplier": position_size_multiplier,
         "paper_only_breakout_probe": bool(is_breakout_probe),
-        "blocked_live_breakout_probe": bool(is_breakout_probe),
+        "paper_only_strategy": bool(is_paper_only),
+        "blocked_live_breakout_probe": bool(is_paper_only),
         "live_block_reason_code": LIVE_BREAKOUT_BLOCK_REASON_CODE
-        if is_breakout_probe
+        if is_paper_only
         else "",
-        "live_blocked_by": LIVE_BREAKOUT_BLOCKED_BY if is_breakout_probe else "",
+        "live_blocked_by": LIVE_BREAKOUT_BLOCKED_BY if is_paper_only else "",
         "momentum_decision": {
             "action": momentum_action,
             "reason_code": momentum_reason_code,
@@ -130,6 +150,26 @@ def build_final_entry_decision(
     trace["legacy_veto_applied"] = legacy_veto_applied
     trace["legacy_veto_ignored"] = legacy_veto_ignored
 
+    if is_paper_only and not is_breakout_probe:
+        return FinalEntryDecision(
+            allowed=True,
+            status="ready",
+            reason_code=FINAL_REASON_PAPER_ONLY_STRATEGY,
+            final_reason="Momentum strategy is paper-only; live orders are blocked",
+            strategy_version=strategy_version,
+            legacy_filter_enabled=bool(legacy_filter_enabled),
+            momentum_decision=momentum_action,
+            momentum_reason_code=momentum_reason_code,
+            legacy_decision=legacy_status or "not_evaluated",
+            legacy_reason_code=legacy_reason_code,
+            blocked_by="",
+            entry_type=entry_type,
+            position_size_multiplier=position_size_multiplier,
+            legacy_veto_applied=legacy_veto_applied,
+            legacy_veto_ignored=False,
+            decision_trace=trace,
+        )
+
     if legacy_veto_applied:
         status = "blocked" if legacy_status == "blocked" else "wait"
         reason_code = "FINAL_LEGACY_VETO_{}".format(legacy_reason_code or legacy_status or "NOT_READY")
@@ -154,13 +194,16 @@ def build_final_entry_decision(
             decision_trace=trace,
         )
 
-    if is_breakout_probe:
+    if is_paper_only:
+        reason_code = FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE if is_breakout_probe else FINAL_REASON_PAPER_ONLY_STRATEGY
         return FinalEntryDecision(
             allowed=True,
             status="ready",
-            reason_code=FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE,
+            reason_code=reason_code,
             final_reason=(
                 "Momentum breakout probe is paper-only; live orders are blocked"
+                if is_breakout_probe
+                else "Momentum strategy is paper-only; live orders are blocked"
             ),
             strategy_version=strategy_version,
             legacy_filter_enabled=bool(legacy_filter_enabled),

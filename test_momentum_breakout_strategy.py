@@ -130,6 +130,96 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
 
         self.assertEqual(decision.action, EntryDecision.BLOCK_CHASE)
 
+    def test_midday_vwap_reclaim_is_paper_only_buy(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig(candidate_expiry_seconds=10_000_000_000))
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("10:45:00"),
+                current_price=10_200,
+                intraday_vwap=10_100,
+                high_since_capture=10_600,
+                turnover_speed_per_min=350_000_000,
+                volume_ratio=0.8,
+                volume_ratio_1m=1.0,
+                volume_ratio_5m=0.7,
+                short_ma=10_050,
+                chejan_strength=130.0,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "MIDDAY_VWAP_RECLAIM_PAPER_ONLY")
+        self.assertEqual(decision.entry_type, "MIDDAY_VWAP_RECLAIM")
+        self.assertEqual(decision.metrics["orderable_live"], 0.0)
+
+    def test_afternoon_second_wave_is_evaluated_as_paper_strategy(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig(candidate_expiry_seconds=10_000_000_000))
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("13:30:00"),
+                current_price=10_200,
+                intraday_vwap=10_050,
+                prior_high=10_500,
+                high_since_capture=10_600,
+                short_ma=10_100,
+                turnover_speed_per_min=350_000_000,
+                chejan_strength=125.0,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "AFTERNOON_SECOND_WAVE_PAPER_ONLY")
+        self.assertEqual(decision.entry_type, "AFTERNOON_SECOND_WAVE")
+
+    def test_after_cutoff_closing_strength_is_paper_only(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig(candidate_expiry_seconds=10_000_000_000))
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("14:25:00"),
+                current_price=10_200,
+                intraday_vwap=10_050,
+                high_since_capture=10_600,
+                turnover_speed_per_min=350_000_000,
+                chejan_strength=170.0,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "CLOSING_STRENGTH_PAPER_ONLY")
+        self.assertEqual(decision.entry_type, "CLOSING_STRENGTH")
+
+    def test_strong_chase_candidate_becomes_trend_continuation_paper_only(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(
+                max_chase_distance_pct=0.03,
+                max_signal_candle_range_pct=0.20,
+                max_recent_low_to_current_pct=0.20,
+                max_extension_from_vwap_pct=0.20,
+                max_extension_from_short_ma_pct=0.20,
+                max_position_in_signal_candle_pct=1.0,
+                candidate_expiry_seconds=10_000_000_000,
+            )
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("09:40:00"),
+                current_price=10_500,
+                high_since_capture=10_500,
+                intraday_vwap=10_200,
+                short_ma=10_100,
+                chejan_strength=170.0,
+                upper_wick_ratio=0.10,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "TREND_CONTINUATION_PAPER_ONLY")
+        self.assertEqual(decision.entry_type, "TREND_CONTINUATION")
+
     def test_rejects_when_strength_or_vwap_fails(self):
         strategy = MomentumBreakoutStrategy(TradeConfig())
 
@@ -323,6 +413,26 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
 
         self.assertEqual(decision.action, EntryDecision.REJECT)
         self.assertEqual(decision.reason_code, "WEAK_VOLUME_RATIO")
+
+    def test_weak_volume_relief_after_0930_is_paper_only(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(min_turnover_speed_per_min=999_999_999, candidate_expiry_seconds=10_000_000_000)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("09:45:00"),
+                volume_ratio=0.5,
+                turnover_speed_per_min=350_000_000,
+                recent_low_to_current_pct=0.0,
+                chejan_strength=140.0,
+                intraday_vwap=9_800,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "WEAK_VOLUME_RELIEF_PAPER_ONLY")
+        self.assertEqual(decision.entry_type, "WEAK_VOLUME_RELIEF_PAPER_ONLY")
 
     def test_first_pullback_leader_turnover_relief_allows_weak_volume_ratio(self):
         strategy = MomentumBreakoutStrategy(

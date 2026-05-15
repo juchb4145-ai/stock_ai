@@ -10,7 +10,7 @@ from typing import Dict, Optional, Sequence
 
 from bars import MinuteBar
 from candidate_registry import Candidate
-from time_policy import TimeDecision, TimePolicy
+from time_policy import TimeDecision, TimePolicy, parse_clock
 from trade_config import TRADE_CONFIG, TradeConfig
 
 
@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 ENTRY_TYPE_BREAKOUT_SMALL = "BREAKOUT_SMALL"
 ENTRY_TYPE_PULLBACK_RECLAIM = "PULLBACK_RECLAIM"
+ENTRY_TYPE_MIDDAY_VWAP_RECLAIM = "MIDDAY_VWAP_RECLAIM"
+ENTRY_TYPE_AFTERNOON_SECOND_WAVE = "AFTERNOON_SECOND_WAVE"
+ENTRY_TYPE_CLOSING_STRENGTH = "CLOSING_STRENGTH"
+ENTRY_TYPE_TREND_CONTINUATION = "TREND_CONTINUATION"
+ENTRY_TYPE_WEAK_VOLUME_RELIEF = "WEAK_VOLUME_RELIEF_PAPER_ONLY"
 
 
 class EntryDecision(str, Enum):
@@ -130,6 +135,7 @@ class MomentumBreakoutStrategy:
         now_ts = ctx.now_ts or time.time()
         age = c.age_seconds(now_ts)
         metrics = self._metrics(ctx, age)
+        metrics["paper_strategy_type"] = self.time_policy.paper_strategy_type(now=now_ts)
         late_a_grade_candidate = self._late_a_grade_candidate(ctx, metrics)
         min_observation_sec = self._min_observation_seconds(late_a_grade_candidate)
         metrics["min_observation_sec"] = float(min_observation_sec)
@@ -152,10 +158,16 @@ class MomentumBreakoutStrategy:
             metrics["time_policy_reason_code"] = time_decision.reason_code
             metrics["time_policy_config_version"] = time_decision.config_version
             if not time_decision.allowed:
-                return self._time_policy_block(time_decision, metrics)
+                paper_window_type = self.time_policy.paper_strategy_type(now=now_ts)
+                metrics["paper_strategy_type"] = paper_window_type
+                if not paper_window_type:
+                    return self._time_policy_block(time_decision, metrics)
             cutoff_block = self._entry_cutoff_block(ctx, metrics, age, min_observation_sec)
             if cutoff_block is not None:
-                return cutoff_block
+                paper_window_type = self.time_policy.paper_strategy_type(now=now_ts)
+                metrics["paper_strategy_type"] = paper_window_type
+                if not paper_window_type:
+                    return cutoff_block
 
         if c.is_expired(now=now_ts, expiry_seconds=self.config.candidate_expiry_seconds):
             return MomentumDecision(
@@ -206,6 +218,9 @@ class MomentumBreakoutStrategy:
         upper_wick_ratio = float(ctx.upper_wick_ratio or 0.0)
         intraday_vwap = float(ctx.intraday_vwap or 0.0)
         bullish_reversal = self._bullish_reversal(ctx.minute_bars)
+        paper_decision = self._paper_strategy_decision(ctx, metrics, bullish_reversal)
+        if paper_decision is not None:
+            return paper_decision
 
         if spread_rate < 0 or spread_rate > self.config.max_spread_pct:
             if not self._conditional_spread_relief(ctx, metrics, bullish_reversal):
@@ -244,6 +259,9 @@ class MomentumBreakoutStrategy:
             metrics["chase_distance_pct"] > self.config.max_chase_distance_pct
             and not bool(metrics.get("first_pullback_ready", 0.0))
         ):
+            trend_decision = self._trend_continuation_decision(ctx, metrics)
+            if trend_decision is not None:
+                return trend_decision
             return MomentumDecision(
                 EntryDecision.BLOCK_CHASE,
                 "chase distance too high {:.2%} > {:.2%}".format(
@@ -623,6 +641,16 @@ class MomentumBreakoutStrategy:
             volume_ok=volume_ok,
             turnover_ok=turnover_ok,
         ):
+            if metrics.get("weak_volume_paper_only", 0.0) > 0.0:
+                ratio = float(metrics.get("weak_volume_position_size_multiplier", 0.25) or 0.25)
+                return self._paper_buy(
+                    ctx,
+                    metrics,
+                    reason="weak volume relief paper-only",
+                    reason_code="WEAK_VOLUME_RELIEF_PAPER_ONLY",
+                    entry_type=ENTRY_TYPE_WEAK_VOLUME_RELIEF,
+                    ratio=ratio,
+                )
             return None
         if not volume_ok:
             return MomentumDecision(
@@ -678,20 +706,34 @@ class MomentumBreakoutStrategy:
             metrics.get("effective_pullback_entry_pct", self.config.pullback_entry_pct)
         ):
             return False
+        relaxed_paper_only = False
         if metrics.get("recent_low_to_current_pct", 0.0) < float(
             getattr(self.config, "weak_volume_partial_min_rebound_pct", 0.0) or 0.0
         ):
-            return False
+            relaxed_paper_only = (
+                float(ctx.chejan_strength or 0.0) >= 130.0
+                and float(ctx.turnover_speed_per_min or 0.0) >= 300_000_000.0
+                and bool(metrics.get("vwap_support_ok", 0.0))
+                and float(ctx.spread_rate or 0.0) <= self.config.max_spread_pct
+                and self._after_clock(ctx.now_ts, "09:30:00")
+            )
+            if not relaxed_paper_only:
+                return False
 
         metrics["flow_score_bucket"] = "weak_volume_partial_pullback"
         metrics["flow_gate_ok"] = 1.0
         metrics["weak_volume_partial_relief"] = 1.0
+        metrics["weak_volume_paper_only"] = 1.0 if relaxed_paper_only else 0.0
         metrics["weak_volume_partial_min_ratio"] = min_partial_volume
         metrics["weak_volume_position_size_multiplier"] = float(
             getattr(self.config, "weak_volume_partial_position_size_multiplier", 0.25)
             or 0.25
         )
         return True
+
+    def _after_clock(self, now: float, clock_text: str) -> bool:
+        local_dt = self.time_policy._coerce_datetime(now or time.time())
+        return local_dt.time().replace(tzinfo=None) >= parse_clock(clock_text)
 
     @staticmethod
     def _entry_size_multiplier(metrics: Dict[str, float], default: float) -> float:
@@ -778,6 +820,160 @@ class MomentumBreakoutStrategy:
                 "BLOCK_SHORT_MA_EXTENSION",
                 chase_risk_score=metrics["chase_risk_score"],
                 metrics=metrics,
+            )
+        return None
+
+    def _paper_strategy_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> Optional[MomentumDecision]:
+        strategy_type = str(metrics.get("paper_strategy_type") or "")
+        if not strategy_type:
+            return None
+        if strategy_type == ENTRY_TYPE_MIDDAY_VWAP_RECLAIM:
+            return self._midday_vwap_reclaim_decision(ctx, metrics, bullish_reversal)
+        if strategy_type == ENTRY_TYPE_AFTERNOON_SECOND_WAVE:
+            return self._afternoon_second_wave_decision(ctx, metrics, bullish_reversal)
+        if strategy_type == "CLOSING_STRENGTH":
+            return self._closing_strength_decision(ctx, metrics, bullish_reversal)
+        return None
+
+    def _paper_buy(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        *,
+        reason: str,
+        reason_code: str,
+        entry_type: str,
+        ratio: float = 0.25,
+    ) -> MomentumDecision:
+        paper_metrics = dict(metrics)
+        paper_metrics["paper_only_strategy"] = 1.0
+        paper_metrics["orderable_live"] = 0.0
+        paper_metrics["strategy_type"] = entry_type
+        return MomentumDecision(
+            EntryDecision.BUY,
+            reason,
+            reason_code,
+            chase_risk_score=paper_metrics.get("chase_risk_score", 0.0),
+            entry_ratio=ratio,
+            entry_type=entry_type,
+            position_size_multiplier=ratio,
+            metrics=paper_metrics,
+        )
+
+    def _midday_vwap_reclaim_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> Optional[MomentumDecision]:
+        vwap = float(ctx.intraday_vwap or 0.0)
+        turnover_ok = float(ctx.turnover_speed_per_min or 0.0) >= 300_000_000.0
+        volume_reaccel = float(ctx.volume_ratio_1m or 0.0) >= float(ctx.volume_ratio_5m or 0.0)
+        pulled_back = 0.003 <= float(metrics.get("observed_pullback_from_high_pct", 0.0)) <= 0.06
+        if (
+            vwap > 0
+            and ctx.current_price >= vwap
+            and bullish_reversal
+            and float(ctx.chejan_strength or 0.0) >= 120.0
+            and float(ctx.spread_rate or 0.0) <= self.config.max_spread_pct
+            and pulled_back
+            and (float(ctx.volume_ratio or 0.0) >= self.config.min_volume_ratio or turnover_ok or volume_reaccel)
+        ):
+            return self._paper_buy(
+                ctx,
+                metrics,
+                reason="midday VWAP reclaim paper-only",
+                reason_code="MIDDAY_VWAP_RECLAIM_PAPER_ONLY",
+                entry_type=ENTRY_TYPE_MIDDAY_VWAP_RECLAIM,
+                ratio=0.25,
+            )
+        return None
+
+    def _afternoon_second_wave_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> Optional[MomentumDecision]:
+        vwap = float(ctx.intraday_vwap or 0.0)
+        prior_high = float(metrics.get("prior_high") or 0.0)
+        room_to_high = prior_high / float(ctx.current_price or 1) - 1.0 if prior_high > 0 and ctx.current_price > 0 else 0.0
+        pullback = float(metrics.get("observed_pullback_from_high_pct", 0.0))
+        turnover_ok = float(ctx.turnover_speed_per_min or 0.0) >= 300_000_000.0
+        short_ma_ok = self._missing_number(ctx.short_ma) or float(ctx.short_ma or 0.0) <= 0 or ctx.current_price > float(ctx.short_ma or 0.0)
+        if (
+            vwap > 0
+            and ctx.current_price > vwap
+            and short_ma_ok
+            and 0.01 <= pullback <= 0.06
+            and turnover_ok
+            and float(ctx.chejan_strength or 0.0) >= 110.0
+            and float(ctx.chejan_strength or 0.0) <= 300.0
+            and float(ctx.spread_rate or 0.0) <= self.config.max_spread_pct
+            and room_to_high >= 0.015
+            and bullish_reversal
+        ):
+            paper_metrics = dict(metrics)
+            paper_metrics["stop_policy"] = "VWAP_LOST_OR_PREV_PULLBACK_LOW"
+            paper_metrics["take_profit_policy"] = "FIRST_0P8_TO_1P2"
+            return self._paper_buy(
+                ctx,
+                paper_metrics,
+                reason="afternoon second wave paper-only",
+                reason_code="AFTERNOON_SECOND_WAVE_PAPER_ONLY",
+                entry_type=ENTRY_TYPE_AFTERNOON_SECOND_WAVE,
+                ratio=0.25,
+            )
+        return None
+
+    def _closing_strength_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> Optional[MomentumDecision]:
+        if (
+            float(ctx.intraday_vwap or 0.0) > 0
+            and ctx.current_price > float(ctx.intraday_vwap or 0.0)
+            and float(ctx.chejan_strength or 0.0) >= 150.0
+            and float(ctx.spread_rate or 0.0) <= self.config.max_spread_pct
+            and bullish_reversal
+        ):
+            return self._paper_buy(
+                ctx,
+                metrics,
+                reason="closing strength paper-only",
+                reason_code="CLOSING_STRENGTH_PAPER_ONLY",
+                entry_type=ENTRY_TYPE_CLOSING_STRENGTH,
+                ratio=0.15,
+            )
+        return None
+
+    def _trend_continuation_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+    ) -> Optional[MomentumDecision]:
+        if (
+            float(metrics.get("chase_distance_pct", 0.0)) > 0.04
+            and float(ctx.chejan_strength or 0.0) >= 150.0
+            and float(ctx.intraday_vwap or 0.0) > 0
+            and ctx.current_price > float(ctx.intraday_vwap or 0.0)
+            and float(ctx.upper_wick_ratio or 0.0) <= 0.25
+            and self._bullish_reversal(ctx.minute_bars)
+        ):
+            return self._paper_buy(
+                ctx,
+                metrics,
+                reason="trend continuation chase candidate paper-only",
+                reason_code="TREND_CONTINUATION_PAPER_ONLY",
+                entry_type=ENTRY_TYPE_TREND_CONTINUATION,
+                ratio=0.15,
             )
         return None
 
@@ -972,6 +1168,7 @@ class MomentumBreakoutStrategy:
             "turnover_rank_sector": float(ctx.turnover_rank_sector or 0),
             "leader_score": float(ctx.leader_score or 0.0),
             "is_above_vwap": is_above_vwap,
+            "vwap_support_ok": 1.0 if vwap_support_ok else 0.0,
             "upper_wick_ratio": upper_wick_ratio,
             "signal_candle_range_pct": signal_candle_range_pct,
             "position_in_signal_candle_pct": position_in_signal_candle_pct,
@@ -1319,6 +1516,9 @@ class MomentumBreakoutStrategy:
             "extension_from_vwap_pct": self._optional_number(metrics.get("extension_from_vwap_pct")),
             "extension_from_short_ma_pct": self._optional_number(metrics.get("extension_from_short_ma_pct")),
             "entry_type": self._entry_type(decision),
+            "strategy_type": metrics.get("strategy_type") or decision.entry_type,
+            "paper_only_strategy": bool(metrics.get("paper_only_strategy", 0.0)),
+            "orderable_live": False if metrics.get("orderable_live", 1.0) <= 0.0 else True,
             "position_size_multiplier": self._optional_number(decision.position_size_multiplier),
             "flow_score_bucket": metrics.get("flow_score_bucket"),
             "flow_gate_ok": self._optional_number(metrics.get("flow_gate_ok")),

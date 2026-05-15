@@ -14,7 +14,7 @@
 - win rate: missing
 - realized pnl: missing
 - mode: paper
-- generated_at: 2026-05-15 16:20:55
+- generated_at: 2026-05-15 20:45:54
 
 ## Daily Buy Gate Funnel
 | metric | value |
@@ -344,13 +344,16 @@
 - previous relaxed pullback would_buy_count meant pullback-threshold signal only. It is now reported as signal rows to avoid implying that VWAP, volume, time policy, and order guard also passed.
 
 ## Time Bucket Analysis
-| time_bucket | capture_count | traded_count | non_traded_count | missed_opportunity_count | good_reject_count | avg_mfe_pct | avg_mae_pct | n_mfe | n_mae |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 09:00~09:30 | 448 | 0 | 448 | 179 | 268 | +4.61% | -10.07% | 448 | 448 |
-| 09:30~10:30 | 80 | 0 | 80 | 21 | 59 | +3.06% | -8.33% | 80 | 80 |
-| 10:30~13:00 | 157 | 0 | 157 | 7 | 0 | +4.78% | -5.72% | 33 | 33 |
-| 13:00~14:20 | 59 | 0 | 59 | 15 | 44 | +2.65% | -2.79% | 59 | 59 |
-| 14:20 이후 | 26 | 0 | 26 | 2 | 0 | +4.53% | -2.90% | 5 | 5 |
+| time_bucket | capture_count | strategy_candidate_count | paper_only_count | traded_count | non_traded_count | missed_opportunity_count | good_reject_count | avg_mfe_pct | avg_mae_pct | n_mfe | n_mae |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 09:00~09:30 | 448 | 0 | 0 | 0 | 448 | 179 | 268 | +4.61% | -10.07% | 448 | 448 |
+| 09:30~10:30 | 80 | 0 | 0 | 0 | 80 | 21 | 59 | +3.06% | -8.33% | 80 | 80 |
+| 10:30~13:00 | 157 | 0 | 0 | 0 | 157 | 7 | 0 | +4.78% | -5.72% | 33 | 33 |
+| 13:00~14:20 | 59 | 0 | 0 | 0 | 59 | 15 | 44 | +2.65% | -2.79% | 59 | 59 |
+| 14:20 이후 | 26 | 0 | 0 | 0 | 26 | 2 | 0 | +4.53% | -2.90% | 5 | 5 |
+
+## Paper Strategy Performance
+No paper-only strategy candidates.
 
 ## Parameter Tuning Hints
 - BLOCK_CHASE has repeated upside misses. Review chase distance and wick thresholds manually.

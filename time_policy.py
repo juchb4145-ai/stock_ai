@@ -137,6 +137,9 @@ class TimePolicy:
         self.candidate_capture_start = parse_clock(config.candidate_capture_start)
         self.candidate_capture_end = parse_clock(config.candidate_capture_end)
         self.entry_windows = parse_windows(config.entry_windows)
+        self.midday_paper_windows = parse_windows(config.midday_paper_window)
+        self.afternoon_entry_windows = parse_windows(config.afternoon_entry_window)
+        self.closing_paper_windows = parse_windows(config.closing_paper_window)
         self.no_new_entry_after = parse_clock(config.no_new_entry_after)
         self.late_a_grade_entry_start = parse_clock(config.late_a_grade_entry_start)
         self.late_a_grade_entry_end = parse_clock(config.late_a_grade_entry_end)
@@ -638,6 +641,31 @@ class TimePolicy:
             "manage_allowed": bool(manage_allowed),
             "analysis_allowed": bool(capture_allowed),
         }
+
+    def paper_strategy_type(
+        self,
+        *,
+        now: Optional[object] = None,
+    ) -> str:
+        """Classify non-live evaluation windows for analysis/paper strategies."""
+        local_dt = self._coerce_datetime(now)
+        if self.calendar.session_for(local_dt) != SESSION_REGULAR:
+            return ""
+        clock = local_dt.time().replace(tzinfo=None)
+        if self._in_windows(clock, self.midday_paper_windows):
+            return "MIDDAY_VWAP_RECLAIM"
+        if self._in_windows(clock, self.afternoon_entry_windows):
+            return "AFTERNOON_SECOND_WAVE"
+        if self._in_windows(clock, self.closing_paper_windows):
+            return "CLOSING_STRENGTH"
+        return ""
+
+    def paper_strategy_allowed(
+        self,
+        *,
+        now: Optional[object] = None,
+    ) -> bool:
+        return bool(self.paper_strategy_type(now=now))
 
     def entry_window_deadline(
         self,

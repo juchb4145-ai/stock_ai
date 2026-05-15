@@ -54,18 +54,30 @@ class TimePolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.action, ALLOW_MANAGE_ONLY)
         self.assertIn("13:00:00", decision.next_allowed_time)
+        self.assertEqual(
+            TimePolicy(TradeConfig()).paper_strategy_type(now=_at("10:45:00")),
+            "MIDDAY_VWAP_RECLAIM",
+        )
 
     def test_allows_secondary_entry_window(self):
         decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("13:30:00"))
 
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.action, ALLOW_ENTRY)
+        self.assertEqual(
+            TimePolicy(TradeConfig()).paper_strategy_type(now=_at("13:30:00")),
+            "AFTERNOON_SECOND_WAVE",
+        )
 
     def test_blocks_after_new_entry_cutoff(self):
         decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("14:25:00"))
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason_code, BLOCK_AFTER_ENTRY_CUTOFF)
+        self.assertEqual(
+            TimePolicy(TradeConfig()).paper_strategy_type(now=_at("14:25:00")),
+            "CLOSING_STRENGTH",
+        )
 
     def test_force_exit_window_allows_management_only(self):
         policy = TimePolicy(TradeConfig())

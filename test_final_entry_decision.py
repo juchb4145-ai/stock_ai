@@ -289,6 +289,23 @@ class FinalEntryDecisionTests(unittest.TestCase):
         self.assertTrue(final.allowed)
         self.assertEqual(final.reason_code, FINAL_REASON_PAPER_ONLY_BREAKOUT_PROBE)
         self.assertEqual(final.decision_trace["live_block_reason_code"], LIVE_BREAKOUT_BLOCK_REASON_CODE)
+
+    def test_midday_paper_only_strategy_records_even_with_legacy_wait(self):
+        final = build_final_entry_decision(
+            momentum_action="BUY",
+            momentum_reason_code="MIDDAY_VWAP_RECLAIM_PAPER_ONLY",
+            momentum_reason="midday paper",
+            legacy_status="wait",
+            legacy_reason_code="SAFE_PULLBACK_SHALLOW",
+            legacy_reason="wait pullback",
+            entry_type="MIDDAY_VWAP_RECLAIM",
+            position_size_multiplier=0.25,
+        )
+
+        self.assertTrue(final.allowed)
+        self.assertEqual(final.reason_code, "FINAL_PAPER_ONLY_STRATEGY")
+        self.assertTrue(final.legacy_veto_applied)
+        self.assertTrue(final.decision_trace["paper_only_strategy"])
         self.assertTrue(final.decision_trace["blocked_live_breakout_probe"])
 
     def test_place_buy_order_logs_live_breakout_block_without_send_order(self):

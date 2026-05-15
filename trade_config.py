@@ -220,6 +220,9 @@ class TradeConfig:
     candidate_capture_start: str = "09:00:00"
     candidate_capture_end: str = "14:50:00"
     entry_windows: str = "09:03:00-10:30:00,13:00:00-14:20:00"
+    midday_paper_window: str = "10:30:00-13:00:00"
+    afternoon_entry_window: str = "13:00:00-14:20:00"
+    closing_paper_window: str = "14:20:00-14:50:00"
     no_new_entry_after: str = "14:20:00"
     force_exit_start: str = "15:05:00"
     force_exit_deadline: str = "15:19:30"
@@ -817,6 +820,18 @@ class TradeConfig:
             entry_windows=_env_str(
                 "KIWOOM_ENTRY_WINDOWS",
                 cls.entry_windows,
+            ),
+            midday_paper_window=_env_str(
+                "KIWOOM_MIDDAY_PAPER_WINDOW",
+                cls.midday_paper_window,
+            ),
+            afternoon_entry_window=_env_str(
+                "KIWOOM_AFTERNOON_ENTRY_WINDOW",
+                cls.afternoon_entry_window,
+            ),
+            closing_paper_window=_env_str(
+                "KIWOOM_CLOSING_PAPER_WINDOW",
+                cls.closing_paper_window,
             ),
             no_new_entry_after=_env_str(
                 "KIWOOM_NO_NEW_ENTRY_AFTER",
