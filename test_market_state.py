@@ -153,6 +153,30 @@ class MarketStateCacheTests(unittest.TestCase):
         snap = cache.snapshot()
         self.assertEqual(snap.market_regime, ms.REGIME_RISK_OFF)
 
+    def test_snapshot_for_market_reflects_kospi(self):
+        cache = ms.MarketStateCache()
+        cache.update(ms.KOSPI_CODE, 2_500.0, _ts(0))
+        cache.update(ms.KOSPI_CODE, 2_530.0, _ts(2, 30))
+        snap = cache.snapshot_for_market("KOSPI")
+        self.assertEqual(snap.index_code, ms.KOSPI_CODE)
+        self.assertEqual(snap.market_regime, ms.REGIME_STRONG)
+
+    def test_snapshot_for_market_reflects_kosdaq_when_only_kosdaq_received(self):
+        cache = ms.MarketStateCache()
+        cache.update(ms.KOSDAQ_CODE, 870.0, _ts(0))
+        cache.update(ms.KOSDAQ_CODE, 855.0, _ts(2, 30))
+        snap = cache.snapshot_for_market("KOSDAQ")
+        self.assertEqual(snap.index_code, ms.KOSDAQ_CODE)
+        self.assertEqual(snap.market_regime, ms.REGIME_RISK_OFF)
+
+    def test_snapshot_for_symbol_unknown_market_falls_back_neutral(self):
+        cache = ms.MarketStateCache()
+        ctx = cache.snapshot_for_symbol("005930", symbol_market="unknown")
+        self.assertEqual(ctx.symbol_market, "unknown")
+        self.assertEqual(ctx.primary_index_code, "")
+        self.assertEqual(ctx.primary_market_regime, ms.REGIME_NEUTRAL)
+        self.assertIn("unknown market fallback", ctx.market_gate_reason)
+
     def test_unknown_index_code_ignored(self):
         cache = ms.MarketStateCache()
         cache.update("999", 100.0, _ts(0))  # 등록 안 된 코드

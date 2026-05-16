@@ -168,6 +168,21 @@ class TradeConfig:
     breakout_probe_entry_ratio: float = 0.0
     legacy_filter_enabled: bool = True
     legacy_filter_veto_breakout_small: bool = False
+    sector_state_enabled: bool = True
+    sector_gate_enforcement_enabled: bool = False
+    sector_map_path: str = "data/sector_map.csv"
+    sector_index_realtime_enabled: bool = True
+    sector_realtime_screen_base: str = "0180"
+    sector_realtime_codes_per_screen: int = 100
+    theme_state_enabled: bool = True
+    theme_gate_enforcement_enabled: bool = False
+    theme_map_path: str = "data/theme_map.csv"
+    sector_strong_score_bonus: float = 0.05
+    sector_weak_score_penalty: float = 0.05
+    theme_strong_score_bonus: float = 0.03
+    theme_weak_score_penalty: float = 0.03
+    sector_min_active_symbols_for_rank: int = 1
+    theme_min_active_symbols: int = 2
 
     max_positions: int = 3
     max_daily_buy_count: int = 20
@@ -622,6 +637,60 @@ class TradeConfig:
             legacy_filter_veto_breakout_small=_env_bool(
                 "KIWOOM_LEGACY_FILTER_VETO_BREAKOUT_SMALL",
                 cls.legacy_filter_veto_breakout_small,
+            ),
+            sector_state_enabled=_env_bool(
+                "KIWOOM_SECTOR_STATE_ENABLED",
+                cls.sector_state_enabled,
+            ),
+            sector_gate_enforcement_enabled=_env_bool(
+                "KIWOOM_SECTOR_GATE_ENFORCEMENT_ENABLED",
+                cls.sector_gate_enforcement_enabled,
+            ),
+            sector_map_path=_env_str("KIWOOM_SECTOR_MAP_PATH", cls.sector_map_path),
+            sector_index_realtime_enabled=_env_bool(
+                "KIWOOM_SECTOR_INDEX_REALTIME_ENABLED",
+                cls.sector_index_realtime_enabled,
+            ),
+            sector_realtime_screen_base=_env_str(
+                "KIWOOM_SECTOR_REALTIME_SCREEN_BASE",
+                cls.sector_realtime_screen_base,
+            ),
+            sector_realtime_codes_per_screen=_env_int(
+                "KIWOOM_SECTOR_REALTIME_CODES_PER_SCREEN",
+                cls.sector_realtime_codes_per_screen,
+            ),
+            theme_state_enabled=_env_bool(
+                "KIWOOM_THEME_STATE_ENABLED",
+                cls.theme_state_enabled,
+            ),
+            theme_gate_enforcement_enabled=_env_bool(
+                "KIWOOM_THEME_GATE_ENFORCEMENT_ENABLED",
+                cls.theme_gate_enforcement_enabled,
+            ),
+            theme_map_path=_env_str("KIWOOM_THEME_MAP_PATH", cls.theme_map_path),
+            sector_strong_score_bonus=_env_float(
+                "KIWOOM_SECTOR_STRONG_SCORE_BONUS",
+                cls.sector_strong_score_bonus,
+            ),
+            sector_weak_score_penalty=_env_float(
+                "KIWOOM_SECTOR_WEAK_SCORE_PENALTY",
+                cls.sector_weak_score_penalty,
+            ),
+            theme_strong_score_bonus=_env_float(
+                "KIWOOM_THEME_STRONG_SCORE_BONUS",
+                cls.theme_strong_score_bonus,
+            ),
+            theme_weak_score_penalty=_env_float(
+                "KIWOOM_THEME_WEAK_SCORE_PENALTY",
+                cls.theme_weak_score_penalty,
+            ),
+            sector_min_active_symbols_for_rank=_env_int(
+                "KIWOOM_SECTOR_MIN_ACTIVE_SYMBOLS_FOR_RANK",
+                cls.sector_min_active_symbols_for_rank,
+            ),
+            theme_min_active_symbols=_env_int(
+                "KIWOOM_THEME_MIN_ACTIVE_SYMBOLS",
+                cls.theme_min_active_symbols,
             ),
             max_positions=_env_int("KIWOOM_MAX_POSITIONS", cls.max_positions),
             max_daily_buy_count=_env_int(

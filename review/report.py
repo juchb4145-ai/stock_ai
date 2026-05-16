@@ -16,6 +16,7 @@ from .loader import (
     CONDITION_COMBO_QUANT_ONLY,
     CONDITION_COMBO_UNKNOWN,
     CONDITION_META_FIELDS,
+    SECTOR_THEME_FIELDS,
     Trade,
     normalize_condition_combo,
 )
@@ -59,6 +60,7 @@ CSV_COLUMNS = [
     "entry_vs_vwap_pct", "vwap_support_ok", "volume_ratio_1m", "volume_ratio_5m",
     "leader_score", "turnover_speed_per_min", "trade_value_since_capture",
     "turnover_rank_market", "turnover_rank_sector",
+    *SECTOR_THEME_FIELDS,
     "breakout_candle_body_pct", "upper_wick_pct",
     "prior_3m_return_pct", "prior_5m_return_pct",
     # 기본 피처
@@ -151,6 +153,7 @@ def _trade_row(trade: Trade) -> dict:
         "trade_value_since_capture": f.get("trade_value_since_capture"),
         "turnover_rank_market": f.get("turnover_rank_market"),
         "turnover_rank_sector": f.get("turnover_rank_sector"),
+        **{field: f.get(field, "") for field in SECTOR_THEME_FIELDS},
         "breakout_candle_body_pct": f.get("breakout_candle_body_pct"),
         "upper_wick_pct": f.get("upper_wick_pct"),
         "prior_3m_return_pct": f.get("prior_3m_return_pct"),
@@ -408,6 +411,135 @@ def _leader_score_lines(trades: List[Trade]) -> List[str]:
     return lines
 
 
+def _feature_bucket(trade: Trade, field: str, default: str = "unknown") -> str:
+    value = trade.features.get(field, "")
+    value = str(value or "").strip()
+    return value if value else default
+
+
+def _max_return_25m(trade: Trade) -> Optional[float]:
+    values = [
+        trade.metrics.get("return_5m"),
+        trade.metrics.get("return_10m"),
+        trade.metrics.get("return_20m"),
+        trade.metrics.get("return_5m_intraday"),
+    ]
+    valid = _valid_numbers(values)
+    return max(valid) if valid else None
+
+
+def _group_feature_performance(trades: List[Trade], field: str) -> Dict[str, Dict[str, object]]:
+    groups: Dict[str, List[Trade]] = {}
+    for trade in trades:
+        groups.setdefault(_feature_bucket(trade, field), []).append(trade)
+
+    out: Dict[str, Dict[str, object]] = {}
+    for bucket, bucket_trades in groups.items():
+        closed = [t for t in bucket_trades if t.is_closed]
+        final_returns = _valid_numbers([t.final_return for t in closed])
+        max_returns = _valid_numbers([_max_return_25m(t) for t in bucket_trades])
+        out[bucket] = {
+            "trades": len(bucket_trades),
+            "ready": len(bucket_trades),
+            "avg_return": mean(final_returns) if final_returns else None,
+            "max_return_25m": mean(max_returns) if max_returns else None,
+        }
+    return out
+
+
+def _feature_performance_lines(trades: List[Trade], field: str, label: str) -> List[str]:
+    summary = _group_feature_performance(trades, field)
+    lines = [
+        f"| {label} | samples | ready | avg_return | avg_max_return_25m |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for bucket in sorted(summary):
+        stats = summary[bucket]
+        lines.append(
+            "| {bucket} | {samples} | {ready} | {avg_ret} | {max_ret} |".format(
+                bucket=bucket,
+                samples=stats["trades"],
+                ready=stats["ready"],
+                avg_ret="n/a" if stats["avg_return"] is None else "{:+.2%}".format(stats["avg_return"]),
+                max_ret="n/a" if stats["max_return_25m"] is None else "{:+.2%}".format(stats["max_return_25m"]),
+            )
+        )
+    return lines
+
+
+def _market_sector_combo_lines(trades: List[Trade]) -> List[str]:
+    groups: Dict[str, List[Trade]] = {}
+    for trade in trades:
+        market = _feature_bucket(trade, "market_regime")
+        sector = _feature_bucket(trade, "sector_regime")
+        groups.setdefault(f"{market}+{sector}", []).append(trade)
+
+    lines = [
+        "| market+sector | samples | avg_return | avg_max_return_25m |",
+        "|---|---:|---:|---:|",
+    ]
+    for bucket in sorted(groups):
+        bucket_trades = groups[bucket]
+        closed = [t for t in bucket_trades if t.is_closed]
+        final_returns = _valid_numbers([t.final_return for t in closed])
+        max_returns = _valid_numbers([_max_return_25m(t) for t in bucket_trades])
+        lines.append(
+            "| {bucket} | {samples} | {avg_ret} | {max_ret} |".format(
+                bucket=bucket,
+                samples=len(bucket_trades),
+                avg_ret="n/a" if not final_returns else "{:+.2%}".format(mean(final_returns)),
+                max_ret="n/a" if not max_returns else "{:+.2%}".format(mean(max_returns)),
+            )
+        )
+    return lines
+
+
+def _unknown_ratio_lines(trades: List[Trade]) -> List[str]:
+    total = len(trades)
+    if total <= 0:
+        return ["- no samples"]
+    sector_unknown = sum(1 for t in trades if _feature_bucket(t, "sector_regime") == "unknown")
+    theme_unknown = sum(1 for t in trades if _feature_bucket(t, "theme_regime") == "unknown")
+    return [
+        f"- sector unknown: **{sector_unknown}/{total} ({sector_unknown / total:.0%})**",
+        f"- theme unknown: **{theme_unknown}/{total} ({theme_unknown / total:.0%})**",
+    ]
+
+
+def _sector_theme_watchlist_lines(trades: List[Trade]) -> List[str]:
+    theme_strong_failed = [
+        t for t in trades
+        if _feature_bucket(t, "theme_regime") == "strong"
+        and t.is_closed
+        and (t.final_return is not None and t.final_return <= 0)
+    ]
+    sector_weak_success = [
+        t for t in trades
+        if _feature_bucket(t, "sector_regime") == "weak"
+        and t.is_closed
+        and (t.final_return is not None and t.final_return > 0)
+    ]
+    dry_run_candidates = [
+        t for t in trades
+        if _feature_bucket(t, "sector_gate_action", "") in ("dry_run_block_all", "dry_run_block_chase_only")
+        or _feature_bucket(t, "theme_gate_action", "") in ("dry_run_block_chase_only", "dry_run_reduce_chase")
+    ]
+
+    def _items(rows: List[Trade], limit: int = 8) -> str:
+        if not rows:
+            return "none"
+        return ", ".join(
+            f"{t.name or t.code}({t.code}, {'n/a' if t.final_return is None else f'{t.final_return:+.2%}'})"
+            for t in rows[:limit]
+        )
+
+    return [
+        f"- theme strong failed: {_items(theme_strong_failed)}",
+        f"- sector weak success: {_items(sector_weak_success)}",
+        f"- dry-run gate candidates: {_items(dry_run_candidates)}",
+    ]
+
+
 def _profit_factor_from_r(rs: List[float]):
     wins = sum(r for r in rs if r > 0)
     losses = -sum(r for r in rs if r < 0)
@@ -554,6 +686,24 @@ def write_markdown(
     out.append("")
     out.append("## leader_score bucket performance")
     out.extend(_leader_score_lines(trades))
+    out.append("")
+    out.append("## sector regime performance")
+    out.extend(_feature_performance_lines(trades, "sector_regime", "sector_regime"))
+    out.append("")
+    out.append("## sector gate dry-run performance")
+    out.extend(_feature_performance_lines(trades, "sector_gate_action", "sector_gate_action"))
+    out.append("")
+    out.append("## market+sector combo performance")
+    out.extend(_market_sector_combo_lines(trades))
+    out.append("")
+    out.append("## theme regime performance")
+    out.extend(_feature_performance_lines(trades, "theme_regime", "theme_regime"))
+    out.append("")
+    out.append("## sector/theme unknown ratio")
+    out.extend(_unknown_ratio_lines(trades))
+    out.append("")
+    out.append("## sector/theme dry-run review")
+    out.extend(_sector_theme_watchlist_lines(trades))
     out.append("")
     out.append("## 손실 큰 거래 Top 3")
     out.extend(_worst_trades_table(trades))

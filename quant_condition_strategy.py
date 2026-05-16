@@ -65,6 +65,12 @@ class QuantEntryDecision:
     stop_price: int = 0
     take_profit_price: int = 0
     safe_target_price: int = 0
+    sector_regime: str = ""
+    sector_gate_action: str = ""
+    sector_gate_reason: str = ""
+    theme_regime: str = ""
+    theme_gate_action: str = ""
+    theme_gate_reason: str = ""
 
     def to_prediction(
         self,
@@ -114,6 +120,12 @@ class QuantEntryDecision:
             "min_leader_score": self.min_leader_score,
             "volume_speed": 0.0,
             "spread_rate": 0.0,
+            "sector_regime": self.sector_regime,
+            "sector_gate_action": self.sector_gate_action,
+            "sector_gate_reason": self.sector_gate_reason,
+            "theme_regime": self.theme_regime,
+            "theme_gate_action": self.theme_gate_action,
+            "theme_gate_reason": self.theme_gate_reason,
         }
         if extra:
             prediction.update(extra)
@@ -133,6 +145,9 @@ class QuantConditionStrategy:
 
     def __init__(self, config: Optional[QuantStrategyConfig] = None):
         self.config = config or QuantStrategyConfig()
+
+    def sector_theme_quality_adjustment(self, sector_context=None, theme_context=None) -> float:
+        return 0.0
 
     def trigger_price(self, capture_price: int) -> int:
         if capture_price <= 0:
@@ -225,7 +240,18 @@ class QuantConditionStrategy:
         leader_score: Optional[float] = None,
         condition_combo: str = "",
         now_ts: Optional[float] = None,
+        market_context: Optional[Any] = None,
+        sector_context: Optional[Any] = None,
+        theme_context: Optional[Any] = None,
     ) -> QuantEntryDecision:
+        if market_context is not None:
+            market_state = (
+                getattr(market_context, "primary_market_regime", None)
+                or market_state
+                or "neutral"
+            )
+            if market_state == "unknown":
+                market_state = "neutral"
         min_chejan_strength = self.min_chejan_strength_for_market(market_state)
         min_leader_score = self.leader_score_threshold(
             condition_combo=condition_combo,
@@ -251,6 +277,8 @@ class QuantConditionStrategy:
         )
         strategy_pullback_basis_default = 0
         entry_pullback_eligible_default = False
+        sector_regime = getattr(sector_context, "sector_regime", "") if sector_context is not None else ""
+        theme_regime = getattr(theme_context, "theme_regime", "") if theme_context is not None else ""
 
         def decision(
             *,
@@ -302,6 +330,12 @@ class QuantConditionStrategy:
                 stop_price=stop_price,
                 take_profit_price=take_profit_price,
                 safe_target_price=safe_target_price,
+                sector_regime=sector_regime,
+                sector_gate_action=getattr(sector_context, "sector_gate_action", "") if sector_context is not None else "",
+                sector_gate_reason=getattr(sector_context, "sector_gate_reason", "") if sector_context is not None else "",
+                theme_regime=theme_regime,
+                theme_gate_action=getattr(theme_context, "theme_gate_action", "") if theme_context is not None else "",
+                theme_gate_reason=getattr(theme_context, "theme_gate_reason", "") if theme_context is not None else "",
             )
 
         if current_price <= 0:

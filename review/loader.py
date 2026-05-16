@@ -54,6 +54,35 @@ LEADER_FEATURE_FIELDS = (
     "turnover_rank_sector",
     "vwap_support_ok",
 )
+SECTOR_THEME_FIELDS = (
+    "symbol_market",
+    "sector_code",
+    "sector_name",
+    "sector_index_code",
+    "sector_regime",
+    "sector_pct",
+    "sector_slope_1m",
+    "sector_slope_3m",
+    "sector_drawdown_from_high",
+    "sector_relative_strength_vs_primary",
+    "sector_gate_action",
+    "sector_gate_reason",
+    "sector_ranked_count",
+    "primary_theme",
+    "theme_names",
+    "theme_regime",
+    "theme_member_count",
+    "theme_active_count",
+    "theme_rising_count",
+    "theme_falling_count",
+    "theme_avg_return",
+    "theme_top_return",
+    "theme_top_turnover",
+    "theme_leader_code",
+    "theme_leader_return",
+    "theme_gate_action",
+    "theme_gate_reason",
+)
 
 # 같은 buy_order 와 매칭할 dante 샘플 검색 윈도우(초). buy_order 시각 - 이 윈도우.
 DANTE_MATCH_WINDOW_SECONDS = 60
@@ -307,10 +336,12 @@ def _consume_buy_chejan(trade: Trade, row: dict) -> None:
 
 
 def _attach_row_features(trade: Trade, row: dict) -> None:
-    for key in LEADER_FEATURE_FIELDS:
+    for key in (*LEADER_FEATURE_FIELDS, *SECTOR_THEME_FIELDS):
         value = _parse_float(row.get(key))
         if value is not None and key not in trade.features:
             trade.features[key] = value
+        elif row.get(key, "") not in ("", None) and key not in trade.features:
+            trade.features[key] = row.get(key, "")
 
 
 def _consume_sell_chejan(trade: Trade, row: dict) -> None:
@@ -536,11 +567,14 @@ def _attach_dante_label(trade: Trade, samples: List[dict]) -> None:
         "upper_wick_ratio",
         "open_return",
         *LEADER_FEATURE_FIELDS,
+        *SECTOR_THEME_FIELDS,
     )
     for key in feature_keys:
         v = _parse_float(sample.get(key))
         if v is not None:
             trade.features[key] = v
+        elif sample.get(key, "") not in ("", None):
+            trade.features[key] = sample.get(key, "")
 
 
 # ---------------------------------------------------------------------------

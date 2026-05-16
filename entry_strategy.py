@@ -27,6 +27,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from bars import FiveMinIndicators, MinuteBar
 from market_state import (
+    MarketContext,
     MarketSnapshot,
     REGIME_NEUTRAL,
     REGIME_RISK_OFF,
@@ -207,6 +208,9 @@ MARKET_GATE_RISK_OFF = "GATE_MARKET_RISK_OFF"
 MARKET_ACTION_ALLOW = "dry_run_allow"
 MARKET_ACTION_BLOCK_CHASE_ONLY = "dry_run_block_chase_only"
 MARKET_ACTION_BLOCK_ALL = "dry_run_block_all"
+SECTOR_THEME_GATE_SECTOR_RISK_OFF = "GATE_SECTOR_RISK_OFF"
+SECTOR_THEME_GATE_SECTOR_WEAK_MARKET_WEAK = "GATE_SECTOR_WEAK_MARKET_WEAK"
+SECTOR_THEME_GATE_THEME_RISK_OFF = "GATE_THEME_RISK_OFF"
 
 
 @dataclass
@@ -225,6 +229,12 @@ class EntryDecision:
     market_regime: str = ""           # "strong"|"neutral"|"weak"|"risk_off"|"unknown"
     market_gate_action: str = ""      # MARKET_ACTION_*
     market_gate_reason: str = ""      # ""|MARKET_GATE_WEAK_CHASE_BLOCK|MARKET_GATE_RISK_OFF
+    sector_regime: str = ""
+    sector_gate_action: str = ""
+    sector_gate_reason: str = ""
+    theme_regime: str = ""
+    theme_gate_action: str = ""
+    theme_gate_reason: str = ""
 
 
 @dataclass
@@ -257,6 +267,9 @@ class EntryContext:
     open_return: float = 0.0       # (현재가 / 시가) - 1
     # === Market regime snapshot (None 가능 — 미수신 시 _apply_market_gate 가 neutral fallback) ===
     market_state: Optional[MarketSnapshot] = None
+    market_context: Optional[MarketContext] = None
+    sector_context: Optional[object] = None
+    theme_context: Optional[object] = None
     # === ATR / VWAP 기반 풀백 정밀도 보강 (W1) ===
     # 5분봉 ATR(14) / last_close. 0.0 이면 동적 임계 비활성 → 정적 PULLBACK_*_PCT 사용.
     atr_5m_pct: float = 0.0
@@ -614,13 +627,25 @@ def _apply_market_gate(decision: EntryDecision, ctx: EntryContext) -> EntryDecis
         - risk_off: 모든 분기에서 dry_run_block_all
         - unknown 또는 ctx.market_state 미수신: neutral 로 fallback → dry_run_allow
     """
-    snap = ctx.market_state
-    if snap is None:
-        regime = REGIME_NEUTRAL
-    else:
-        regime = snap.market_regime or REGIME_UNKNOWN
+    fallback_reason = ""
+    market_context = getattr(ctx, "market_context", None)
+    if market_context is not None:
+        regime = getattr(market_context, "primary_market_regime", "") or REGIME_UNKNOWN
+        fallback_reason = getattr(market_context, "market_gate_reason", "") or ""
         if regime == REGIME_UNKNOWN:
             regime = REGIME_NEUTRAL
+            fallback_reason = fallback_reason or "unknown market fallback neutral"
+    else:
+        snap = ctx.market_state
+        if snap is None:
+            regime = REGIME_NEUTRAL
+        else:
+            regime = snap.market_regime or REGIME_UNKNOWN
+            if regime == REGIME_UNKNOWN:
+                regime = REGIME_NEUTRAL
+
+    if not regime:
+        regime = REGIME_NEUTRAL
 
     decision.market_regime = regime
 
@@ -635,13 +660,67 @@ def _apply_market_gate(decision: EntryDecision, ctx: EntryContext) -> EntryDecis
         return decision
 
     decision.market_gate_action = MARKET_ACTION_ALLOW
-    decision.market_gate_reason = ""
+    decision.market_gate_reason = fallback_reason
     return decision
+
+
+def _apply_sector_theme_gate(decision: EntryDecision, ctx: EntryContext) -> EntryDecision:
+    sector_ctx = getattr(ctx, "sector_context", None)
+    theme_ctx = getattr(ctx, "theme_context", None)
+    sector_regime = getattr(sector_ctx, "sector_regime", "") or REGIME_UNKNOWN
+    theme_regime = getattr(theme_ctx, "theme_regime", "") or REGIME_UNKNOWN
+    decision.sector_regime = sector_regime
+    decision.sector_gate_action = getattr(sector_ctx, "sector_gate_action", "") or "dry_run_allow"
+    decision.sector_gate_reason = getattr(sector_ctx, "sector_gate_reason", "") or (
+        "SECTOR_UNKNOWN_FALLBACK" if sector_ctx is None else ""
+    )
+    decision.theme_regime = theme_regime
+    decision.theme_gate_action = getattr(theme_ctx, "theme_gate_action", "") or "dry_run_allow"
+    decision.theme_gate_reason = getattr(theme_ctx, "theme_gate_reason", "") or (
+        "THEME_UNKNOWN_FALLBACK" if theme_ctx is None else ""
+    )
+    if decision.market_gate_action == MARKET_ACTION_BLOCK_ALL:
+        return decision
+    sector_enforced = bool(getattr(TRADE_CONFIG, "sector_gate_enforcement_enabled", False))
+    theme_enforced = bool(getattr(TRADE_CONFIG, "theme_gate_enforcement_enabled", False))
+    if not sector_enforced and not theme_enforced:
+        return decision
+    chase_ready = decision.reason_code == READY_AGRADE_FIRST
+    market_regime = decision.market_regime or REGIME_NEUTRAL
+    if sector_enforced:
+        if sector_regime == REGIME_RISK_OFF and chase_ready:
+            decision.status = "blocked"
+            decision.ratio = 0.0
+            decision.reason = "sector risk_off blocks A-grade chase"
+            decision.reason_code = SECTOR_THEME_GATE_SECTOR_RISK_OFF
+            return decision
+        if sector_regime == REGIME_RISK_OFF and decision.status == "ready":
+            decision.status = "wait"
+            decision.ratio = 0.0
+            decision.reason = "sector risk_off waits pullback/secondary entry"
+            decision.reason_code = SECTOR_THEME_GATE_SECTOR_RISK_OFF
+            return decision
+        if sector_regime == REGIME_WEAK and market_regime == REGIME_WEAK and chase_ready:
+            decision.status = "blocked"
+            decision.ratio = 0.0
+            decision.reason = "sector weak + market weak blocks A-grade chase"
+            decision.reason_code = SECTOR_THEME_GATE_SECTOR_WEAK_MARKET_WEAK
+            return decision
+    if theme_enforced and theme_regime == REGIME_RISK_OFF and chase_ready:
+        decision.status = "blocked"
+        decision.ratio = 0.0
+        decision.reason = "theme risk_off blocks A-grade chase"
+        decision.reason_code = SECTOR_THEME_GATE_THEME_RISK_OFF
+    return decision
+
+
+def _apply_entry_context_gates(decision: EntryDecision, ctx: EntryContext) -> EntryDecision:
+    return _apply_sector_theme_gate(_apply_market_gate(decision, ctx), ctx)
 
 
 def evaluate_first_entry(ctx: EntryContext) -> EntryDecision:
     """공개 API 래퍼. 내부 평가 후 매크로 dry-run 메타를 부여해 반환."""
-    return _apply_market_gate(_evaluate_first_entry_inner(ctx), ctx)
+    return _apply_entry_context_gates(_evaluate_first_entry_inner(ctx), ctx)
 
 
 def _evaluate_first_entry_inner(ctx: EntryContext) -> EntryDecision:
@@ -919,7 +998,7 @@ def _chejan_strength_rising(history: Sequence[float], min_recent_avg: float) -> 
 
 def evaluate_second_entry(ctx: EntryContext) -> EntryDecision:
     """공개 API 래퍼. 내부 평가 후 매크로 dry-run 메타를 부여해 반환."""
-    return _apply_market_gate(_evaluate_second_entry_inner(ctx), ctx)
+    return _apply_entry_context_gates(_evaluate_second_entry_inner(ctx), ctx)
 
 
 def evaluate_a_grade_watch_entry(
@@ -930,7 +1009,7 @@ def evaluate_a_grade_watch_entry(
     pullback_window_deadline: float,
 ) -> EntryDecision:
     """Evaluate an A-grade breakout that is being watched without a first buy."""
-    return _apply_market_gate(
+    return _apply_entry_context_gates(
         _evaluate_a_grade_watch_entry_inner(
             ctx,
             breakout_high=breakout_high,
@@ -1468,7 +1547,7 @@ def evaluate_reentry_after_exit(ctx: EntryContext, watch: dict) -> EntryDecision
             reason_code=GATE_STAGE2_NO_REVERSAL,
         )
 
-    return _apply_market_gate(
+    return _apply_entry_context_gates(
         EntryDecision(
             "ready",
             REENTRY_RATIO,

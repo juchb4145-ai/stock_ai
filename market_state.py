@@ -57,6 +57,26 @@ SNAPSHOT_FIELD_NAMES = (
     "market_regime",
 )
 
+MARKET_CONTEXT_FIELD_NAMES = (
+    "symbol_market",
+    "primary_index_code",
+    "primary_market_regime",
+    "primary_market_pct",
+    "primary_market_slope_1m",
+    "primary_market_slope_3m",
+    "primary_market_drawdown_from_high",
+    "kospi_regime",
+    "kospi_pct",
+    "kospi_slope_1m",
+    "kospi_slope_3m",
+    "kospi_drawdown_from_high",
+    "kosdaq_regime",
+    "kosdaq_pct",
+    "kosdaq_slope_1m",
+    "kosdaq_slope_3m",
+    "kosdaq_drawdown_from_high",
+)
+
 # 1분 OHLC deque 의 최대 길이. slope_3m 에 3개만 쓰지만 여유 있게 5분 보관.
 MINUTE_BAR_HISTORY = 5
 
@@ -223,6 +243,80 @@ class MarketSnapshot:
         }
 
 
+@dataclass
+class IndexSnapshot:
+    index_code: str
+    market_pct: Optional[float] = None
+    market_slope_1m: Optional[float] = None
+    market_slope_3m: Optional[float] = None
+    market_drawdown_from_high: Optional[float] = None
+    market_regime: str = REGIME_UNKNOWN
+
+    def to_market_snapshot(self) -> MarketSnapshot:
+        return MarketSnapshot(
+            market_pct=self.market_pct,
+            market_slope_1m=self.market_slope_1m,
+            market_slope_3m=self.market_slope_3m,
+            market_drawdown_from_high=self.market_drawdown_from_high,
+            market_regime=self.market_regime,
+        )
+
+
+@dataclass
+class MarketContext:
+    symbol: str
+    symbol_market: str = "unknown"
+    primary_index_code: str = ""
+    primary_market_regime: str = REGIME_NEUTRAL
+    primary_market_pct: Optional[float] = None
+    primary_market_slope_1m: Optional[float] = None
+    primary_market_slope_3m: Optional[float] = None
+    primary_market_drawdown_from_high: Optional[float] = None
+    kospi_regime: str = REGIME_UNKNOWN
+    kospi_pct: Optional[float] = None
+    kospi_slope_1m: Optional[float] = None
+    kospi_slope_3m: Optional[float] = None
+    kospi_drawdown_from_high: Optional[float] = None
+    kosdaq_regime: str = REGIME_UNKNOWN
+    kosdaq_pct: Optional[float] = None
+    kosdaq_slope_1m: Optional[float] = None
+    kosdaq_slope_3m: Optional[float] = None
+    kosdaq_drawdown_from_high: Optional[float] = None
+    market_gate_action: str = ""
+    market_gate_reason: str = ""
+
+    def as_row_dict(self) -> Dict[str, object]:
+        values = {
+            "symbol_market": self.symbol_market,
+            "primary_index_code": self.primary_index_code,
+            "primary_market_regime": self.primary_market_regime,
+            "primary_market_pct": self.primary_market_pct,
+            "primary_market_slope_1m": self.primary_market_slope_1m,
+            "primary_market_slope_3m": self.primary_market_slope_3m,
+            "primary_market_drawdown_from_high": self.primary_market_drawdown_from_high,
+            "kospi_regime": self.kospi_regime,
+            "kospi_pct": self.kospi_pct,
+            "kospi_slope_1m": self.kospi_slope_1m,
+            "kospi_slope_3m": self.kospi_slope_3m,
+            "kospi_drawdown_from_high": self.kospi_drawdown_from_high,
+            "kosdaq_regime": self.kosdaq_regime,
+            "kosdaq_pct": self.kosdaq_pct,
+            "kosdaq_slope_1m": self.kosdaq_slope_1m,
+            "kosdaq_slope_3m": self.kosdaq_slope_3m,
+            "kosdaq_drawdown_from_high": self.kosdaq_drawdown_from_high,
+        }
+        return {key: "" if value is None else value for key, value in values.items()}
+
+    def to_market_snapshot(self) -> MarketSnapshot:
+        return MarketSnapshot(
+            market_pct=self.primary_market_pct,
+            market_slope_1m=self.primary_market_slope_1m,
+            market_slope_3m=self.primary_market_slope_3m,
+            market_drawdown_from_high=self.primary_market_drawdown_from_high,
+            market_regime=self.primary_market_regime or REGIME_UNKNOWN,
+        )
+
+
 def classify_regime(snap: MarketSnapshot) -> str:
     """KOSPI 통계로 regime 4+1분류.
 
@@ -273,6 +367,72 @@ class MarketStateCache:
 
     def kosdaq(self) -> IndexState:
         return self.indices[KOSDAQ_CODE]
+
+    def snapshot_index(self, index_code: str) -> IndexSnapshot:
+        state = self.indices.get(str(index_code))
+        if state is None:
+            return IndexSnapshot(index_code=str(index_code), market_regime=REGIME_UNKNOWN)
+        snap = IndexSnapshot(
+            index_code=str(index_code),
+            market_pct=state.pct(),
+            market_slope_1m=state.slope_1m(),
+            market_slope_3m=state.slope_3m(),
+            market_drawdown_from_high=state.drawdown_from_high(),
+        )
+        snap.market_regime = classify_regime(snap.to_market_snapshot())
+        return snap
+
+    def snapshot_for_market(self, market: str) -> IndexSnapshot:
+        normalized = str(market or "").strip().upper()
+        if normalized in ("KOSPI", "0", KOSPI_CODE):
+            return self.snapshot_index(KOSPI_CODE)
+        if normalized in ("KOSDAQ", "10", KOSDAQ_CODE):
+            return self.snapshot_index(KOSDAQ_CODE)
+        return IndexSnapshot(index_code="", market_regime=REGIME_UNKNOWN)
+
+    def snapshot_for_symbol(self, symbol: str, symbol_market: str = "unknown") -> MarketContext:
+        normalized_market = str(symbol_market or "unknown").strip().upper()
+        kospi = self.snapshot_index(KOSPI_CODE)
+        kosdaq = self.snapshot_index(KOSDAQ_CODE)
+        primary = IndexSnapshot(index_code="", market_regime=REGIME_NEUTRAL)
+        reason = ""
+        if normalized_market == "KOSPI":
+            primary = kospi
+        elif normalized_market == "KOSDAQ":
+            primary = kosdaq
+        else:
+            normalized_market = "unknown"
+            reason = "unknown market fallback neutral"
+
+        primary_regime = primary.market_regime or REGIME_UNKNOWN
+        if primary_regime == REGIME_UNKNOWN:
+            primary_regime = REGIME_NEUTRAL
+            if reason:
+                reason = "{}; primary regime unknown fallback neutral".format(reason)
+            else:
+                reason = "primary regime unknown fallback neutral"
+
+        return MarketContext(
+            symbol=str(symbol or ""),
+            symbol_market=normalized_market,
+            primary_index_code=primary.index_code,
+            primary_market_regime=primary_regime,
+            primary_market_pct=primary.market_pct,
+            primary_market_slope_1m=primary.market_slope_1m,
+            primary_market_slope_3m=primary.market_slope_3m,
+            primary_market_drawdown_from_high=primary.market_drawdown_from_high,
+            kospi_regime=kospi.market_regime,
+            kospi_pct=kospi.market_pct,
+            kospi_slope_1m=kospi.market_slope_1m,
+            kospi_slope_3m=kospi.market_slope_3m,
+            kospi_drawdown_from_high=kospi.market_drawdown_from_high,
+            kosdaq_regime=kosdaq.market_regime,
+            kosdaq_pct=kosdaq.market_pct,
+            kosdaq_slope_1m=kosdaq.market_slope_1m,
+            kosdaq_slope_3m=kosdaq.market_slope_3m,
+            kosdaq_drawdown_from_high=kosdaq.market_drawdown_from_high,
+            market_gate_reason=reason,
+        )
 
     def snapshot(self) -> MarketSnapshot:
         """KOSPI 기준 즉시 통계 + regime 분류.

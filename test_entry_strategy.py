@@ -82,6 +82,7 @@ def build_ctx(
     px_over_bb55_pct: float | None = None,
     open_return: float | None = None,
     market_state: ms.MarketSnapshot | None = None,
+    market_context: ms.MarketContext | None = None,
     atr_5m_pct: float = 0.0,
     intraday_vwap: float = 0.0,
     pullback_low_after_high: int = 0,
@@ -123,6 +124,7 @@ def build_ctx(
         px_over_bb55_pct=px_over_bb55_pct,
         open_return=open_return,
         market_state=market_state,
+        market_context=market_context,
         atr_5m_pct=atr_5m_pct,
         intraday_vwap=intraday_vwap,
         pullback_low_after_high=pullback_low_after_high,
@@ -137,6 +139,24 @@ def make_market_snap(*, regime: str, pct: float = 0.0) -> ms.MarketSnapshot:
         market_slope_3m=None,
         market_drawdown_from_high=None,
         market_regime=regime,
+    )
+
+
+def make_market_context(
+    *,
+    symbol_market: str,
+    primary_regime: str,
+    kospi_regime: str = ms.REGIME_NEUTRAL,
+    kosdaq_regime: str = ms.REGIME_NEUTRAL,
+    primary_index_code: str = ms.KOSPI_CODE,
+) -> ms.MarketContext:
+    return ms.MarketContext(
+        symbol="000001",
+        symbol_market=symbol_market,
+        primary_index_code=primary_index_code,
+        primary_market_regime=primary_regime,
+        kospi_regime=kospi_regime,
+        kosdaq_regime=kosdaq_regime,
     )
 
 
@@ -660,6 +680,62 @@ class MarketDryRunGateTests(unittest.TestCase):
         self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
         self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
         self.assertEqual(d.market_gate_reason, es.MARKET_GATE_RISK_OFF)
+
+    def test_kosdaq_primary_risk_off_blocks_even_when_kospi_strong(self):
+        ctx = build_ctx(
+            market_context=make_market_context(
+                symbol_market="KOSDAQ",
+                primary_index_code=ms.KOSDAQ_CODE,
+                primary_regime=ms.REGIME_RISK_OFF,
+                kospi_regime=ms.REGIME_STRONG,
+                kosdaq_regime=ms.REGIME_RISK_OFF,
+            )
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
+
+    def test_kosdaq_primary_neutral_ignores_kospi_risk_off(self):
+        ctx = build_ctx(
+            market_context=make_market_context(
+                symbol_market="KOSDAQ",
+                primary_index_code=ms.KOSDAQ_CODE,
+                primary_regime=ms.REGIME_NEUTRAL,
+                kospi_regime=ms.REGIME_RISK_OFF,
+                kosdaq_regime=ms.REGIME_NEUTRAL,
+            )
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.market_regime, ms.REGIME_NEUTRAL)
+        self.assertNotEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
+
+    def test_kospi_primary_risk_off_blocks_even_when_kosdaq_strong(self):
+        ctx = build_ctx(
+            market_context=make_market_context(
+                symbol_market="KOSPI",
+                primary_index_code=ms.KOSPI_CODE,
+                primary_regime=ms.REGIME_RISK_OFF,
+                kospi_regime=ms.REGIME_RISK_OFF,
+                kosdaq_regime=ms.REGIME_STRONG,
+            )
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.market_regime, ms.REGIME_RISK_OFF)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_BLOCK_ALL)
+
+    def test_unknown_market_context_falls_back_to_neutral_with_reason(self):
+        ctx = build_ctx(
+            market_context=ms.MarketContext(
+                symbol="000001",
+                symbol_market="unknown",
+                primary_market_regime=ms.REGIME_UNKNOWN,
+                market_gate_reason="unknown market fallback neutral",
+            )
+        )
+        d = es.evaluate_first_entry(ctx)
+        self.assertEqual(d.market_regime, ms.REGIME_NEUTRAL)
+        self.assertEqual(d.market_gate_action, es.MARKET_ACTION_ALLOW)
+        self.assertIn("unknown market fallback", d.market_gate_reason)
 
 
 class DynamicPullbackBandTests(unittest.TestCase):

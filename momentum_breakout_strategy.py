@@ -80,6 +80,8 @@ class MomentumContext:
     now_ts: float = 0.0
     was_below_vwap: bool = False
     short_reclaim_high: int = 0
+    sector_context: Optional[object] = None
+    theme_context: Optional[object] = None
 
 
 class MomentumBreakoutStrategy:
@@ -1167,6 +1169,10 @@ class MomentumBreakoutStrategy:
             "turnover_rank_market": float(ctx.turnover_rank_market or 0),
             "turnover_rank_sector": float(ctx.turnover_rank_sector or 0),
             "leader_score": float(ctx.leader_score or 0.0),
+            "sector_regime": getattr(ctx.sector_context, "sector_regime", "") if ctx.sector_context is not None else "",
+            "sector_gate_action": getattr(ctx.sector_context, "sector_gate_action", "") if ctx.sector_context is not None else "",
+            "theme_regime": getattr(ctx.theme_context, "theme_regime", "") if ctx.theme_context is not None else "",
+            "theme_gate_action": getattr(ctx.theme_context, "theme_gate_action", "") if ctx.theme_context is not None else "",
             "is_above_vwap": is_above_vwap,
             "vwap_support_ok": 1.0 if vwap_support_ok else 0.0,
             "upper_wick_ratio": upper_wick_ratio,

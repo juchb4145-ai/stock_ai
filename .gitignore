@@ -5,5 +5,8 @@ __pycache__/
 .Python
 stock_ai-1/
 stock_ai/
-data/
+data/*
+!data/
+!data/sector_map.csv
+!data/theme_map.csv
 venv64/

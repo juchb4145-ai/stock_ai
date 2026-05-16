@@ -36,7 +36,9 @@ import entry_strategy
 import exit_strategy
 import scoring
 from candidate_registry import CONDITION_COMBO_META_FIELDS, LEADER_META_FIELDS
-from market_state import SNAPSHOT_FIELD_NAMES
+from market_state import MARKET_CONTEXT_FIELD_NAMES, SNAPSHOT_FIELD_NAMES
+from sector_state import SECTOR_FIELDS, as_log_dict as sector_log_dict
+from theme_state import THEME_FIELDS, as_log_dict as theme_log_dict
 from trade_config import TRADE_CONFIG
 
 
@@ -83,7 +85,9 @@ DANTE_TRAINING_SAMPLE_COOLDOWN_SECONDS = 60  # 같은 종목 연속 등록 방�
 # === Market regime dry-run 메타 컬럼 (entry_strategy._apply_market_gate 가 채움) ===
 # CSV 분석 시 group by 키. SNAPSHOT_FIELD_NAMES 는 market_state 모듈이 단일 출처.
 MARKET_FIELDS = list(SNAPSHOT_FIELD_NAMES)
+MARKET_CONTEXT_FIELDS = list(MARKET_CONTEXT_FIELD_NAMES)
 MARKET_GATE_FIELDS = ["market_gate_action", "market_gate_reason"]
+SECTOR_THEME_FIELDS = list(SECTOR_FIELDS) + list(THEME_FIELDS)
 FIRST_PULLBACK_QUALITY_FIELDS = [
     "observed_pullback_from_high_pct",
     "strategy_pullback_basis",
@@ -118,7 +122,7 @@ DANTE_TRAINING_FIELDS = [
     "hit_stop",
     "time_exit",
     "labeled_at",
-] + MARKET_FIELDS + MARKET_GATE_FIELDS
+] + MARKET_CONTEXT_FIELDS + SECTOR_THEME_FIELDS + MARKET_FIELDS + MARKET_GATE_FIELDS
 
 # === 퀀트조건식 shadow 학습 트랙 (기존 dante 파일명 호환) ===
 DANTE_SHADOW_TRAINING_DATA_ENABLED = True
@@ -227,9 +231,10 @@ TRADE_LOG_FIELDS = [
     "message",
     # Market regime dry-run 메타 — 매수 이벤트 시 진입 시점 매크로를 같이 박는다.
     # 매도 이벤트는 빈값 허용(진입 시점 메타가 의미 적음).
-    "market_regime",
-    "market_gate_action",
-    "market_gate_reason",
+    *MARKET_FIELDS,
+    *MARKET_CONTEXT_FIELDS,
+    *SECTOR_THEME_FIELDS,
+    *MARKET_GATE_FIELDS,
 ]
 
 
@@ -246,8 +251,39 @@ def _attach_market_meta(row: Dict[str, Any], ctx: Any, decision: Any) -> None:
     else:
         for key in MARKET_FIELDS:
             row[key] = ""
+    market_context = getattr(ctx, "market_context", None)
+    if market_context is not None:
+        row.update(market_context.as_row_dict())
+        primary_regime = getattr(market_context, "primary_market_regime", "") or ""
+        if primary_regime:
+            row["market_regime"] = primary_regime
+            row["market_pct"] = (
+                "" if getattr(market_context, "primary_market_pct", None) is None
+                else getattr(market_context, "primary_market_pct", "")
+            )
+            row["market_slope_1m"] = (
+                "" if getattr(market_context, "primary_market_slope_1m", None) is None
+                else getattr(market_context, "primary_market_slope_1m", "")
+            )
+            row["market_slope_3m"] = (
+                "" if getattr(market_context, "primary_market_slope_3m", None) is None
+                else getattr(market_context, "primary_market_slope_3m", "")
+            )
+            row["market_drawdown_from_high"] = (
+                "" if getattr(market_context, "primary_market_drawdown_from_high", None) is None
+                else getattr(market_context, "primary_market_drawdown_from_high", "")
+            )
+    else:
+        for key in MARKET_CONTEXT_FIELDS:
+            row[key] = ""
     row["market_gate_action"] = getattr(decision, "market_gate_action", "") or ""
     row["market_gate_reason"] = getattr(decision, "market_gate_reason", "") or ""
+    row.update(sector_log_dict(getattr(ctx, "sector_context", None)))
+    row.update(theme_log_dict(getattr(ctx, "theme_context", None)))
+    row["sector_gate_action"] = getattr(decision, "sector_gate_action", row.get("sector_gate_action", "")) or row.get("sector_gate_action", "")
+    row["sector_gate_reason"] = getattr(decision, "sector_gate_reason", row.get("sector_gate_reason", "")) or row.get("sector_gate_reason", "")
+    row["theme_gate_action"] = getattr(decision, "theme_gate_action", row.get("theme_gate_action", "")) or row.get("theme_gate_action", "")
+    row["theme_gate_reason"] = getattr(decision, "theme_gate_reason", row.get("theme_gate_reason", "")) or row.get("theme_gate_reason", "")
 
 
 def _ensure_csv_header(path: str, fieldnames: list, *, log_label: str) -> None:
@@ -735,6 +771,9 @@ class TrainingRecorderMixin:
         for field in LEADER_META_FIELDS:
             if row.get(field) in ("", None):
                 row[field] = getattr(candidate, field, meta.get(field, ""))
+        for field in SECTOR_THEME_FIELDS:
+            if row.get(field) in ("", None):
+                row[field] = meta.get(field, "")
 
     def ensure_trade_log_file(self) -> None:
         _ensure_csv_header(TRADE_LOG_CSV, TRADE_LOG_FIELDS, log_label="trade_log")

@@ -13,6 +13,7 @@ from quant_backtest import (
     QuantForwardSimulator,
 )
 from quant_condition_strategy import QuantConditionStrategy, QuantStrategyConfig
+import market_state as ms
 
 
 class QuantConditionStrategyTests(unittest.TestCase):
@@ -99,6 +100,27 @@ class QuantConditionStrategyTests(unittest.TestCase):
         )
         self.assertEqual(strong.status, "ready")
         self.assertEqual(strong.min_chejan_strength, 100.0)
+
+    def test_market_context_primary_regime_controls_strength_threshold(self):
+        ctx = ms.MarketContext(
+            symbol="000001",
+            symbol_market="KOSDAQ",
+            primary_index_code=ms.KOSDAQ_CODE,
+            primary_market_regime="weak",
+            kospi_regime="strong",
+            kosdaq_regime="weak",
+        )
+        decision = self.strategy.evaluate_entry(
+            capture_price=10_000,
+            current_price=9_850,
+            chejan_strength=119.9,
+            recent_low_price=9_820,
+            market_state="strong",
+            market_context=ctx,
+        )
+        self.assertEqual(decision.reason_code, "SAFE_CHEJAN_WAIT")
+        self.assertEqual(decision.market_state, "weak")
+        self.assertEqual(decision.min_chejan_strength, 120.0)
 
     def test_market_strength_config_can_keep_neutral_at_110(self):
         strategy = QuantConditionStrategy(

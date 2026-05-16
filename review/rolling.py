@@ -226,6 +226,10 @@ _NUMERIC_FIELDS = {
     "condition_score_bonus", "time_between_conditions_sec",
     "leader_score", "turnover_speed_per_min", "volume_ratio_1m", "volume_ratio_5m",
     "trade_value_since_capture", "turnover_rank_market", "turnover_rank_sector",
+    "sector_pct", "sector_slope_1m", "sector_slope_3m", "sector_drawdown_from_high",
+    "sector_relative_strength_vs_primary", "sector_ranked_count",
+    "theme_member_count", "theme_active_count", "theme_rising_count", "theme_falling_count",
+    "theme_avg_return", "theme_top_return", "theme_top_turnover", "theme_leader_return",
 }
 
 _INT_FIELDS = {"reached_1r", "reached_2r", "hit_stop", "time_exit", "entry_stage_max"}

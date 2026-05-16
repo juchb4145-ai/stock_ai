@@ -32,7 +32,7 @@ from final_entry_decision import (
     build_final_entry_decision,
     trace_with_order_guard,
 )
-from market_state import KOSDAQ_CODE, KOSPI_CODE, MarketStateCache
+from market_state import KOSDAQ_CODE, KOSPI_CODE, MarketContext, MarketStateCache
 from momentum_breakout_strategy import (
     EntryDecision as MomentumEntryDecision,
     MomentumBreakoutStrategy,
@@ -54,6 +54,8 @@ from portfolio import LoadedPortfolioState, Position, PortfolioState
 from logging_setup import setup_logging
 from fid_codes import FID_CODES, FID_NAME_TO_CODE, get_fid
 from quant_condition_strategy import QuantConditionStrategy, QuantStrategyConfig
+from sector_state import SectorContext, SectorStateCache, as_log_dict as sector_log_dict
+from theme_state import ThemeContext, ThemeStateCache, as_log_dict as theme_log_dict
 from trade_config import TRADE_CONFIG
 from time_policy import TimePolicy, first_window_start_hhmmss, hhmmss_from_clock
 from training_recorder import (
@@ -82,6 +84,102 @@ from training_recorder import (
 
 
 logger = setup_logging()
+
+
+def _market_context_for_symbol(market_state_cache, code, symbol_market):
+    if hasattr(market_state_cache, "snapshot_for_symbol"):
+        return market_state_cache.snapshot_for_symbol(code, symbol_market=symbol_market)
+    snap = market_state_cache.snapshot() if hasattr(market_state_cache, "snapshot") else None
+    if snap is None:
+        return MarketContext(symbol=code, symbol_market=symbol_market)
+    return MarketContext(
+        symbol=code,
+        symbol_market=symbol_market or "unknown",
+        primary_index_code=KOSPI_CODE if symbol_market == "KOSPI" else "",
+        primary_market_regime=getattr(snap, "market_regime", "") or "neutral",
+        primary_market_pct=getattr(snap, "market_pct", None),
+        primary_market_slope_1m=getattr(snap, "market_slope_1m", None),
+        primary_market_slope_3m=getattr(snap, "market_slope_3m", None),
+        primary_market_drawdown_from_high=getattr(snap, "market_drawdown_from_high", None),
+        kospi_regime=getattr(snap, "market_regime", "") or "unknown",
+        kospi_pct=getattr(snap, "market_pct", None),
+        kospi_slope_1m=getattr(snap, "market_slope_1m", None),
+        kospi_slope_3m=getattr(snap, "market_slope_3m", None),
+        kospi_drawdown_from_high=getattr(snap, "market_drawdown_from_high", None),
+    )
+
+
+def _sector_context_for_symbol(sector_state_cache, code, symbol_market, market_context):
+    if sector_state_cache is None or not hasattr(sector_state_cache, "snapshot_for_symbol"):
+        return SectorContext(
+            symbol=str(code or "").strip().lstrip("A"),
+            symbol_market=symbol_market or "unknown",
+            primary_market_regime=getattr(market_context, "primary_market_regime", "unknown"),
+            primary_market_pct=getattr(market_context, "primary_market_pct", None),
+            sector_gate_reason="SECTOR_UNKNOWN_FALLBACK",
+        )
+    return sector_state_cache.snapshot_for_symbol(
+        code,
+        symbol_market=symbol_market,
+        market_context=market_context,
+    )
+
+
+def _theme_context_for_symbol(theme_state_cache, code, realtime_lookup):
+    if theme_state_cache is None or not hasattr(theme_state_cache, "snapshot_for_symbol"):
+        return ThemeContext(symbol=str(code or "").strip().lstrip("A"), theme_gate_reason="THEME_UNKNOWN_FALLBACK")
+    return theme_state_cache.snapshot_for_symbol(code, realtime_lookup=realtime_lookup)
+
+
+def _owner_theme_realtime_lookup(owner):
+    if owner is not None and hasattr(owner, "theme_realtime_lookup"):
+        return owner.theme_realtime_lookup
+    return lambda _code: None
+
+
+def _owner_realtime_turnover_rank_sector(owner, code, sector_code=None, current_turnover=0):
+    if owner is not None and hasattr(owner, "realtime_turnover_rank_sector"):
+        return owner.realtime_turnover_rank_sector(
+            code,
+            sector_code=sector_code,
+            current_turnover=current_turnover,
+        )
+    return 0, 0
+
+
+def _sector_theme_log_dict(sector_context=None, theme_context=None):
+    out = {}
+    out.update(sector_log_dict(sector_context))
+    out.update(theme_log_dict(theme_context))
+    return out
+
+
+def _ai_context_payload(market_context=None, sector_context=None, theme_context=None):
+    return {
+        "market_context": {
+            "symbol_market": getattr(market_context, "symbol_market", ""),
+            "primary_market_regime": getattr(market_context, "primary_market_regime", ""),
+        },
+        "sector_context": {
+            "sector_code": getattr(sector_context, "sector_code", ""),
+            "sector_name": getattr(sector_context, "sector_name", ""),
+            "sector_regime": getattr(sector_context, "sector_regime", ""),
+            "sector_relative_strength_vs_primary": getattr(
+                sector_context,
+                "sector_relative_strength_vs_primary",
+                "",
+            ),
+            "sector_gate_action": getattr(sector_context, "sector_gate_action", ""),
+        },
+        "theme_context": {
+            "theme_names": getattr(theme_context, "theme_names", ""),
+            "primary_theme": getattr(theme_context, "primary_theme", ""),
+            "theme_regime": getattr(theme_context, "theme_regime", ""),
+            "theme_active_count": getattr(theme_context, "theme_active_count", ""),
+            "theme_rising_count": getattr(theme_context, "theme_rising_count", ""),
+            "theme_gate_action": getattr(theme_context, "theme_gate_action", ""),
+        },
+    }
 
 # ===== 퀀트조건식 눌림 전략 =====
 # 영웅문에 저장된 조건식 이름과 정확히 일치해야 한다. 조건식 자체의 A/J/N/P/S/T
@@ -380,6 +478,19 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         # 매크로 dry-run 게이트용 KOSPI/KOSDAQ 실시간 지수 캐시.
         # 미수신 시 entry_strategy 가 neutral fallback 으로 안전 처리한다.
         self.market_state = MarketStateCache()
+        self.symbol_market_by_code = {}
+        self.refresh_symbol_market_cache()
+        self.sector_state = SectorStateCache(TRADE_CONFIG.sector_map_path)
+        self.theme_state = ThemeStateCache(
+            TRADE_CONFIG.theme_map_path,
+            min_active_symbols=TRADE_CONFIG.theme_min_active_symbols,
+        )
+        if TRADE_CONFIG.sector_state_enabled:
+            self.sector_state.load_sector_maps()
+        if TRADE_CONFIG.theme_state_enabled:
+            self.theme_state.load_theme_map()
+        self.sector_index_realtime_registered_codes = set()
+        self.sector_index_realtime_code_screens = {}
         self.index_realtime_registered = False
         self.market_services_started = False
         self.ai_server_failure_count = 0
@@ -889,6 +1000,29 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         code_list = code_list.split(';')[:-1]
         return code_list
 
+    def refresh_symbol_market_cache(self):
+        """Build a lightweight code -> KOSPI/KOSDAQ cache from Kiwoom market lists."""
+        mapping = {}
+        for market_type, market_name in (("0", "KOSPI"), ("10", "KOSDAQ")):
+            try:
+                codes = self.get_code_list_stock_market(market_type)
+            except Exception as exc:
+                logger.warning("[market cache] failed to load %s codes: %s", market_name, exc)
+                continue
+            for code in codes or []:
+                normalized = self.normalize_code(str(code)) if hasattr(self, "normalize_code") else str(code).strip().lstrip("A")
+                if normalized:
+                    mapping[normalized] = market_name
+        self.symbol_market_by_code = mapping
+        logger.info("[market cache] loaded symbol markets: %d", len(mapping))
+        return mapping
+
+    def resolve_symbol_market(self, code):
+        normalized = self.normalize_code(str(code or "")) if hasattr(self, "normalize_code") else str(code or "").strip().lstrip("A")
+        if not normalized:
+            return "unknown"
+        return getattr(self, "symbol_market_by_code", {}).get(normalized, "unknown")
+
     def get_code_name(self, code):
         code_name = self.dynamicCall("GetMasterCodeName(QString)", code)
         return code_name
@@ -1100,7 +1234,39 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             meta.update(getattr(candidate, "meta", {}) or {})
         meta.setdefault("primary_condition_name", PRIMARY_CONDITION_NAME)
         meta.setdefault("bonus_condition_name", BONUS_CONDITION_NAME)
-        return {field: meta.get(field, "") for field in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)}
+        extra_fields = (
+            "symbol_market",
+            "sector_code",
+            "sector_name",
+            "sector_index_code",
+            "primary_theme",
+            "theme_names",
+        )
+        return {
+            field: meta.get(field, "")
+            for field in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS, *extra_fields)
+        }
+
+    def attach_sector_theme_candidate_meta(self, code, candidate=None):
+        meta = {}
+        symbol_market = self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown"
+        meta["symbol_market"] = symbol_market
+        sector_state = getattr(self, "sector_state", None)
+        if sector_state is not None:
+            sector = sector_state.resolve_symbol_sector(code)
+            meta.update({
+                "sector_code": sector.get("sector_code", ""),
+                "sector_name": sector.get("sector_name", ""),
+                "sector_index_code": sector.get("sector_index_code", ""),
+            })
+        theme_state = getattr(self, "theme_state", None)
+        if theme_state is not None:
+            themes = theme_state.themes_for_symbol(code)
+            meta["primary_theme"] = themes[0] if themes else ""
+            meta["theme_names"] = ";".join(themes)
+        if candidate is not None:
+            candidate.meta.update(meta)
+        return meta
 
     def register_condition_detected_stock(
         self,
@@ -1294,10 +1460,18 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 "capture_allowed": capture_allowed,
                 "manage_allowed": capture_decision.manage_allowed,
                 "analysis_allowed": getattr(capture_decision, "analysis_allowed", ""),
+                "symbol_market": self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown",
             },
         )
+        if hasattr(self, "attach_sector_theme_candidate_meta"):
+            self.attach_sector_theme_candidate_meta(code, candidate)
+        if hasattr(self, "register_realtime_sector_indices_for_candidate"):
+            self.register_realtime_sector_indices_for_candidate(code)
         condition_meta = self._condition_log_meta(candidate)
         watch = self.ensure_monitoring_stock(code)
+        watch["symbol_market"] = self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown"
+        for key in ("sector_code", "sector_name", "sector_index_code", "primary_theme", "theme_names"):
+            watch[key] = condition_meta.get(key, "")
         watch["candidate_id"] = candidate.candidate_id
         if is_primary_condition or not watch.get("condition_name"):
             watch["condition_name"] = hts_condition_name
@@ -2006,6 +2180,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             price = self.get_real_int(s_code, "현재가")
             if price > 0:
                 self.market_state.update(str(s_code), float(price), time.time())
+                self.route_sector_index_real_data(str(s_code), float(price), time.time())
         elif real_type == "주식호가잔량":
             self.update_orderbook_snapshot(s_code)
         elif real_type == "주식체결":
@@ -2594,6 +2769,51 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             return 0, len(turnovers)
         rank = 1 + sum(1 for turnover in turnovers.values() if turnover > turnovers[code])
         return rank, len(turnovers)
+
+    def realtime_turnover_rank_sector(self, code, sector_code=None, current_turnover=0):
+        code = self.normalize_code(code)
+        sector_state = getattr(self, "sector_state", None)
+        sector_code = str(sector_code or "").strip()
+        if not sector_code and sector_state is not None:
+            sector_code = sector_state.resolve_symbol_sector(code).get("sector_code", "")
+        if not sector_code or sector_state is None:
+            return 0, 0
+        turnovers = {}
+        for tracked_code, ticks in self.realtime_ticks.items():
+            normalized = self.normalize_code(tracked_code)
+            meta = sector_state.resolve_symbol_sector(normalized)
+            if meta.get("sector_code", "") != sector_code or not ticks:
+                continue
+            last = ticks[-1]
+            turnover = self.realtime_daily_turnover(
+                normalized,
+                current_price=last.get("close", 0),
+                accum_volume=last.get("accum_volume", 0),
+            )
+            if turnover > 0:
+                turnovers[normalized] = turnover
+        if current_turnover > 0:
+            turnovers[code] = max(self.parse_int(current_turnover), turnovers.get(code, 0))
+        if not turnovers or code not in turnovers:
+            return 0, len(turnovers)
+        rank = 1 + sum(1 for turnover in turnovers.values() if turnover > turnovers[code])
+        return rank, len(turnovers)
+
+    def theme_realtime_lookup(self, code):
+        code = self.normalize_code(code)
+        ticks = self.realtime_ticks.get(code, [])
+        if not ticks:
+            return None
+        last = ticks[-1]
+        current_price = self.parse_int(last.get("close", 0))
+        open_price = self.parse_int(last.get("open", 0))
+        accum_volume = self.parse_int(last.get("accum_volume", 0))
+        if current_price <= 0 or open_price <= 0:
+            return None
+        return {
+            "return_pct": current_price / open_price - 1,
+            "turnover": current_price * max(accum_volume, 0),
+        }
 
     def evaluate_time_filter(self, code, *, current_price=0, accum_volume=0):
         if not hasattr(self, "time_policy"):
@@ -3221,11 +3441,16 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             watch["big_buy_seen"] = True
             watch["big_buy_qty"] = max(self.parse_int(watch.get("big_buy_qty", 0)), volume_delta)
 
-    def market_filter_pauses_buy(self):
-        snapshot = self.market_state.snapshot()
-        slope_1m = getattr(snapshot, "market_slope_1m", None)
-        slope_3m = getattr(snapshot, "market_slope_3m", None)
-        regime = getattr(snapshot, "market_regime", "") or ""
+    def market_filter_pauses_buy(self, code=None):
+        symbol_market = (
+            self.resolve_symbol_market(code)
+            if code and hasattr(self, "resolve_symbol_market")
+            else "unknown"
+        )
+        snapshot = _market_context_for_symbol(self.market_state, code or "", symbol_market)
+        slope_1m = getattr(snapshot, "primary_market_slope_1m", None)
+        slope_3m = getattr(snapshot, "primary_market_slope_3m", None)
+        regime = getattr(snapshot, "primary_market_regime", "") or ""
         if regime in ("weak", "risk_off"):
             return True, "지수 하락 regime={}".format(regime)
         if slope_1m is not None and slope_1m < 0:
@@ -3422,6 +3647,27 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             code,
             current_turnover=daily_turnover,
         )
+        symbol_market = self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown"
+        market_context = _market_context_for_symbol(self.market_state, code, symbol_market)
+        sector_context = _sector_context_for_symbol(
+            getattr(self, "sector_state", None),
+            code,
+            symbol_market,
+            market_context,
+        )
+        sector_rank, sector_ranked_count = _owner_realtime_turnover_rank_sector(
+            self,
+            code,
+            sector_code=getattr(sector_context, "sector_code", ""),
+            current_turnover=daily_turnover,
+        )
+        sector_context.turnover_rank_sector = sector_rank
+        sector_context.sector_ranked_count = sector_ranked_count
+        theme_context = _theme_context_for_symbol(
+            getattr(self, "theme_state", None),
+            code,
+            _owner_theme_realtime_lookup(self),
+        )
         trade_value_since_capture = self.parse_int(getattr(candidate, "trade_value_since_capture", 0)) if candidate is not None else 0
         if trade_value_since_capture <= 0 and volume_delta > 0 and current_price > 0:
             trade_value_since_capture = int(volume_delta * current_price)
@@ -3447,15 +3693,17 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 volume_ratio_1m=float(volume_ratio_1m or 0.0),
                 volume_ratio_5m=float(volume_ratio_5m or 0.0),
                 turnover_rank_market=turnover_rank_market,
-                turnover_rank_sector=0,  # TODO: fill when sector grouping is available.
+                turnover_rank_sector=sector_rank,
                 leader_score=leader_score,
             )
+            candidate.meta.update(_sector_theme_log_dict(sector_context, theme_context))
         watch["trade_value_since_capture"] = trade_value_since_capture
         watch["turnover_speed_per_min"] = float(turnover_speed_per_min or 0.0)
         watch["volume_ratio_1m"] = float(volume_ratio_1m or 0.0)
         watch["volume_ratio_5m"] = float(volume_ratio_5m or 0.0)
         watch["turnover_rank_market"] = turnover_rank_market
-        watch["turnover_rank_sector"] = 0
+        watch["turnover_rank_sector"] = sector_rank
+        watch.update(_sector_theme_log_dict(sector_context, theme_context))
         watch["leader_score"] = leader_score
         return MomentumContext(
             candidate=candidate,
@@ -3468,7 +3716,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             volume_ratio_1m=volume_ratio_1m,
             volume_ratio_5m=volume_ratio_5m,
             turnover_rank_market=turnover_rank_market,
-            turnover_rank_sector=0,
+            turnover_rank_sector=sector_rank,
             leader_score=leader_score,
             intraday_vwap=intraday_vwap,
             minute_bars=minute_bars,
@@ -3490,6 +3738,8 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             now_ts=time.time(),
             was_below_vwap=bool(watch.get("was_below_vwap")),
             short_reclaim_high=self.parse_int(watch.get("short_reclaim_high", 0)),
+            sector_context=sector_context,
+            theme_context=theme_context,
         )
 
     def momentum_prediction(self, code, name, decision, current_price, *, stage=2):
@@ -3740,8 +3990,46 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 self.parse_int(watch.get("short_reclaim_high", 0)),
                 current_price,
             )
-        market_snapshot = self.market_state.snapshot()
-        market_regime = getattr(market_snapshot, "market_regime", "") or "neutral"
+        symbol_market = self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown"
+        if hasattr(self, "candidate_registry"):
+            candidate = self.candidate_registry.get(code)
+            if candidate is not None:
+                candidate.meta["symbol_market"] = symbol_market
+        watch["symbol_market"] = symbol_market
+        market_context = _market_context_for_symbol(self.market_state, code, symbol_market)
+        market_regime = getattr(market_context, "primary_market_regime", "") or "neutral"
+        sector_context = _sector_context_for_symbol(
+            getattr(self, "sector_state", None),
+            code,
+            symbol_market,
+            market_context,
+        )
+        sector_rank, sector_ranked_count = _owner_realtime_turnover_rank_sector(
+            self,
+            code,
+            sector_code=getattr(sector_context, "sector_code", ""),
+            current_turnover=time_filter.get("daily_turnover", 0),
+        )
+        sector_context.turnover_rank_sector = sector_rank
+        sector_context.sector_ranked_count = sector_ranked_count
+        theme_context = _theme_context_for_symbol(
+            getattr(self, "theme_state", None),
+            code,
+            _owner_theme_realtime_lookup(self),
+        )
+        market_context_extra = {
+            "symbol_market": symbol_market,
+            "primary_index_code": getattr(market_context, "primary_index_code", ""),
+            "primary_market_regime": getattr(market_context, "primary_market_regime", ""),
+            "primary_market_pct": getattr(market_context, "primary_market_pct", ""),
+            "primary_market_slope_1m": getattr(market_context, "primary_market_slope_1m", ""),
+            "primary_market_slope_3m": getattr(market_context, "primary_market_slope_3m", ""),
+            "primary_market_drawdown_from_high": getattr(market_context, "primary_market_drawdown_from_high", ""),
+            "kospi_regime": getattr(market_context, "kospi_regime", ""),
+            "kosdaq_regime": getattr(market_context, "kosdaq_regime", ""),
+            "market_regime": getattr(market_context, "primary_market_regime", ""),
+            **_sector_theme_log_dict(sector_context, theme_context),
+        }
 
         entry_decision = self.quant_strategy.evaluate_entry(
             capture_price=capture_price,
@@ -3750,6 +4038,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             active_positions=self.active_position_count(),
             recent_low_price=recent_low_price,
             market_state=market_regime,
+            market_context=market_context,
+            sector_context=sector_context,
+            theme_context=theme_context,
             high_since_capture=self.parse_int(
                 getattr(momentum_ctx, "high_since_capture", 0)
                 or watch.get("high_since_capture", 0)
@@ -3880,6 +4171,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                         "turnover_rank_sector",
                         0,
                     ),
+                    **market_context_extra,
                 }
             )
             blocked_prediction.update(self._condition_log_meta(momentum_ctx.candidate, watch))
@@ -3928,6 +4220,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "volume_ratio_5m": getattr(momentum_ctx, "volume_ratio_5m", 0.0) or 0.0,
             "turnover_rank_market": getattr(momentum_ctx, "turnover_rank_market", 0),
             "turnover_rank_sector": getattr(momentum_ctx, "turnover_rank_sector", 0),
+            **market_context_extra,
         }
         common_extra.update(self._condition_log_meta(momentum_ctx.candidate, watch))
         prediction = entry_decision.to_prediction(
@@ -4038,10 +4331,26 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         if not big_ok:
             return {"status": "wait", "stage": 2, "reason": "SAFE 2차 {}".format(big_reason), "reason_code": "SAFE_SECOND_BIG_BUY_WAIT"}
 
-        paused, market_reason = self.market_filter_pauses_buy()
+        paused, market_reason = self.market_filter_pauses_buy(code)
         if paused:
             return {"status": "wait", "stage": 2, "reason": market_reason, "reason_code": "SAFE_SECOND_MARKET_PAUSE"}
 
+        symbol_market = self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown"
+        market_context = _market_context_for_symbol(self.market_state, code, symbol_market)
+        sector_context = _sector_context_for_symbol(getattr(self, "sector_state", None), code, symbol_market, market_context)
+        sector_rank, sector_ranked_count = _owner_realtime_turnover_rank_sector(
+            self,
+            code,
+            sector_code=getattr(sector_context, "sector_code", ""),
+            current_turnover=time_filter.get("daily_turnover", 0),
+        )
+        sector_context.turnover_rank_sector = sector_rank
+        sector_context.sector_ranked_count = sector_ranked_count
+        theme_context = _theme_context_for_symbol(
+            getattr(self, "theme_state", None),
+            code,
+            _owner_theme_realtime_lookup(self),
+        )
         entry_limit_price = scoring.round_down_to_tick(current_price)
         stop_price = scoring.round_down_to_tick(entry_limit_price * (1 - SAFE_PULLBACK_STOP_LOSS_PCT))
         take_profit_price = scoring.round_up_to_tick(entry_limit_price * (1 + SAFE_PULLBACK_TAKE_PROFIT_PCT))
@@ -4072,6 +4381,10 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "ranked_count": time_filter.get("ranked_count", 0),
             "time_filter_phase": time_filter.get("phase", ""),
             "time_filter_weight": time_filter.get("weight", 1.0),
+            "market_regime": getattr(market_context, "primary_market_regime", ""),
+            "symbol_market": symbol_market,
+            "primary_market_regime": getattr(market_context, "primary_market_regime", ""),
+            **_sector_theme_log_dict(sector_context, theme_context),
         }
 
     def should_print_wait_log(self, code):
@@ -4218,6 +4531,11 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "market_regime": getattr(decision, "market_regime", "") or "",
             "market_gate_action": getattr(decision, "market_gate_action", "") or "",
             "market_gate_reason": getattr(decision, "market_gate_reason", "") or "",
+            "context": _ai_context_payload(
+                getattr(ctx, "market_context", None),
+                getattr(ctx, "sector_context", None),
+                getattr(ctx, "theme_context", None),
+            ),
             "enforce_model": False,
         }
         response = self.call_ai_server("/predict-dante-entry", payload)
@@ -4396,6 +4714,27 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "market_regime": prediction.get("market_regime", ""),
             "market_gate_action": prediction.get("market_gate_action", ""),
             "market_gate_reason": prediction.get("market_gate_reason", ""),
+            "context": {
+                "market_context": {
+                    "symbol_market": prediction.get("symbol_market", ""),
+                    "primary_market_regime": prediction.get("primary_market_regime", prediction.get("market_regime", "")),
+                },
+                "sector_context": {
+                    "sector_code": prediction.get("sector_code", ""),
+                    "sector_name": prediction.get("sector_name", ""),
+                    "sector_regime": prediction.get("sector_regime", ""),
+                    "sector_relative_strength_vs_primary": prediction.get("sector_relative_strength_vs_primary", ""),
+                    "sector_gate_action": prediction.get("sector_gate_action", ""),
+                },
+                "theme_context": {
+                    "theme_names": prediction.get("theme_names", ""),
+                    "primary_theme": prediction.get("primary_theme", ""),
+                    "theme_regime": prediction.get("theme_regime", ""),
+                    "theme_active_count": prediction.get("theme_active_count", ""),
+                    "theme_rising_count": prediction.get("theme_rising_count", ""),
+                    "theme_gate_action": prediction.get("theme_gate_action", ""),
+                },
+            },
             "enforce_model": False,
         }
         response = self.call_ai_server("/predict-dante-entry-plan", payload)
@@ -5021,6 +5360,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         turnover_rank_market = int(time_filter.get("turnover_rank", 0) or 0)
         ranked_count = int(time_filter.get("ranked_count", 0) or 0)
         condition_combo = str((getattr(candidate, "meta", {}) or {}).get("condition_combo", "") if candidate is not None else "")
+        symbol_market = self.resolve_symbol_market(code) if hasattr(self, "resolve_symbol_market") else "unknown"
+        if candidate is not None:
+            candidate.meta["symbol_market"] = symbol_market
         vwap_support_ok = bool(intraday_vwap <= 0 or current_price >= intraday_vwap)
         leader_score = calculate_leader_score(
             turnover_speed_per_min=turnover_speed_per_min,
@@ -5045,7 +5387,38 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                 turnover_rank_sector=0,
                 leader_score=leader_score,
             )
-        market_snapshot = self.market_state.snapshot()
+        market_context = _market_context_for_symbol(self.market_state, code, symbol_market)
+        market_snapshot = market_context.to_market_snapshot()
+        sector_context = _sector_context_for_symbol(
+            getattr(self, "sector_state", None),
+            code,
+            symbol_market,
+            market_context,
+        )
+        sector_rank, sector_ranked_count = _owner_realtime_turnover_rank_sector(
+            self,
+            code,
+            sector_code=getattr(sector_context, "sector_code", ""),
+            current_turnover=time_filter.get("daily_turnover", 0),
+        )
+        sector_context.turnover_rank_sector = sector_rank
+        sector_context.sector_ranked_count = sector_ranked_count
+        theme_context = _theme_context_for_symbol(
+            getattr(self, "theme_state", None),
+            code,
+            _owner_theme_realtime_lookup(self),
+        )
+        if candidate is not None:
+            candidate.update_leader_metrics(
+                trade_value_since_capture=trade_value_since_capture,
+                turnover_speed_per_min=turnover_speed_per_min,
+                volume_ratio_1m=volume_ratio_1m,
+                volume_ratio_5m=volume_ratio_5m,
+                turnover_rank_market=turnover_rank_market,
+                turnover_rank_sector=sector_rank,
+                leader_score=leader_score,
+            )
+            candidate.meta.update(_sector_theme_log_dict(sector_context, theme_context))
 
         ctx = entry_strategy.EntryContext(
             code=code,
@@ -5072,6 +5445,9 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             px_over_bb55_pct=px_over_bb55,
             open_return=open_return,
             market_state=market_snapshot,
+            market_context=market_context,
+            sector_context=sector_context,
+            theme_context=theme_context,
             atr_5m_pct=atr_5m_pct,
             intraday_vwap=intraday_vwap,
             pullback_low_after_high=pullback_low_after_high,
@@ -5080,7 +5456,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             volume_ratio_1m=volume_ratio_1m,
             volume_ratio_5m=volume_ratio_5m,
             turnover_rank_market=turnover_rank_market,
-            turnover_rank_sector=0,
+            turnover_rank_sector=sector_rank,
             leader_score=leader_score,
         )
 
@@ -5127,6 +5503,12 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
                     market_regime=getattr(decision, "market_regime", ""),
                     market_gate_action=getattr(decision, "market_gate_action", ""),
                     market_gate_reason=getattr(decision, "market_gate_reason", ""),
+                    sector_regime=getattr(decision, "sector_regime", ""),
+                    sector_gate_action=getattr(decision, "sector_gate_action", ""),
+                    sector_gate_reason=getattr(decision, "sector_gate_reason", ""),
+                    theme_regime=getattr(decision, "theme_regime", ""),
+                    theme_gate_action=getattr(decision, "theme_gate_action", ""),
+                    theme_gate_reason=getattr(decision, "theme_gate_reason", ""),
                 )
 
         if decision.reason_code == entry_strategy.GATE_VOLUME_SPEED:
@@ -5224,11 +5606,21 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "volume_speed": volume_speed,
             "turnover_speed_per_min": turnover_speed_per_min,
             "leader_score": leader_score,
+            "symbol_market": symbol_market,
+            "primary_index_code": getattr(market_context, "primary_index_code", ""),
+            "primary_market_regime": getattr(market_context, "primary_market_regime", ""),
+            "primary_market_pct": getattr(market_context, "primary_market_pct", ""),
+            "primary_market_slope_1m": getattr(market_context, "primary_market_slope_1m", ""),
+            "primary_market_slope_3m": getattr(market_context, "primary_market_slope_3m", ""),
+            "primary_market_drawdown_from_high": getattr(market_context, "primary_market_drawdown_from_high", ""),
+            "kospi_regime": getattr(market_context, "kospi_regime", ""),
+            "kosdaq_regime": getattr(market_context, "kosdaq_regime", ""),
+            **_sector_theme_log_dict(sector_context, theme_context),
             "trade_value_since_capture": trade_value_since_capture,
             "volume_ratio_1m": volume_ratio_1m,
             "volume_ratio_5m": volume_ratio_5m,
             "turnover_rank_market": turnover_rank_market,
-            "turnover_rank_sector": 0,
+            "turnover_rank_sector": sector_rank,
             "daily_turnover": time_filter.get("daily_turnover", 0),
             "turnover_rank": time_filter.get("turnover_rank", 0),
             "ranked_count": time_filter.get("ranked_count", 0),
@@ -5262,7 +5654,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             "model_target": getattr(decision, "model_target", "") or "",
             "model_threshold": getattr(decision, "model_threshold", "") or "",
             # 매크로 dry-run 메타 — place_buy_order 등 trade_log 호출처에서 그대로 사용.
-            "market_regime": getattr(decision, "market_regime", "") or "",
+            "market_regime": getattr(decision, "market_regime", "") or getattr(market_context, "primary_market_regime", ""),
             "market_gate_action": getattr(decision, "market_gate_action", "") or "",
             "market_gate_reason": getattr(decision, "market_gate_reason", "") or "",
         }
@@ -6119,6 +6511,59 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
         self.set_real_reg(INDEX_REALTIME_SCREEN_NO, codes, fids, "0")
         self.index_realtime_registered = True
         logger.info("[매크로] KOSPI/KOSDAQ 업종지수 실시간 등록 (screen %s)", INDEX_REALTIME_SCREEN_NO)
+
+    def register_realtime_sector_index(self, sector_index_code):
+        if not getattr(TRADE_CONFIG, "sector_index_realtime_enabled", True):
+            return False
+        code = str(sector_index_code or "").strip()
+        if not code or code in getattr(self, "sector_index_realtime_registered_codes", set()):
+            return bool(code)
+        registered = getattr(self, "sector_index_realtime_registered_codes", set())
+        per_screen = int(getattr(TRADE_CONFIG, "sector_realtime_codes_per_screen", 100) or 100)
+        base = int(getattr(TRADE_CONFIG, "sector_realtime_screen_base", "0180") or "0180")
+        screen_no = str(base + (len(registered) // per_screen)).zfill(4)
+        fids = ";".join([
+            get_fid("현재가"),
+            get_fid("시가"),
+            get_fid("고가"),
+            get_fid("저가"),
+            get_fid("체결시간"),
+        ])
+        opt_type = "0" if len(registered) % per_screen == 0 else "1"
+        self.set_real_reg(screen_no, code, fids, opt_type)
+        registered.add(code)
+        self.sector_index_realtime_registered_codes = registered
+        self.sector_index_realtime_code_screens[code] = screen_no
+        if hasattr(self, "sector_state"):
+            sector_code = getattr(self.sector_state, "index_to_sector_code", {}).get(code, "")
+            if sector_code:
+                self.sector_state.register_sector_index_if_needed(sector_code)
+        logger.info("[sector] 업종지수 실시간 등록 %s screen=%s", code, screen_no)
+        return True
+
+    def register_realtime_sector_indices_for_candidate(self, code):
+        if not getattr(TRADE_CONFIG, "sector_state_enabled", True):
+            return False
+        sector_state = getattr(self, "sector_state", None)
+        if sector_state is None:
+            return False
+        meta = sector_state.resolve_symbol_sector(code)
+        index_code = meta.get("sector_index_code", "") if meta else ""
+        if not index_code:
+            return False
+        sector_state.register_sector_index_if_needed(meta.get("sector_code", ""))
+        return self.register_realtime_sector_index(index_code)
+
+    def route_sector_index_real_data(self, s_code, price, ts):
+        sector_state = getattr(self, "sector_state", None)
+        if sector_state is None:
+            return False
+        code = str(s_code or "").strip()
+        registered = getattr(self, "sector_index_realtime_registered_codes", set())
+        if code not in registered and code not in getattr(sector_state, "index_to_sector_code", {}):
+            return False
+        sector_state.update(code, float(price), ts)
+        return True
 
     def get_realtime_screen_no(self):
         screen_offset = len(self.realtime_registered_codes) // REALTIME_CODES_PER_SCREEN

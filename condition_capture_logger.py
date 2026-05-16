@@ -28,6 +28,12 @@ CONDITION_CAPTURE_FIELDS = [
     "condition_name",
     *CONDITION_COMBO_META_FIELDS,
     *LEADER_META_FIELDS,
+    "symbol_market",
+    "sector_code",
+    "sector_name",
+    "sector_index_code",
+    "primary_theme",
+    "theme_names",
     "strategy_name",
     "condition_formula",
     "condition_formula_version",
@@ -85,6 +91,12 @@ class ConditionCaptureEvent:
     turnover_rank_market: Union[int, str, None] = ""
     turnover_rank_sector: Union[int, str, None] = ""
     leader_score: Union[float, str, None] = ""
+    symbol_market: str = ""
+    sector_code: str = ""
+    sector_name: str = ""
+    sector_index_code: str = ""
+    primary_theme: str = ""
+    theme_names: str = ""
     strategy_name: str = ""
     condition_formula: str = ""
     condition_formula_version: str = ""
@@ -160,6 +172,12 @@ class ConditionCaptureEvent:
             "turnover_rank_market": self.turnover_rank_market,
             "turnover_rank_sector": self.turnover_rank_sector,
             "leader_score": self.leader_score,
+            "symbol_market": self.symbol_market,
+            "sector_code": self.sector_code,
+            "sector_name": self.sector_name,
+            "sector_index_code": self.sector_index_code,
+            "primary_theme": self.primary_theme,
+            "theme_names": self.theme_names,
             "strategy_name": self.strategy_name or TRADE_CONFIG.strategy_name,
             "condition_formula": self.condition_formula or TRADE_CONFIG.condition_formula,
             "condition_formula_version": (
@@ -267,7 +285,16 @@ class ConditionCaptureLogger:
                 analysis_allowed=analysis_allowed,
                 **{
                     key: condition_meta.get(key, "")
-                    for key in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)
+                    for key in (
+                        *CONDITION_COMBO_META_FIELDS,
+                        *LEADER_META_FIELDS,
+                        "symbol_market",
+                        "sector_code",
+                        "sector_name",
+                        "sector_index_code",
+                        "primary_theme",
+                        "theme_names",
+                    )
                 },
             )
         )
@@ -323,7 +350,16 @@ class ConditionCaptureLogger:
                 analysis_allowed=analysis_allowed,
                 **{
                     key: condition_meta.get(key, "")
-                    for key in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS)
+                    for key in (
+                        *CONDITION_COMBO_META_FIELDS,
+                        *LEADER_META_FIELDS,
+                        "symbol_market",
+                        "sector_code",
+                        "sector_name",
+                        "sector_index_code",
+                        "primary_theme",
+                        "theme_names",
+                    )
                 },
             )
         )
@@ -335,7 +371,16 @@ def read_condition_captures(path: str = CONDITION_CAPTURE_CSV) -> List[Dict[str,
     with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     for row in rows:
-        for field in (*CONDITION_COMBO_META_FIELDS, *LEADER_META_FIELDS):
+        for field in (
+            *CONDITION_COMBO_META_FIELDS,
+            *LEADER_META_FIELDS,
+            "symbol_market",
+            "sector_code",
+            "sector_name",
+            "sector_index_code",
+            "primary_theme",
+            "theme_names",
+        ):
             row.setdefault(field, "")
         if not row.get("primary_condition_name"):
             row["primary_condition_name"] = getattr(
