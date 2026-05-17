@@ -131,6 +131,31 @@ def _theme_context_for_symbol(theme_state_cache, code, realtime_lookup):
     return theme_state_cache.snapshot_for_symbol(code, realtime_lookup=realtime_lookup)
 
 
+def _log_sector_theme_map_startup_status(sector_state_cache, theme_state_cache):
+    policy = str(getattr(TRADE_CONFIG, "sector_theme_map_policy", "warn") or "warn").lower()
+    reports = []
+    if getattr(TRADE_CONFIG, "sector_state_enabled", False):
+        reports.append(("sector", getattr(sector_state_cache, "map_validation", None)))
+    if getattr(TRADE_CONFIG, "theme_state_enabled", False):
+        reports.append(("theme", getattr(theme_state_cache, "map_validation", None)))
+    failed = []
+    for kind, report in reports:
+        if report is None:
+            logger.warning("[%s][startup] map validation unavailable", kind)
+            continue
+        log = logger.info if report.ok else logger.warning
+        log("[%s][startup] %s", kind, report.message())
+        if report.empty or report.missing_columns:
+            failed.append(report)
+    if failed and policy == "fail":
+        detail = "; ".join(report.message() for report in failed)
+        raise RuntimeError(
+            "sector/theme map validation failed at startup: "
+            + detail
+            + " (set KIWOOM_SECTOR_THEME_MAP_POLICY=warn to allow dry-run fallback)"
+        )
+
+
 def _owner_theme_realtime_lookup(owner):
     if owner is not None and hasattr(owner, "theme_realtime_lookup"):
         return owner.theme_realtime_lookup
@@ -489,6 +514,7 @@ class Kiwoom(TrainingRecorderMixin, QAxWidget):
             self.sector_state.load_sector_maps()
         if TRADE_CONFIG.theme_state_enabled:
             self.theme_state.load_theme_map()
+        _log_sector_theme_map_startup_status(self.sector_state, self.theme_state)
         self.sector_index_realtime_registered_codes = set()
         self.sector_index_realtime_code_screens = {}
         self.index_realtime_registered = False

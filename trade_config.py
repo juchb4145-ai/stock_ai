@@ -170,6 +170,7 @@ class TradeConfig:
     legacy_filter_veto_breakout_small: bool = False
     sector_state_enabled: bool = True
     sector_gate_enforcement_enabled: bool = False
+    sector_theme_map_policy: str = "warn"
     sector_map_path: str = "data/sector_map.csv"
     sector_index_realtime_enabled: bool = True
     sector_realtime_screen_base: str = "0180"
@@ -646,6 +647,10 @@ class TradeConfig:
                 "KIWOOM_SECTOR_GATE_ENFORCEMENT_ENABLED",
                 cls.sector_gate_enforcement_enabled,
             ),
+            sector_theme_map_policy=_env_str(
+                "KIWOOM_SECTOR_THEME_MAP_POLICY",
+                cls.sector_theme_map_policy,
+            ).lower(),
             sector_map_path=_env_str("KIWOOM_SECTOR_MAP_PATH", cls.sector_map_path),
             sector_index_realtime_enabled=_env_bool(
                 "KIWOOM_SECTOR_INDEX_REALTIME_ENABLED",

@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from sector_theme_maps import MapValidation, validate_sector_map
 from market_state import (
     IndexState,
     MarketSnapshot,
@@ -88,6 +89,7 @@ class SectorStateCache:
         self.symbol_sector: Dict[str, Dict[str, str]] = {}
         self.indices: Dict[str, IndexState] = {}
         self.index_to_sector_code: Dict[str, str] = {}
+        self.map_validation: Optional[MapValidation] = None
 
     @staticmethod
     def normalize_code(code: str) -> str:
@@ -96,6 +98,10 @@ class SectorStateCache:
     def load_sector_maps(self) -> None:
         self.symbol_sector.clear()
         self.index_to_sector_code.clear()
+        self.map_validation = validate_sector_map(self.map_path)
+        if not self.map_validation.ok:
+            logger.warning("[sector] %s - sector unknown fallback", self.map_validation.message())
+            return
         if not os.path.exists(self.map_path):
             logger.info("[sector] sector_map.csv 없음 - sector unknown fallback")
             return

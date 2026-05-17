@@ -180,3 +180,23 @@ python -m py_compile review\post_market.py review\structured_log.py tools\post_m
 
 - [POST_MARKET_REVIEW_GUIDE.md](POST_MARKET_REVIEW_GUIDE.md)
 - [../reports/post_market/README.md](../reports/post_market/README.md)
+## Sector/Theme Map Preflight
+
+Before enabling or reviewing the sector/theme dry-run gates, validate that
+`data/sector_map.csv` and `data/theme_map.csv` are not missing or header-only:
+
+```powershell
+.\venv64\Scripts\python.exe tools\bootstrap_sector_theme_maps.py --validate-only --fail-on-empty
+```
+
+Bootstrap local Kiwoom/exported data into the production maps:
+
+```powershell
+.\venv64\Scripts\python.exe tools\bootstrap_sector_theme_maps.py `
+  --sector-source path\to\sector_source.csv `
+  --theme-source path\to\theme_source.json `
+  --fail-on-empty
+```
+
+See [SECTOR_THEME_MAPS.md](SECTOR_THEME_MAPS.md) for the CSV/JSON formats and
+startup fail-fast policy.

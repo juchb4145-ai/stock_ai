@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
+from sector_theme_maps import MapValidation, validate_theme_map
 from market_state import REGIME_NEUTRAL, REGIME_RISK_OFF, REGIME_STRONG, REGIME_UNKNOWN, REGIME_WEAK
 
 
@@ -80,6 +81,7 @@ class ThemeStateCache:
         self.min_active_symbols = int(min_active_symbols or 2)
         self.symbol_themes: Dict[str, List[Dict[str, str]]] = {}
         self.theme_members: Dict[str, List[Dict[str, str]]] = {}
+        self.map_validation: Optional[MapValidation] = None
 
     @staticmethod
     def normalize_code(code: str) -> str:
@@ -88,6 +90,10 @@ class ThemeStateCache:
     def load_theme_map(self) -> None:
         self.symbol_themes.clear()
         self.theme_members.clear()
+        self.map_validation = validate_theme_map(self.map_path)
+        if not self.map_validation.ok:
+            logger.warning("[theme] %s - theme unknown fallback", self.map_validation.message())
+            return
         if not os.path.exists(self.map_path):
             logger.info("[theme] theme map 없음 - theme unknown fallback")
             return
