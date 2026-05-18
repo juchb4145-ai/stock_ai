@@ -185,6 +185,16 @@ def _write_main_log(path: Path) -> None:
                 "time_policy_decision": "ALLOW_ENTRY",
                 "order_guard_decision": None,
                 "strategy_version": "test-v1",
+                "market_regime": "weak",
+                "market_gate_action": "dry_run_block_chase_only",
+                "market_gate_reason": "GATE_MARKET_WEAK_CHASE_BLOCK",
+                "sector_regime": "risk_off",
+                "sector_gate_action": "dry_run_block_chase_only",
+                "sector_gate_reason": "GATE_SECTOR_RISK_OFF",
+                "theme_regime": "neutral",
+                "theme_gate_action": "dry_run_allow",
+                "theme_gate_reason": "",
+                "turnover_rank_sector": 3,
                 "decision_trace": {
                     "momentum_decision": "REJECT",
                     "legacy_decision": "READY",
@@ -494,6 +504,16 @@ class PostMarketReviewTests(unittest.TestCase):
                 "strategy_name",
                 "decision_trace",
                 "join_quality",
+                "market_regime",
+                "market_gate_action",
+                "market_gate_reason",
+                "sector_regime",
+                "sector_gate_action",
+                "sector_gate_reason",
+                "theme_regime",
+                "theme_gate_action",
+                "theme_gate_reason",
+                "turnover_rank_sector",
                 "data_quality",
                 "review_category",
             ):
@@ -519,6 +539,12 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertIsInstance(loss_json["exit_decision_trace"], dict)
             self.assertEqual(loss_json["exit_decision_trace"]["matched_rule"], "hard_stop_fixed_pct")
             self.assertIsInstance(missed_json["decision_trace"], dict)
+            self.assertEqual(missed_json["market_regime"], "weak")
+            self.assertEqual(missed_json["market_gate_action"], "dry_run_block_chase_only")
+            self.assertEqual(missed_json["sector_gate_reason"], "GATE_SECTOR_RISK_OFF")
+            self.assertEqual(missed_json["theme_gate_action"], "dry_run_allow")
+            self.assertEqual(missed_json["turnover_rank_sector"], 3.0)
+            self.assertEqual(missed_json["decision_trace"]["market_gate_reason"], "GATE_MARKET_WEAK_CHASE_BLOCK")
             self.assertEqual(missed_json["decision_trace"]["momentum_decision"], "REJECT")
             self.assertEqual(missed_json["decision_trace"]["legacy_decision"], "READY")
             self.assertEqual(missed_json["decision_trace"]["time_policy_decision"], "ALLOW_ENTRY")

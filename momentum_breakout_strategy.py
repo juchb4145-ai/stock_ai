@@ -1303,6 +1303,13 @@ class MomentumBreakoutStrategy:
                 reason_code = "WAIT_LEADER_SCORE"
                 reason = "leader score wait {:.1f} < {:.1f}".format(score, threshold)
             else:
+                if self._post_opening_weak_leader_context_relief(
+                    ctx,
+                    metrics,
+                    score=score,
+                    threshold=threshold,
+                ):
+                    return None
                 action = EntryDecision.BLOCK_CHASE
                 reason_code = "BLOCK_WEAK_LEADER"
                 reason = "leader score weak {:.1f} < {:.1f}".format(score, threshold)
@@ -1314,6 +1321,83 @@ class MomentumBreakoutStrategy:
                 metrics=metrics,
             )
         return None
+
+    def _post_opening_weak_leader_context_relief(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        *,
+        score: float,
+        threshold: float,
+    ) -> bool:
+        relief = float(
+            getattr(self.config, "post_opening_weak_leader_context_relief", 0.0)
+            or 0.0
+        )
+        if relief <= 0 or threshold - score > relief:
+            return False
+        min_score = float(
+            getattr(self.config, "post_opening_weak_leader_min_score", threshold)
+            or threshold
+        )
+        if score < min_score:
+            return False
+        metrics["leader_score_context_relief_checked"] = 1.0
+
+        one_min_reversal = (
+            bool(ctx.one_min_reversal)
+            if ctx.one_min_reversal is not None
+            else self._bullish_reversal(ctx.minute_bars)
+        )
+        if not one_min_reversal:
+            metrics["leader_score_context_relief"] = 0.0
+            return False
+        if float(ctx.spread_rate or 0.0) > float(self.config.max_spread_pct or 0.0):
+            metrics["leader_score_context_relief"] = 0.0
+            return False
+
+        vwap_support_ok = bool(metrics.get("vwap_support_ok", 0.0))
+        upper_wick_ok = float(ctx.upper_wick_ratio or 0.0) <= float(
+            self.config.max_upper_wick_ratio or 0.0
+        )
+        reclaim_strength = float(
+            getattr(
+                self.config,
+                "vwap_reclaim_buy_trade_strength",
+                self.config.min_trade_strength,
+            )
+            or self.config.min_trade_strength
+        )
+        vwap_reclaim_context = (
+            vwap_support_ok
+            and upper_wick_ok
+            and float(ctx.chejan_strength or 0.0) >= reclaim_strength
+        )
+
+        min_turnover = float(
+            getattr(self.config, "post_opening_weak_leader_min_turnover_speed", 0.0)
+            or 0.0
+        )
+        min_strength = float(
+            getattr(self.config, "post_opening_weak_leader_min_trade_strength", 0.0)
+            or 0.0
+        )
+        pullback_dry_run = metrics.get("pullback_dry_run", {}) or {}
+        dry_run_1pct = False
+        if isinstance(pullback_dry_run, dict):
+            dry_run_1pct = bool((pullback_dry_run.get("0.0100") or {}).get("passes"))
+        pullback_context = (
+            dry_run_1pct
+            and float(ctx.turnover_speed_per_min or 0.0) >= min_turnover
+            and float(ctx.chejan_strength or 0.0) >= min_strength
+        )
+
+        allowed = bool(vwap_reclaim_context or pullback_context)
+        metrics["leader_score_context_relief"] = 1.0 if allowed else 0.0
+        if allowed:
+            metrics["leader_score_context_min"] = min_score
+            metrics["leader_score_context_relief_points"] = threshold - score
+        return allowed
 
     @staticmethod
     def _wait_data(

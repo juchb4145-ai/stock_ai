@@ -14,7 +14,7 @@
 - win rate: missing
 - realized pnl: missing
 - mode: live
-- generated_at: 2026-05-17 17:59:34
+- generated_at: 2026-05-15 20:45:55
 
 ## Daily Buy Gate Funnel
 | metric | value |
@@ -30,13 +30,6 @@
 | order_attempted | 0 |
 | order_filled | 0 |
 | policy_row_count | 770 |
-
-## Market/Sector/Theme Gates
-| field | value | row_count | unique_symbol_count | missed_count | avg_mfe_pct |
-|---|---|---:|---:|---:|---:|
-| gate_payload | missing | 0 | 0 | 0 | missing |
-
-- no structured market/sector/theme gate fields found in matched 2026-05-15 logs.
 
 ## Reason Counts by Unique Symbol
 | reason | row_count | unique_symbol_count | avg_mfe_pct | missed_count |

@@ -136,6 +136,10 @@ class TradeConfig:
     opening_quant_only_min_leader_score: float = 65.0
     first_pullback_leader_score_relief: float = 7.0
     post_opening_min_leader_score: float = 60.0
+    post_opening_weak_leader_context_relief: float = 5.0
+    post_opening_weak_leader_min_score: float = 55.0
+    post_opening_weak_leader_min_trade_strength: float = 120.0
+    post_opening_weak_leader_min_turnover_speed: float = 300_000_000.0
     opening_leader_start: str = "09:00:00"
     opening_leader_end: str = "09:30:00"
     leader_score_turnover_speed_full: float = 200_000_000.0
@@ -510,6 +514,22 @@ class TradeConfig:
             post_opening_min_leader_score=_env_float(
                 "KIWOOM_POST_OPENING_MIN_LEADER_SCORE",
                 cls.post_opening_min_leader_score,
+            ),
+            post_opening_weak_leader_context_relief=_env_float(
+                "KIWOOM_POST_OPENING_WEAK_LEADER_CONTEXT_RELIEF",
+                cls.post_opening_weak_leader_context_relief,
+            ),
+            post_opening_weak_leader_min_score=_env_float(
+                "KIWOOM_POST_OPENING_WEAK_LEADER_MIN_SCORE",
+                cls.post_opening_weak_leader_min_score,
+            ),
+            post_opening_weak_leader_min_trade_strength=_env_float(
+                "KIWOOM_POST_OPENING_WEAK_LEADER_MIN_TRADE_STRENGTH",
+                cls.post_opening_weak_leader_min_trade_strength,
+            ),
+            post_opening_weak_leader_min_turnover_speed=_env_float(
+                "KIWOOM_POST_OPENING_WEAK_LEADER_MIN_TURNOVER_SPEED",
+                cls.post_opening_weak_leader_min_turnover_speed,
             ),
             opening_leader_start=os.environ.get(
                 "KIWOOM_OPENING_LEADER_START",

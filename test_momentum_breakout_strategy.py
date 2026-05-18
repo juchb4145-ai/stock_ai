@@ -273,6 +273,69 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         self.assertEqual(decision.action, EntryDecision.BLOCK_CHASE)
         self.assertEqual(decision.reason_code, "BLOCK_WEAK_LEADER")
 
+    def test_near_threshold_weak_leader_continues_to_vwap_gate_when_pullback_context_is_constructive(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(post_opening_min_leader_score=60.0, candidate_expiry_seconds=10_000_000_000)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                leader_score=56.5,
+                now_ts=_ts("09:45:00"),
+                intraday_vwap=9_900,
+                turnover_speed_per_min=350_000_000,
+                chejan_strength=125.0,
+                volume_ratio=0.1,
+                volume_ratio_1m=0.1,
+                volume_ratio_5m=0.1,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.REJECT)
+        self.assertEqual(decision.reason_code, "BLOCK_BELOW_VWAP_WEAK_FLOW")
+        self.assertEqual(decision.metrics["leader_score_context_relief"], 1.0)
+
+    def test_near_threshold_weak_leader_does_not_turn_shallow_good_reject_into_buy(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(post_opening_min_leader_score=60.0, candidate_expiry_seconds=10_000_000_000)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                leader_score=58.5,
+                now_ts=_ts("09:45:00"),
+                current_price=10_010,
+                intraday_vwap=9_900,
+                high_since_capture=10_080,
+                chejan_strength=155.0,
+                turnover_speed_per_min=40_000_000,
+                upper_wick_ratio=0.29,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.WAIT_PULLBACK)
+        self.assertEqual(decision.reason_code, "WAIT_PULLBACK")
+        self.assertEqual(decision.metrics["leader_score_context_relief"], 1.0)
+
+    def test_sub_context_minimum_weak_leader_still_blocks_after_opening_phase(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(post_opening_min_leader_score=60.0, candidate_expiry_seconds=10_000_000_000)
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                leader_score=54.9,
+                now_ts=_ts("09:45:00"),
+                current_price=10_010,
+                intraday_vwap=9_900,
+                chejan_strength=180.0,
+                upper_wick_ratio=0.1,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BLOCK_CHASE)
+        self.assertEqual(decision.reason_code, "BLOCK_WEAK_LEADER")
+
     def test_missing_vwap_forbids_buy(self):
         strategy = MomentumBreakoutStrategy(TradeConfig(require_vwap_filter=True))
 

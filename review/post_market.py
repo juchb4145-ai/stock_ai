@@ -178,6 +178,7 @@ REVIEW_COLUMNS = [
     "return_after_60m",
     "volume_ratio",
     "turnover_speed_per_min",
+    "turnover_rank_sector",
     "trade_strength",
     "spread_rate",
     "vwap",
@@ -192,6 +193,15 @@ REVIEW_COLUMNS = [
     "one_min_reversal",
     "entry_type",
     "position_size_multiplier",
+    "market_regime",
+    "market_gate_action",
+    "market_gate_reason",
+    "sector_regime",
+    "sector_gate_action",
+    "sector_gate_reason",
+    "theme_regime",
+    "theme_gate_action",
+    "theme_gate_reason",
     "time_policy_reason",
     "time_policy_source",
     "order_guard_reason",
@@ -339,6 +349,7 @@ class ReviewRow:
     return_after_60m: Optional[float]
     volume_ratio: Optional[float]
     turnover_speed_per_min: Optional[float]
+    turnover_rank_sector: Optional[float]
     trade_strength: Optional[float]
     spread_rate: Optional[float]
     vwap: Optional[float]
@@ -353,6 +364,15 @@ class ReviewRow:
     one_min_reversal: Optional[bool]
     entry_type: str
     position_size_multiplier: Optional[float]
+    market_regime: str
+    market_gate_action: str
+    market_gate_reason: str
+    sector_regime: str
+    sector_gate_action: str
+    sector_gate_reason: str
+    theme_regime: str
+    theme_gate_action: str
+    theme_gate_reason: str
     time_policy_reason: str
     time_policy_source: str
     order_guard_reason: str
@@ -412,6 +432,7 @@ class ReviewRow:
             "return_after_60m": self.return_after_60m,
             "volume_ratio": self.volume_ratio,
             "turnover_speed_per_min": self.turnover_speed_per_min,
+            "turnover_rank_sector": self.turnover_rank_sector,
             "trade_strength": self.trade_strength,
             "spread_rate": self.spread_rate,
             "vwap": self.vwap,
@@ -426,6 +447,15 @@ class ReviewRow:
             "one_min_reversal": self.one_min_reversal,
             "entry_type": self.entry_type,
             "position_size_multiplier": self.position_size_multiplier,
+            "market_regime": self.market_regime,
+            "market_gate_action": self.market_gate_action,
+            "market_gate_reason": self.market_gate_reason,
+            "sector_regime": self.sector_regime,
+            "sector_gate_action": self.sector_gate_action,
+            "sector_gate_reason": self.sector_gate_reason,
+            "theme_regime": self.theme_regime,
+            "theme_gate_action": self.theme_gate_action,
+            "theme_gate_reason": self.theme_gate_reason,
             "time_policy_reason": self.time_policy_reason,
             "time_policy_source": self.time_policy_source,
             "order_guard_reason": self.order_guard_reason,
@@ -1511,6 +1541,13 @@ def build_review_row(
         return_after_60m=flow.return_after_60m,
         volume_ratio=_as_float(metrics_source.get("volume_ratio")),
         turnover_speed_per_min=_as_float(metrics_source.get("turnover_speed_per_min")),
+        turnover_rank_sector=_as_float(
+            _first_text(
+                final.get("turnover_rank_sector") if final else None,
+                momentum.get("turnover_rank_sector") if momentum else None,
+                metrics_source.get("turnover_rank_sector"),
+            )
+        ),
         trade_strength=_as_float(metrics_source.get("trade_strength")),
         spread_rate=_as_float(metrics_source.get("spread_rate")),
         vwap=_as_float(metrics_source.get("vwap")),
@@ -1525,6 +1562,15 @@ def build_review_row(
         one_min_reversal=_as_bool(metrics_source.get("one_min_reversal")),
         entry_type=str(metrics_source.get("entry_type") or ""),
         position_size_multiplier=_as_float(metrics_source.get("position_size_multiplier")),
+        market_regime=_first_text(final.get("market_regime") if final else None, momentum.get("market_regime") if momentum else None),
+        market_gate_action=_first_text(final.get("market_gate_action") if final else None, momentum.get("market_gate_action") if momentum else None),
+        market_gate_reason=_first_text(final.get("market_gate_reason") if final else None, momentum.get("market_gate_reason") if momentum else None),
+        sector_regime=_first_text(final.get("sector_regime") if final else None, momentum.get("sector_regime") if momentum else None),
+        sector_gate_action=_first_text(final.get("sector_gate_action") if final else None, momentum.get("sector_gate_action") if momentum else None),
+        sector_gate_reason=_first_text(final.get("sector_gate_reason") if final else None, momentum.get("sector_gate_reason") if momentum else None),
+        theme_regime=_first_text(final.get("theme_regime") if final else None, momentum.get("theme_regime") if momentum else None),
+        theme_gate_action=_first_text(final.get("theme_gate_action") if final else None, momentum.get("theme_gate_action") if momentum else None),
+        theme_gate_reason=_first_text(final.get("theme_gate_reason") if final else None, momentum.get("theme_gate_reason") if momentum else None),
         time_policy_reason=time_policy_reason,
         time_policy_source=time_policy_source,
         order_guard_reason=order_guard_reason,
@@ -1545,6 +1591,7 @@ def _derived_metrics_from_flow(flow: PriceFlow) -> Dict[str, object]:
         "prior_high": flow.prior_high_at_signal,
         "prior_high_source": "post_market_intraday",
         "volume_ratio": flow.volume_ratio_at_signal,
+        "turnover_rank_sector": None,
         "upper_wick_ratio": flow.upper_wick_ratio_at_signal,
         "trade_strength": None,
         "spread_rate": None,
@@ -1606,6 +1653,20 @@ def _build_decision_trace(
         trace.setdefault("reason_code", final.get("reason_code"))
         trace.setdefault("pullback_dry_run", final.get("pullback_dry_run"))
         trace.setdefault("prior_high_source", final.get("prior_high_source"))
+        for key in (
+            "market_regime",
+            "market_gate_action",
+            "market_gate_reason",
+            "sector_regime",
+            "sector_gate_action",
+            "sector_gate_reason",
+            "theme_regime",
+            "theme_gate_action",
+            "theme_gate_reason",
+            "turnover_rank_sector",
+        ):
+            if key in final:
+                trace.setdefault(key, final.get(key))
         if "order_guard_decision" in final:
             trace.setdefault("order_guard_decision", final.get("order_guard_decision"))
     if momentum:
@@ -1613,6 +1674,20 @@ def _build_decision_trace(
         trace.setdefault("reason_code", momentum.get("reason_code"))
         trace.setdefault("pullback_pct", momentum.get("pullback_pct"))
         trace.setdefault("pullback_dry_run", momentum.get("pullback_dry_run"))
+        for key in (
+            "market_regime",
+            "market_gate_action",
+            "market_gate_reason",
+            "sector_regime",
+            "sector_gate_action",
+            "sector_gate_reason",
+            "theme_regime",
+            "theme_gate_action",
+            "theme_gate_reason",
+            "turnover_rank_sector",
+        ):
+            if key in momentum:
+                trace.setdefault(key, momentum.get(key))
     if guard:
         if "order_guard_decision" not in trace:
             trace["order_guard_decision"] = {
@@ -1850,6 +1925,9 @@ def write_markdown_summary(result: ReviewResult, path: str | Path) -> None:
     lines.append("## Daily Buy Gate Funnel")
     lines.extend(_daily_buy_gate_funnel_lines(rows))
     lines.append("")
+    lines.append("## Market/Sector/Theme Gates")
+    lines.extend(_market_sector_theme_gate_lines(rows))
+    lines.append("")
     lines.append("## Reason Counts by Unique Symbol")
     lines.extend(_reason_counts_unique_lines(non_traded))
     lines.append("")
@@ -1959,6 +2037,52 @@ def _daily_buy_gate_funnel_lines(rows: Sequence[ReviewRow]) -> List[str]:
     lines = ["| metric | value |", "|---|---:|"]
     for name, value in metrics:
         lines.append(f"| {name} | {value} |")
+    return lines
+
+
+def _market_sector_theme_gate_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    fields = [
+        "market_regime",
+        "market_gate_action",
+        "market_gate_reason",
+        "sector_regime",
+        "sector_gate_action",
+        "sector_gate_reason",
+        "theme_regime",
+        "theme_gate_action",
+        "theme_gate_reason",
+    ]
+    has_gate_data = any(
+        str(getattr(row, field, "") or "").strip()
+        for row in rows
+        for field in fields
+    )
+    lines = [
+        "| field | value | row_count | unique_symbol_count | missed_count | avg_mfe_pct |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    if not has_gate_data:
+        lines.append("| gate_payload | missing | 0 | 0 | 0 | missing |")
+        lines.append("")
+        lines.append("- no structured market/sector/theme gate fields found in matched 2026-05-15 logs.")
+        return lines
+    for field in fields:
+        grouped: Dict[str, List[ReviewRow]] = defaultdict(list)
+        for row in rows:
+            value = str(getattr(row, field, "") or "").strip()
+            if value:
+                grouped[value].append(row)
+        for value, members in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+            lines.append(
+                "| {field} | {value} | {rows} | {symbols} | {missed} | {mfe} |".format(
+                    field=field,
+                    value=_short(value),
+                    rows=len(members),
+                    symbols=len({row.symbol for row in members}),
+                    missed=sum(1 for row in members if row.missed_opportunity),
+                    mfe=_fmt_pct(_mean([row.mfe_pct for row in members])),
+                )
+            )
     return lines
 
 
