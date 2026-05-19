@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 ENTRY_TYPE_BREAKOUT_SMALL = "BREAKOUT_SMALL"
 ENTRY_TYPE_PULLBACK_RECLAIM = "PULLBACK_RECLAIM"
+ENTRY_TYPE_OPENING_RECOVERY_PROBE = "OPENING_RECOVERY_PROBE"
 ENTRY_TYPE_MIDDAY_VWAP_RECLAIM = "MIDDAY_VWAP_RECLAIM"
 ENTRY_TYPE_AFTERNOON_SECOND_WAVE = "AFTERNOON_SECOND_WAVE"
 ENTRY_TYPE_CLOSING_STRENGTH = "CLOSING_STRENGTH"
@@ -142,6 +143,7 @@ class MomentumBreakoutStrategy:
         min_observation_sec = self._min_observation_seconds(late_a_grade_candidate)
         metrics["min_observation_sec"] = float(min_observation_sec)
         metrics["late_a_grade_candidate"] = 1.0 if late_a_grade_candidate else 0.0
+        deferred_time_policy_block: Optional[MomentumDecision] = None
 
         if bool(self.config.time_policy_enabled):
             time_decision = self.time_policy.evaluate_entry(
@@ -164,14 +166,18 @@ class MomentumBreakoutStrategy:
                 metrics["paper_strategy_type"] = paper_window_type
                 if not paper_window_type:
                     return self._time_policy_block(time_decision, metrics)
+                deferred_time_policy_block = self._time_policy_block(time_decision, metrics)
             cutoff_block = self._entry_cutoff_block(ctx, metrics, age, min_observation_sec)
             if cutoff_block is not None:
                 paper_window_type = self.time_policy.paper_strategy_type(now=now_ts)
                 metrics["paper_strategy_type"] = paper_window_type
                 if not paper_window_type:
                     return cutoff_block
+                deferred_time_policy_block = cutoff_block
 
         if c.is_expired(now=now_ts, expiry_seconds=self.config.candidate_expiry_seconds):
+            if deferred_time_policy_block is not None:
+                return deferred_time_policy_block
             return MomentumDecision(
                 EntryDecision.REJECT,
                 "candidate expired age={:.0f}s limit={}s".format(
@@ -223,6 +229,8 @@ class MomentumBreakoutStrategy:
         paper_decision = self._paper_strategy_decision(ctx, metrics, bullish_reversal)
         if paper_decision is not None:
             return paper_decision
+        if deferred_time_policy_block is not None:
+            return deferred_time_policy_block
         if metrics.get("time_policy_reason_code") == "ALLOW_MIDDAY_ENTRY":
             return MomentumDecision(
                 EntryDecision.WAIT_RECLAIM_VWAP,
@@ -843,6 +851,8 @@ class MomentumBreakoutStrategy:
         strategy_type = str(metrics.get("paper_strategy_type") or "")
         if not strategy_type:
             return None
+        if strategy_type == ENTRY_TYPE_OPENING_RECOVERY_PROBE:
+            return self._opening_recovery_probe_decision(ctx, metrics, bullish_reversal)
         if strategy_type == ENTRY_TYPE_MIDDAY_VWAP_RECLAIM:
             return self._midday_vwap_reclaim_decision(ctx, metrics, bullish_reversal)
         if strategy_type == ENTRY_TYPE_AFTERNOON_SECOND_WAVE:
@@ -875,6 +885,42 @@ class MomentumBreakoutStrategy:
             position_size_multiplier=ratio,
             metrics=paper_metrics,
         )
+
+    def _opening_recovery_probe_decision(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        bullish_reversal: bool,
+    ) -> Optional[MomentumDecision]:
+        vwap = float(ctx.intraday_vwap or 0.0)
+        turnover_ok = float(ctx.turnover_speed_per_min or 0.0) >= 300_000_000.0
+        volume_reaccel = float(ctx.volume_ratio_1m or 0.0) >= float(ctx.volume_ratio_5m or 0.0)
+        near_capture = (
+            ctx.current_price / ctx.candidate.capture_price - 1.0
+            if ctx.candidate.capture_price > 0
+            else 0.0
+        )
+        if (
+            bool(getattr(self.config, "time_policy_high_mfe_paper_enabled", True))
+            and vwap > 0
+            and ctx.current_price >= vwap
+            and bullish_reversal
+            and -0.015 <= near_capture <= 0.040
+            and float(ctx.chejan_strength or 0.0) >= 130.0
+            and float(ctx.spread_rate or 0.0) <= self.config.max_spread_pct
+            and (float(ctx.volume_ratio or 0.0) >= self.config.min_volume_ratio or turnover_ok or volume_reaccel)
+        ):
+            paper_metrics = dict(metrics)
+            paper_metrics["time_policy_high_mfe_paper_candidate"] = 1.0
+            return self._paper_buy(
+                ctx,
+                paper_metrics,
+                reason="opening recovery probe paper-only",
+                reason_code="OPENING_RECOVERY_PROBE_PAPER_ONLY",
+                entry_type=ENTRY_TYPE_OPENING_RECOVERY_PROBE,
+                ratio=0.15,
+            )
+        return None
 
     def _live_strategy_buy(
         self,

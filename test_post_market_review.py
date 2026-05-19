@@ -467,6 +467,12 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertEqual(by_symbol["GUARD1"].review_category, "ORDER_GUARD_BLOCK")
             self.assertFalse(by_symbol["MISS1"].traded)
             self.assertGreater(by_symbol["MISS1"].mfe_pct, 0.02)
+            self.assertEqual(by_symbol["TIME1"].block_source, "time_policy")
+            self.assertTrue(by_symbol["TIME1"].would_have_passed_if_time_policy_relaxed)
+            self.assertEqual(by_symbol["TIME1"].missed_reason_detail, "BLOCK_AFTER_ENTRY_CUTOFF")
+            self.assertEqual(by_symbol["GUARD1"].block_source, "order_guard")
+            self.assertEqual(by_symbol["GUARD1"].order_guard_rule, "daily_buy_limit")
+            self.assertFalse(by_symbol["GUARD1"].would_have_passed_if_order_guard_relaxed)
 
     def test_reports_are_written_and_missing_values_are_not_zero_filled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -487,9 +493,27 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertTrue(result.paths.csv.exists())
             self.assertTrue(result.paths.markdown.exists())
             self.assertTrue(result.paths.json.exists())
+            self.assertIn("top_missed_by_mfe", result.paths.extra_csv)
+            self.assertIn("sector_theme_missed_summary", result.paths.extra_csv)
+            self.assertTrue(result.paths.extra_csv["top_missed_by_mfe"].exists())
+            self.assertTrue(result.paths.extra_csv["sector_theme_missed_summary"].exists())
             with result.paths.csv.open("r", newline="", encoding="utf-8-sig") as f:
                 rows = list(csv.DictReader(f))
             self.assertEqual(list(rows[0].keys()), REVIEW_COLUMNS)
+            self.assertIn("missed_reason_detail", rows[0])
+            self.assertIn("would_have_passed_if_time_policy_relaxed", rows[0])
+            with result.paths.extra_csv["top_missed_by_mfe"].open("r", newline="", encoding="utf-8-sig") as f:
+                missed_rows = list(csv.DictReader(f))
+            self.assertEqual(missed_rows[0]["symbol"], "CHBAD")
+            with result.paths.extra_csv["time_policy_what_if"].open("r", newline="", encoding="utf-8-sig") as f:
+                what_if_rows = list(csv.DictReader(f))
+            self.assertTrue(any(row["relaxation"] == "recoverable_time_policy_blocks" for row in what_if_rows))
+            self.assertIn("paper_strategy_type", what_if_rows[0])
+            self.assertIn("avg_close_return_pct", what_if_rows[0])
+            self.assertTrue(any(row["relaxation"] == "recoverable_time_policy_blocks_unique" for row in what_if_rows))
+            md = result.paths.markdown.read_text(encoding="utf-8")
+            self.assertIn("TimePolicy Paper Validation Candidates", md)
+            self.assertIn("paper-only validation list", md)
             for field in (
                 "entry_time",
                 "exit_time",
@@ -1221,6 +1245,10 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertEqual(row.current_price, 10100)
             self.assertEqual(row.order_guard_reason, "SHOULD_SKIP_BUY_MISSING_FIRST_POSITION_FOR_STAGE2")
             self.assertEqual(row.review_category, "ORDER_GUARD_BLOCK")
+            self.assertTrue(row.blocked_after_buy_ready)
+            self.assertTrue(row.would_have_passed_if_order_guard_relaxed)
+            self.assertEqual(row.order_guard_rule, "missing_first_position_for_stage2")
+            self.assertTrue(row.order_guard_recoverable)
             self.assertEqual(row.context_fields["symbol_market"], "KOSDAQ")
             self.assertIn("recovery_watch_queued", row.candidate_lifecycle)
             self.assertEqual(row.recovery_watch_count, 1)

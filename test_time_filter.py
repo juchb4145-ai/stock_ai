@@ -42,6 +42,10 @@ class TimePolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason_code, BLOCK_OPENING_STABILIZATION)
         self.assertIn("09:03:00", decision.next_allowed_time)
+        self.assertEqual(
+            TimePolicy(TradeConfig()).paper_strategy_type(now=_at("09:01:00")),
+            "OPENING_RECOVERY_PROBE",
+        )
 
     def test_allows_main_entry_window(self):
         decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("09:05:00"))
@@ -85,6 +89,12 @@ class TimePolicyTests(unittest.TestCase):
             TimePolicy(TradeConfig()).paper_strategy_type(now=_at("14:25:00")),
             "CLOSING_STRENGTH",
         )
+
+    def test_high_mfe_paper_windows_can_be_disabled(self):
+        policy = TimePolicy(TradeConfig(time_policy_high_mfe_paper_enabled=False))
+
+        self.assertEqual(policy.paper_strategy_type(now=_at("09:01:00")), "")
+        self.assertEqual(policy.paper_strategy_type(now=_at("14:25:00")), "CLOSING_STRENGTH")
 
     def test_force_exit_window_allows_management_only(self):
         policy = TimePolicy(TradeConfig())

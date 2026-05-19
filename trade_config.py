@@ -235,12 +235,15 @@ class TradeConfig:
     stop_sell_allowed_during_no_buy_window: bool = True
     time_policy_enabled: bool = True
     time_policy_config_version: str = "krx_regular_v1"
+    time_policy_high_mfe_paper_enabled: bool = True
+    time_policy_high_mfe_min_mfe_pct: float = 0.02
     trading_timezone: str = "Asia/Seoul"
     krx_regular_open: str = "09:00:00"
     krx_regular_close: str = "15:30:00"
     candidate_capture_start: str = "09:00:00"
     candidate_capture_end: str = "14:50:00"
     entry_windows: str = "09:03:00-10:30:00,13:00:00-14:20:00"
+    opening_recovery_paper_window: str = "09:00:00-09:30:00"
     midday_paper_window: str = "10:30:00-13:00:00"
     midday_live_entry_enabled: bool = True
     midday_live_entry_ratio: float = 0.25
@@ -898,6 +901,14 @@ class TradeConfig:
                 "KIWOOM_TIME_POLICY_CONFIG_VERSION",
                 cls.time_policy_config_version,
             ),
+            time_policy_high_mfe_paper_enabled=_env_bool(
+                "KIWOOM_TIME_POLICY_HIGH_MFE_PAPER_ENABLED",
+                cls.time_policy_high_mfe_paper_enabled,
+            ),
+            time_policy_high_mfe_min_mfe_pct=_env_float(
+                "KIWOOM_TIME_POLICY_HIGH_MFE_MIN_MFE_PCT",
+                cls.time_policy_high_mfe_min_mfe_pct,
+            ),
             trading_timezone=_env_str(
                 "KIWOOM_TRADING_TIMEZONE",
                 cls.trading_timezone,
@@ -922,6 +933,10 @@ class TradeConfig:
                 "KIWOOM_ENTRY_WINDOWS",
                 cls.entry_windows,
             ),
+            opening_recovery_paper_window=_env_str(
+                "KIWOOM_OPENING_RECOVERY_PAPER_WINDOW",
+                cls.opening_recovery_paper_window,
+            ),
             midday_paper_window=_env_str(
                 "KIWOOM_MIDDAY_PAPER_WINDOW",
                 cls.midday_paper_window,
@@ -939,8 +954,8 @@ class TradeConfig:
                 cls.afternoon_entry_window,
             ),
             closing_paper_window=_env_str(
-                "KIWOOM_CLOSING_PAPER_WINDOW",
-                cls.closing_paper_window,
+                "KIWOOM_CLOSING_STRENGTH_PAPER_WINDOW",
+                _env_str("KIWOOM_CLOSING_PAPER_WINDOW", cls.closing_paper_window),
             ),
             no_new_entry_after=_env_str(
                 "KIWOOM_NO_NEW_ENTRY_AFTER",

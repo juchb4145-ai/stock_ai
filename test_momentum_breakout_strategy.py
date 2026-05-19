@@ -99,6 +99,26 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         self.assertNotEqual(decision.action, EntryDecision.BUY)
         self.assertEqual(decision.reason_code, "BLOCK_OPENING_STABILIZATION")
 
+    def test_opening_recovery_probe_is_paper_only(self):
+        strategy = MomentumBreakoutStrategy(TradeConfig(candidate_expiry_seconds=10_000_000_000))
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("09:01:00"),
+                current_price=10_050,
+                intraday_vwap=10_000,
+                high_since_capture=10_100,
+                turnover_speed_per_min=350_000_000,
+                chejan_strength=140.0,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "OPENING_RECOVERY_PROBE_PAPER_ONLY")
+        self.assertEqual(decision.entry_type, "OPENING_RECOVERY_PROBE")
+        self.assertEqual(decision.metrics["orderable_live"], 0.0)
+        self.assertEqual(decision.metrics["paper_only_strategy"], 1.0)
+
     def test_waits_for_first_pullback(self):
         strategy = MomentumBreakoutStrategy(TradeConfig())
 

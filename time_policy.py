@@ -19,6 +19,10 @@ ALLOW_MIDDAY_ENTRY = "ALLOW_MIDDAY_ENTRY"
 ALLOW_MANAGE_ONLY = "ALLOW_MANAGE_ONLY"
 ALLOW_CANDIDATE_CAPTURE = "ALLOW_CANDIDATE_CAPTURE"
 ALLOW_ANALYSIS_ONLY = "ALLOW_ANALYSIS_ONLY"
+PAPER_OPENING_RECOVERY = "OPENING_RECOVERY_PROBE"
+PAPER_MIDDAY_VWAP_RECLAIM = "MIDDAY_VWAP_RECLAIM"
+PAPER_AFTERNOON_SECOND_WAVE = "AFTERNOON_SECOND_WAVE"
+PAPER_CLOSING_STRENGTH = "CLOSING_STRENGTH"
 BLOCK_PRE_OPEN = "BLOCK_PRE_OPEN"
 BLOCK_OPENING_STABILIZATION = "BLOCK_OPENING_STABILIZATION"
 BLOCK_AFTER_ENTRY_CUTOFF = "BLOCK_AFTER_ENTRY_CUTOFF"
@@ -138,6 +142,7 @@ class TimePolicy:
         self.candidate_capture_start = parse_clock(config.candidate_capture_start)
         self.candidate_capture_end = parse_clock(config.candidate_capture_end)
         self.entry_windows = parse_windows(config.entry_windows)
+        self.opening_recovery_paper_windows = parse_windows(config.opening_recovery_paper_window)
         self.midday_paper_windows = parse_windows(config.midday_paper_window)
         self.afternoon_entry_windows = parse_windows(config.afternoon_entry_window)
         self.closing_paper_windows = parse_windows(config.closing_paper_window)
@@ -666,12 +671,18 @@ class TimePolicy:
         if self.calendar.session_for(local_dt) != SESSION_REGULAR:
             return ""
         clock = local_dt.time().replace(tzinfo=None)
+        if (
+            bool(getattr(self.config, "time_policy_high_mfe_paper_enabled", True))
+            and self._in_windows(clock, self.opening_recovery_paper_windows)
+            and not self._in_windows(clock, self.entry_windows)
+        ):
+            return PAPER_OPENING_RECOVERY
         if self._in_windows(clock, self.midday_paper_windows):
-            return "MIDDAY_VWAP_RECLAIM"
+            return PAPER_MIDDAY_VWAP_RECLAIM
         if self._in_windows(clock, self.afternoon_entry_windows):
-            return "AFTERNOON_SECOND_WAVE"
+            return PAPER_AFTERNOON_SECOND_WAVE
         if self._in_windows(clock, self.closing_paper_windows):
-            return "CLOSING_STRENGTH"
+            return PAPER_CLOSING_STRENGTH
         return ""
 
     def paper_strategy_allowed(

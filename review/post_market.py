@@ -32,6 +32,7 @@ MODE_LIVE = "live"
 MODE_CHOICES = (MODE_PAPER, MODE_LIVE, "all")
 
 MISSING_TEXT = "missing"
+TIME_POLICY_HIGH_MFE_PAPER_MIN_MFE_PCT = 0.02
 
 BLOCK_CHASE_REASON_CODES = {
     "block_chase_signal_candle_top",
@@ -271,6 +272,17 @@ REVIEW_COLUMNS = [
     "time_policy_reason",
     "time_policy_source",
     "order_guard_reason",
+    "missed_reason_detail",
+    "block_source",
+    "recoverable",
+    "would_have_passed_if_time_policy_relaxed",
+    "would_have_passed_if_order_guard_relaxed",
+    "order_guard_rule",
+    "order_guard_recoverable",
+    "blocked_after_buy_ready",
+    "time_bucket",
+    "is_theme_leader",
+    "theme_coverage_status",
     "data_quality",
     "missed_opportunity",
     "review_category",
@@ -448,6 +460,17 @@ class ReviewRow:
     time_policy_reason: str
     time_policy_source: str
     order_guard_reason: str
+    missed_reason_detail: str
+    block_source: str
+    recoverable: bool
+    would_have_passed_if_time_policy_relaxed: bool
+    would_have_passed_if_order_guard_relaxed: bool
+    order_guard_rule: str
+    order_guard_recoverable: bool
+    blocked_after_buy_ready: bool
+    time_bucket: str
+    is_theme_leader: bool
+    theme_coverage_status: str
     data_quality: List[str]
     missed_opportunity: bool
     review_category: str
@@ -535,6 +558,17 @@ class ReviewRow:
             "time_policy_reason": self.time_policy_reason,
             "time_policy_source": self.time_policy_source,
             "order_guard_reason": self.order_guard_reason,
+            "missed_reason_detail": self.missed_reason_detail,
+            "block_source": self.block_source,
+            "recoverable": self.recoverable,
+            "would_have_passed_if_time_policy_relaxed": self.would_have_passed_if_time_policy_relaxed,
+            "would_have_passed_if_order_guard_relaxed": self.would_have_passed_if_order_guard_relaxed,
+            "order_guard_rule": self.order_guard_rule,
+            "order_guard_recoverable": self.order_guard_recoverable,
+            "blocked_after_buy_ready": self.blocked_after_buy_ready,
+            "time_bucket": self.time_bucket,
+            "is_theme_leader": self.is_theme_leader,
+            "theme_coverage_status": self.theme_coverage_status,
             "data_quality": list(self.data_quality),
             "missed_opportunity": self.missed_opportunity,
             "review_category": self.review_category,
@@ -549,6 +583,7 @@ class ReviewPaths:
     csv: Path
     markdown: Path
     json: Optional[Path] = None
+    extra_csv: Dict[str, Path] = field(default_factory=dict)
 
 
 @dataclass
@@ -664,6 +699,8 @@ def static_context_for_symbol(symbol: str, static_context: StaticReviewContext) 
         if primary_theme:
             out["primary_theme"] = primary_theme
             out["theme_member_count"] = static_context.theme_member_counts.get(primary_theme, len(themes))
+            if str(primary.get("role") or "").lower() == "leader":
+                out["theme_leader_code"] = normalized
     return out
 
 
@@ -1824,6 +1861,39 @@ def build_review_row(
         min_missed_opportunity_pct=min_missed_opportunity_pct,
         missed_opportunity=missed,
     )
+    block_source = _block_source_for_row(
+        review_category=category,
+        blocked_by=blocked_by,
+        reason_code=reason_code,
+        time_policy_reason=time_policy_reason,
+        order_guard_reason=order_guard_reason,
+        data_quality=data_quality,
+    )
+    order_guard_rule = _normalize_order_guard_rule(order_guard_reason or blocked_by or reason_code)
+    blocked_after_buy_ready = bool(
+        not traded
+        and block_source == "order_guard"
+        and (
+            str(final_decision or "").upper() == "BUY"
+            or str(reason_code or "").upper() == "FINAL_BUY_READY"
+        )
+    )
+    would_pass_time_relaxed = _would_have_passed_if_time_policy_relaxed(
+        category=category,
+        missed=missed,
+        flow=flow,
+        data_quality=data_quality,
+    )
+    would_pass_guard_relaxed = _would_have_passed_if_order_guard_relaxed(
+        category=category,
+        missed=missed,
+        blocked_after_buy_ready=blocked_after_buy_ready,
+        flow=flow,
+        data_quality=data_quality,
+    )
+    recoverable = bool(would_pass_time_relaxed or would_pass_guard_relaxed or category in {"MISSED_OPPORTUNITY", "BAD_BLOCK_CHASE"})
+    order_guard_recoverable = bool(would_pass_guard_relaxed and order_guard_rule not in {"daily_loss_limit", "missing_live_account_state"})
+    theme_leader_code = str(context_fields.get("theme_leader_code") or "").strip()
     return ReviewRow(
         mode=mode,
         symbol=candidate.symbol,
@@ -1917,6 +1987,26 @@ def build_review_row(
         time_policy_reason=time_policy_reason,
         time_policy_source=time_policy_source,
         order_guard_reason=order_guard_reason,
+        missed_reason_detail=_missed_reason_detail(
+            review_category=category,
+            block_source=block_source,
+            reason_code=reason_code,
+            final_reason=final_reason,
+            time_policy_reason=time_policy_reason,
+            order_guard_rule=order_guard_rule,
+            data_quality=data_quality,
+            missed=missed,
+        ),
+        block_source=block_source,
+        recoverable=recoverable,
+        would_have_passed_if_time_policy_relaxed=would_pass_time_relaxed,
+        would_have_passed_if_order_guard_relaxed=would_pass_guard_relaxed,
+        order_guard_rule=order_guard_rule,
+        order_guard_recoverable=order_guard_recoverable,
+        blocked_after_buy_ready=blocked_after_buy_ready,
+        time_bucket=_time_bucket_label(candidate.detected_at),
+        is_theme_leader=bool(theme_leader_code and _normalize_symbol(theme_leader_code) == _normalize_symbol(candidate.symbol)),
+        theme_coverage_status=_theme_coverage_status(context_fields),
         data_quality=data_quality,
         missed_opportunity=missed,
         review_category=category,
@@ -1944,6 +2034,165 @@ def _derived_metrics_from_flow(flow: PriceFlow) -> Dict[str, object]:
         "entry_type": "",
         "position_size_multiplier": None,
     }
+
+
+def _block_source_for_row(
+    *,
+    review_category: str,
+    blocked_by: str,
+    reason_code: str,
+    time_policy_reason: str,
+    order_guard_reason: str,
+    data_quality: Sequence[str],
+) -> str:
+    if review_category == "TIME_POLICY_BLOCK":
+        return "time_policy"
+    if review_category == "ORDER_GUARD_BLOCK":
+        return "order_guard"
+    if review_category == "DATA_QUALITY_BLOCK":
+        return "data_quality"
+    if review_category in {"GOOD_BLOCK_CHASE", "BAD_BLOCK_CHASE"}:
+        return "strategy_chase_block"
+    if review_category == "MISSED_OPPORTUNITY":
+        return "strategy_reject"
+    haystack = " ".join(
+        str(value or "").lower()
+        for value in (blocked_by, reason_code, time_policy_reason, order_guard_reason, " ".join(data_quality))
+    )
+    if "time_policy" in haystack or "block_after" in haystack or "block_pre" in haystack:
+        return "time_policy"
+    if "order_guard" in haystack or order_guard_reason:
+        return "order_guard"
+    if "missing" in haystack or "invalid" in haystack or "data" in haystack:
+        return "data_quality"
+    return ""
+
+
+def _normalize_order_guard_rule(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    aliases = {
+        "daily_buy_limit_exceeded": "daily_buy_limit",
+        "daily_loss_limit_exceeded": "daily_loss_limit",
+        "position_limit_exceeded": "position_limit",
+        "duplicate_position": "duplicate_position",
+        "pending_order_exists": "pending_order",
+        "missing_final_entry_decision": "missing_final_entry_decision",
+        "should_skip_buy_missing_first_position_for_stage2": "missing_first_position_for_stage2",
+        "missing_live_account_state": "missing_live_account_state",
+        "time_policy_block": "time_policy",
+    }
+    for source, normalized in aliases.items():
+        if source in text:
+            return normalized
+    if "cooldown" in text:
+        return "reentry_cooldown"
+    if "duplicate" in text:
+        return "duplicate_position"
+    if "pending" in text:
+        return "pending_order"
+    if "position" in text:
+        return "position_limit"
+    if "daily_buy" in text:
+        return "daily_buy_limit"
+    if "daily_loss" in text:
+        return "daily_loss_limit"
+    return text[:80]
+
+
+def _has_hard_data_gap(data_quality: Sequence[str]) -> bool:
+    hard_flags = {
+        "MISSING_CAPTURE_PRICE",
+        "MISSING_MARKET_METRICS",
+        "MISSING_MFE_MAE",
+    }
+    return any(str(flag or "").strip() in hard_flags for flag in data_quality)
+
+
+def _would_have_passed_if_time_policy_relaxed(
+    *,
+    category: str,
+    missed: bool,
+    flow: PriceFlow,
+    data_quality: Sequence[str],
+) -> bool:
+    return bool(
+        category == "TIME_POLICY_BLOCK"
+        and missed
+        and flow.mfe_pct is not None
+        and not _has_hard_data_gap(data_quality)
+    )
+
+
+def _would_have_passed_if_order_guard_relaxed(
+    *,
+    category: str,
+    missed: bool,
+    blocked_after_buy_ready: bool,
+    flow: PriceFlow,
+    data_quality: Sequence[str],
+) -> bool:
+    return bool(
+        category == "ORDER_GUARD_BLOCK"
+        and missed
+        and blocked_after_buy_ready
+        and flow.mfe_pct is not None
+        and not _has_hard_data_gap(data_quality)
+    )
+
+
+def _missed_reason_detail(
+    *,
+    review_category: str,
+    block_source: str,
+    reason_code: str,
+    final_reason: str,
+    time_policy_reason: str,
+    order_guard_rule: str,
+    data_quality: Sequence[str],
+    missed: bool,
+) -> str:
+    if not missed and review_category not in {"TIME_POLICY_BLOCK", "ORDER_GUARD_BLOCK", "DATA_QUALITY_BLOCK"}:
+        return ""
+    if block_source == "time_policy":
+        return time_policy_reason or reason_code or "time_policy_block"
+    if block_source == "order_guard":
+        return order_guard_rule or reason_code or "order_guard_block"
+    if block_source == "data_quality":
+        return ";".join(data_quality) or reason_code or "data_quality_block"
+    if review_category in {"MISSED_OPPORTUNITY", "BAD_BLOCK_CHASE"}:
+        return reason_code or final_reason or review_category
+    return reason_code or final_reason or review_category
+
+
+def _time_bucket_label(value: Optional[datetime]) -> str:
+    if value is None:
+        return ""
+    current = value.time()
+    buckets = [
+        ("09:00~09:30", "09:00:00", "09:30:00"),
+        ("09:30~10:30", "09:30:00", "10:30:00"),
+        ("10:30~13:00", "10:30:00", "13:00:00"),
+        ("13:00~14:20", "13:00:00", "14:20:00"),
+        ("14:20~close", "14:20:00", "23:59:59"),
+    ]
+    for label, start_text, end_text in buckets:
+        start = datetime.strptime(start_text, "%H:%M:%S").time()
+        end = datetime.strptime(end_text, "%H:%M:%S").time()
+        if start <= current < end:
+            return label
+    return "outside_regular_session"
+
+
+def _theme_coverage_status(context_fields: Dict[str, object]) -> str:
+    names = str(context_fields.get("theme_names") or "").strip()
+    primary = str(context_fields.get("primary_theme") or "").strip()
+    if names and primary:
+        return "mapped"
+    if names:
+        return "theme_names_only"
+    return "blank"
 
 
 def _latest_event(events: Sequence[Dict[str, object]]) -> Dict[str, object]:
@@ -2300,7 +2549,8 @@ def write_review_outputs(
     write_markdown_summary(result, md_path)
     if json_path is not None:
         write_review_json(result.rows, json_path)
-    return ReviewPaths(csv=csv_path, markdown=md_path, json=json_path)
+    extra_csv = write_priority_review_reports(result.rows, out_dir, prefix)
+    return ReviewPaths(csv=csv_path, markdown=md_path, json=json_path, extra_csv=extra_csv)
 
 
 def write_review_csv(rows: Sequence[ReviewRow], path: str | Path) -> None:
@@ -2316,6 +2566,201 @@ def write_review_json(rows: Sequence[ReviewRow], path: str | Path) -> None:
     payload = [row.as_dict() for row in rows]
     with Path(path).open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+PRIORITY_REPORT_COLUMNS = [
+    "symbol",
+    "symbol_name",
+    "detected_at",
+    "review_category",
+    "missed_opportunity",
+    "mfe_pct",
+    "mae_pct",
+    "return_to_close_pct",
+    "time_to_high_min",
+    "final_decision",
+    "reason_code",
+    "block_source",
+    "missed_reason_detail",
+    "recoverable",
+    "would_have_passed_if_time_policy_relaxed",
+    "would_have_passed_if_order_guard_relaxed",
+    "blocked_after_buy_ready",
+    "order_guard_rule",
+    "order_guard_recoverable",
+    "time_bucket",
+    "sector_name",
+    "primary_theme",
+    "theme_names",
+]
+
+
+def write_priority_review_reports(
+    rows: Sequence[ReviewRow],
+    output_dir: str | Path,
+    prefix: str,
+) -> Dict[str, Path]:
+    out_dir = Path(output_dir)
+    reports = {
+        "top_missed_by_mfe": _unique_best_rows(sorted(
+            [row for row in rows if not row.traded and row.missed_opportunity],
+            key=lambda row: _sort_metric(row.mfe_pct),
+            reverse=True,
+        )),
+        "top_blocked_by_order_guard": _unique_best_rows(sorted(
+            [row for row in rows if row.review_category == "ORDER_GUARD_BLOCK" or row.block_source == "order_guard"],
+            key=lambda row: _sort_metric(row.mfe_pct),
+            reverse=True,
+        )),
+        "top_blocked_by_time_policy": _unique_best_rows(sorted(
+            [row for row in rows if row.review_category == "TIME_POLICY_BLOCK" or row.block_source == "time_policy"],
+            key=lambda row: _sort_metric(row.mfe_pct),
+            reverse=True,
+        )),
+    }
+    paths: Dict[str, Path] = {}
+    for name, members in reports.items():
+        path = out_dir / f"{prefix}_{name}.csv"
+        _write_priority_report_csv(members, path)
+        paths[name] = path
+
+    sector_theme_path = out_dir / f"{prefix}_sector_theme_missed_summary.csv"
+    _write_sector_theme_missed_summary_csv(rows, sector_theme_path)
+    paths["sector_theme_missed_summary"] = sector_theme_path
+
+    time_policy_path = out_dir / f"{prefix}_time_policy_what_if.csv"
+    _write_time_policy_what_if_csv(rows, time_policy_path)
+    paths["time_policy_what_if"] = time_policy_path
+
+    return paths
+
+
+def _write_priority_report_csv(rows: Sequence[ReviewRow], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=PRIORITY_REPORT_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            data = row.as_dict()
+            writer.writerow({key: _csv_value(key, data.get(key)) for key in PRIORITY_REPORT_COLUMNS})
+
+
+def _unique_best_rows(rows: Sequence[ReviewRow]) -> List[ReviewRow]:
+    best: Dict[str, ReviewRow] = {}
+    for row in rows:
+        current = best.get(row.symbol)
+        if current is None or _sort_metric(row.mfe_pct) > _sort_metric(current.mfe_pct):
+            best[row.symbol] = row
+    return sorted(best.values(), key=lambda row: _sort_metric(row.mfe_pct), reverse=True)
+
+
+def _write_sector_theme_missed_summary_csv(rows: Sequence[ReviewRow], path: Path) -> None:
+    fieldnames = [
+        "dimension",
+        "name",
+        "row_count",
+        "unique_symbol_count",
+        "missed_count",
+        "order_guard_block_count",
+        "time_policy_block_count",
+        "good_reject_count",
+        "avg_mfe_pct",
+        "max_mfe_pct",
+        "theme_blank_count",
+    ]
+    grouped: Dict[Tuple[str, str], List[ReviewRow]] = defaultdict(list)
+    for row in rows:
+        sector_name = str(row.context_fields.get("sector_name") or "").strip() or "(blank)"
+        grouped[("sector", sector_name)].append(row)
+        theme_names = [
+            name.strip()
+            for name in str(row.context_fields.get("theme_names") or "").split(";")
+            if name.strip()
+        ]
+        if not theme_names:
+            grouped[("theme", "(blank)")].append(row)
+        else:
+            for theme_name in theme_names:
+                grouped[("theme", theme_name)].append(row)
+
+    summary_rows: List[Dict[str, object]] = []
+    for (dimension, name), members in grouped.items():
+        mfe_values = [row.mfe_pct for row in members if row.mfe_pct is not None]
+        summary_rows.append(
+            {
+                "dimension": dimension,
+                "name": name,
+                "row_count": len(members),
+                "unique_symbol_count": len({row.symbol for row in members}),
+                "missed_count": sum(1 for row in members if row.missed_opportunity),
+                "order_guard_block_count": sum(1 for row in members if row.review_category == "ORDER_GUARD_BLOCK"),
+                "time_policy_block_count": sum(1 for row in members if row.review_category == "TIME_POLICY_BLOCK"),
+                "good_reject_count": sum(1 for row in members if row.review_category in {"GOOD_REJECT", "GOOD_BLOCK_CHASE"}),
+                "avg_mfe_pct": _mean([row.mfe_pct for row in members]),
+                "max_mfe_pct": max(mfe_values) if mfe_values else None,
+                "theme_blank_count": sum(1 for row in members if row.theme_coverage_status == "blank"),
+            }
+        )
+    summary_rows.sort(key=lambda item: (-int(item["missed_count"]), -float(item["max_mfe_pct"] or -999), str(item["dimension"]), str(item["name"])))
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in summary_rows:
+            writer.writerow({key: _csv_value(key, item.get(key)) for key in fieldnames})
+
+
+def _write_time_policy_what_if_csv(rows: Sequence[ReviewRow], path: Path) -> None:
+    fieldnames = [
+        "relaxation",
+        "paper_strategy_type",
+        "candidate_count",
+        "unique_symbol_count",
+        "missed_count",
+        "avg_mfe_pct",
+        "max_mfe_pct",
+        "avg_close_return_pct",
+        "max_close_return_pct",
+        "top_symbol",
+        "top_symbol_mfe_pct",
+    ]
+    time_rows = [row for row in rows if row.review_category == "TIME_POLICY_BLOCK" or row.block_source == "time_policy"]
+    recoverable_rows = [row for row in time_rows if _time_policy_paper_validation_candidate(row)]
+    scenarios = [
+        ("current_time_policy_blocks", "", time_rows),
+        ("recoverable_time_policy_blocks", "", recoverable_rows),
+        ("recoverable_time_policy_blocks_unique", "", _unique_best_rows(recoverable_rows)),
+        ("09:00~09:30_only", "OPENING_RECOVERY_PROBE", [row for row in time_rows if row.time_bucket == "09:00~09:30" and row.missed_opportunity]),
+        ("10:30~13:00_only", "MIDDAY_VWAP_RECLAIM", [row for row in time_rows if row.time_bucket == "10:30~13:00" and row.missed_opportunity]),
+        ("14:20~close_only", "CLOSING_STRENGTH", [row for row in time_rows if row.time_bucket == "14:20~close" and row.missed_opportunity]),
+    ]
+    by_strategy: Dict[str, List[ReviewRow]] = defaultdict(list)
+    for row in recoverable_rows:
+        strategy_type = _time_policy_paper_strategy_type(row)
+        if strategy_type:
+            by_strategy[strategy_type].append(row)
+    for strategy_type, members in sorted(by_strategy.items()):
+        scenarios.append((f"recoverable_strategy_{strategy_type}", strategy_type, _unique_best_rows(members)))
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for name, strategy_type, members in scenarios:
+            top = max(members, key=lambda row: _sort_metric(row.mfe_pct)) if members else None
+            mfe_values = [row.mfe_pct for row in members if row.mfe_pct is not None]
+            close_values = [row.return_to_close_pct for row in members if row.return_to_close_pct is not None]
+            writer.writerow(
+                {
+                    "relaxation": name,
+                    "paper_strategy_type": strategy_type,
+                    "candidate_count": len(members),
+                    "unique_symbol_count": len({row.symbol for row in members}),
+                    "missed_count": sum(1 for row in members if row.missed_opportunity),
+                    "avg_mfe_pct": _mean([row.mfe_pct for row in members]),
+                    "max_mfe_pct": max(mfe_values) if mfe_values else None,
+                    "avg_close_return_pct": _mean([row.return_to_close_pct for row in members]),
+                    "max_close_return_pct": max(close_values) if close_values else None,
+                    "top_symbol": top.symbol if top else "",
+                    "top_symbol_mfe_pct": top.mfe_pct if top else None,
+                }
+            )
 
 
 def _csv_value(key: str, value: object) -> object:
@@ -2387,6 +2832,27 @@ def write_markdown_summary(result: ReviewResult, path: str | Path) -> None:
     lines.append("## Missed Opportunities")
     missed_rows = [r for r in non_traded if r.missed_opportunity or r.review_category in {"MISSED_OPPORTUNITY", "BAD_BLOCK_CHASE"}]
     lines.extend(_non_traded_table(sorted(missed_rows, key=lambda r: r.mfe_pct or -999, reverse=True), limit=15))
+    lines.append("")
+    lines.append("## Top Missed Opportunities")
+    lines.extend(_top_missed_opportunity_lines(rows))
+    lines.append("")
+    lines.append("## Most Expensive Blocks")
+    lines.extend(_most_expensive_block_lines(rows))
+    lines.append("")
+    lines.append("## OrderGuard Review Candidates")
+    lines.extend(_order_guard_review_candidate_lines(rows))
+    lines.append("")
+    lines.append("## TimePolicy Review Candidates")
+    lines.extend(_time_policy_review_candidate_lines(rows))
+    lines.append("")
+    lines.append("## TimePolicy Paper Validation Candidates")
+    lines.extend(_time_policy_paper_validation_lines(rows))
+    lines.append("")
+    lines.append("## Sector/Theme Concentration")
+    lines.extend(_sector_theme_concentration_lines(rows))
+    lines.append("")
+    lines.append("## Recommended Next Parameter Checks")
+    lines.extend(_recommended_parameter_check_lines(rows))
     lines.append("")
     lines.append("## Good Rejects")
     good_rows = [r for r in non_traded if r.review_category in {"GOOD_REJECT", "GOOD_BLOCK_CHASE"}]
@@ -3043,6 +3509,7 @@ def _time_bucket_lines(rows: Sequence[ReviewRow]) -> List[str]:
 
 
 PAPER_STRATEGY_ENTRY_TYPES = {
+    "OPENING_RECOVERY_PROBE",
     "MIDDAY_VWAP_RECLAIM",
     "AFTERNOON_SECOND_WAVE",
     "CLOSING_STRENGTH",
@@ -3059,6 +3526,21 @@ def _paper_strategy_key(row: ReviewRow) -> str:
     for key in PAPER_STRATEGY_ENTRY_TYPES:
         if key in reason_code:
             return key
+    return ""
+
+
+def _time_policy_paper_strategy_type(row: ReviewRow) -> str:
+    key = _paper_strategy_key(row)
+    if key:
+        return key
+    if row.time_bucket == "09:00~09:30":
+        return "OPENING_RECOVERY_PROBE"
+    if row.time_bucket == "10:30~13:00":
+        return "MIDDAY_VWAP_RECLAIM"
+    if row.time_bucket == "13:00~14:20":
+        return "AFTERNOON_SECOND_WAVE"
+    if row.time_bucket == "14:20~close":
+        return "CLOSING_STRENGTH"
     return ""
 
 
@@ -3097,6 +3579,191 @@ def _paper_strategy_performance_lines(rows: Sequence[ReviewRow]) -> List[str]:
                 mae=_fmt_pct(mae_stats["avg"]),
                 n_mfe=mfe_stats["n"],
                 n_mae=mae_stats["n"],
+            )
+        )
+    return lines
+
+
+def _top_missed_opportunity_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    members = [row for row in rows if not row.traded and row.missed_opportunity]
+    return _priority_candidate_table(members, limit=15)
+
+
+def _most_expensive_block_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    members = [
+        row for row in rows
+        if not row.traded
+        and row.block_source in {"time_policy", "order_guard", "data_quality", "strategy_chase_block"}
+        and row.mfe_pct is not None
+    ]
+    return _priority_candidate_table(members, limit=15)
+
+
+def _order_guard_review_candidate_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    members = [
+        row for row in rows
+        if row.review_category == "ORDER_GUARD_BLOCK"
+        or row.block_source == "order_guard"
+        or row.blocked_after_buy_ready
+    ]
+    lines = _priority_candidate_table(members, limit=15)
+    recoverable = sum(1 for row in members if row.order_guard_recoverable)
+    ready = sum(1 for row in members if row.blocked_after_buy_ready)
+    lines.append("")
+    lines.append(f"- blocked_after_buy_ready: {ready}")
+    lines.append(f"- order_guard_recoverable: {recoverable}")
+    return lines
+
+
+def _time_policy_review_candidate_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    members = [
+        row for row in rows
+        if row.review_category == "TIME_POLICY_BLOCK"
+        or row.block_source == "time_policy"
+    ]
+    lines = _priority_candidate_table(members, limit=15)
+    bucket_counter = Counter(row.time_bucket or "(blank)" for row in members if row.missed_opportunity)
+    if bucket_counter:
+        lines.append("")
+        lines.append("| time_bucket | missed_count |")
+        lines.append("|---|---:|")
+        for bucket, count in bucket_counter.most_common():
+            lines.append(f"| {bucket} | {count} |")
+    return lines
+
+
+def _time_policy_paper_validation_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    members = _unique_best_rows(
+        [
+            row for row in rows
+            if _time_policy_paper_validation_candidate(row)
+            and _time_policy_paper_strategy_type(row)
+        ]
+    )
+    if not members:
+        return ["- none"]
+    lines = [
+        "- paper-only validation list; this is not a live entry relaxation.",
+        "",
+        "| symbol | name | time_bucket | paper_strategy_type | reason | MFE | close return | sector | theme |",
+        "|---|---|---|---|---|---:|---:|---|---|",
+    ]
+    for row in members[:15]:
+        lines.append(
+            "| {symbol} | {name} | {bucket} | {strategy} | {reason} | {mfe} | {close} | {sector} | {theme} |".format(
+                symbol=row.symbol,
+                name=_short(row.symbol_name or "", 24),
+                bucket=row.time_bucket or "",
+                strategy=_time_policy_paper_strategy_type(row),
+                reason=_short(row.missed_reason_detail or _display_reason(row), 56),
+                mfe=_fmt_pct(row.mfe_pct),
+                close=_fmt_pct(row.return_to_close_pct),
+                sector=_short(row.context_fields.get("sector_name") or "", 32),
+                theme=_short(row.context_fields.get("primary_theme") or row.context_fields.get("theme_names") or "", 32),
+            )
+        )
+    return lines
+
+
+def _time_policy_paper_validation_candidate(row: ReviewRow) -> bool:
+    if row.review_category != "TIME_POLICY_BLOCK" and row.block_source != "time_policy":
+        return False
+    if row.mfe_pct is None or row.mfe_pct < TIME_POLICY_HIGH_MFE_PAPER_MIN_MFE_PCT:
+        return False
+    hard_flags = {"MISSING_CAPTURE_PRICE", "MISSING_MARKET_METRICS", "MISSING_MFE_MAE"}
+    return not any(flag in hard_flags for flag in row.data_quality)
+
+
+def _sector_theme_concentration_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    lines: List[str] = []
+    for title, getter in (
+        ("sector_name", lambda row: [str(row.context_fields.get("sector_name") or "").strip() or "(blank)"]),
+        (
+            "theme_names",
+            lambda row: [
+                name.strip()
+                for name in str(row.context_fields.get("theme_names") or "").split(";")
+                if name.strip()
+            ] or ["(blank)"],
+        ),
+    ):
+        grouped: Dict[str, List[ReviewRow]] = defaultdict(list)
+        for row in rows:
+            for key in getter(row):
+                grouped[key].append(row)
+        ranked = sorted(
+            grouped.items(),
+            key=lambda item: (
+                -sum(1 for row in item[1] if row.missed_opportunity),
+                -_sort_metric(max((row.mfe_pct for row in item[1] if row.mfe_pct is not None), default=None)),
+                item[0],
+            ),
+        )[:10]
+        lines.append(f"### {title}")
+        lines.append("| name | rows | unique_symbols | missed | order_guard | time_policy | avg_MFE | max_MFE |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for name, members in ranked:
+            mfe_values = [row.mfe_pct for row in members if row.mfe_pct is not None]
+            lines.append(
+                "| {name} | {rows} | {symbols} | {missed} | {guard} | {time} | {avg_mfe} | {max_mfe} |".format(
+                    name=_short(name, 60),
+                    rows=len(members),
+                    symbols=len({row.symbol for row in members}),
+                    missed=sum(1 for row in members if row.missed_opportunity),
+                    guard=sum(1 for row in members if row.review_category == "ORDER_GUARD_BLOCK"),
+                    time=sum(1 for row in members if row.review_category == "TIME_POLICY_BLOCK"),
+                    avg_mfe=_fmt_pct(_mean([row.mfe_pct for row in members])),
+                    max_mfe=_fmt_pct(max(mfe_values) if mfe_values else None),
+                )
+            )
+        lines.append("")
+    return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+def _recommended_parameter_check_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    lines: List[str] = []
+    guard_ready = [row for row in rows if row.blocked_after_buy_ready and row.missed_opportunity]
+    time_recoverable = [row for row in rows if row.would_have_passed_if_time_policy_relaxed]
+    data_high = [
+        row for row in rows
+        if row.review_category == "DATA_QUALITY_BLOCK"
+        and row.mfe_pct is not None
+        and row.mfe_pct >= 0.02
+    ]
+    theme_blank_missed = [row for row in rows if row.missed_opportunity and row.theme_coverage_status == "blank"]
+    if guard_ready:
+        lines.append(f"- OrderGuard: review {len(guard_ready)} BUY-ready blocked rows before changing strategy thresholds.")
+    if time_recoverable:
+        top_bucket = Counter(row.time_bucket for row in time_recoverable).most_common(1)[0][0]
+        lines.append(f"- TimePolicy: simulate a narrower relaxation around {top_bucket}; {len(time_recoverable)} recoverable rows qualify.")
+    if data_high:
+        lines.append(f"- Data quality: fix collection gaps for {len(data_high)} high-MFE rows before tuning entries.")
+    if theme_blank_missed:
+        lines.append(f"- Theme map: {len(theme_blank_missed)} missed rows still have blank theme coverage; improve the map before theme gating.")
+    if not lines:
+        lines.append("- No parameter check crossed the review thresholds. Keep collecting comparable samples.")
+    return lines
+
+
+def _priority_candidate_table(rows: Sequence[ReviewRow], *, limit: int = 15) -> List[str]:
+    if not rows:
+        return ["- none"]
+    lines = [
+        "| symbol | name | category | MFE | close | block_source | detail | sector | theme |",
+        "|---|---|---|---:|---:|---|---|---|---|",
+    ]
+    for row in _unique_best_rows(rows)[:limit]:
+        lines.append(
+            "| {symbol} | {name} | {category} | {mfe} | {close} | {source} | {detail} | {sector} | {theme} |".format(
+                symbol=row.symbol,
+                name=_short(row.symbol_name or "", 24),
+                category=row.review_category,
+                mfe=_fmt_pct(row.mfe_pct),
+                close=_fmt_pct(row.return_to_close_pct),
+                source=row.block_source or "",
+                detail=_short(row.missed_reason_detail or _display_reason(row), 60),
+                sector=_short(row.context_fields.get("sector_name") or "", 32),
+                theme=_short(row.context_fields.get("primary_theme") or row.context_fields.get("theme_names") or "", 32),
             )
         )
     return lines

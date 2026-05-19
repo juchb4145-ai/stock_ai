@@ -14,7 +14,7 @@
 - win rate: missing
 - realized pnl: missing
 - mode: live
-- generated_at: 2026-05-19 21:09:46
+- generated_at: 2026-05-19 22:39:26
 
 ## Data Source Status
 | source | status | path | data_rows | valid_rows | invalid_rows | missing_columns |
@@ -327,6 +327,15 @@
 | theme_rising_count | 0 | 142 | 14 | 118 | +10.47% |
 | theme_falling_count | 0 | 142 | 14 | 118 | +10.47% |
 | theme_top_turnover | 0 | 142 | 14 | 118 | +10.47% |
+| theme_leader_code | 064550 | 17 | 1 | 0 | +2.08% |
+| theme_leader_code | 003490 | 7 | 1 | 0 | +0.35% |
+| theme_leader_code | 028050 | 6 | 1 | 0 | +1.20% |
+| theme_leader_code | 005290 | 5 | 1 | 5 | +5.04% |
+| theme_leader_code | 036540 | 5 | 1 | 0 | +0.69% |
+| theme_leader_code | 047810 | 4 | 1 | 0 | +0.54% |
+| theme_leader_code | 086960 | 4 | 1 | 4 | +9.22% |
+| theme_leader_code | 089010 | 2 | 1 | 0 | +0.00% |
+| theme_leader_code | 005930 | 1 | 1 | 1 | +2715.00% |
 | theme_regime | unknown | 223 | 43 | 62 | +4.04% |
 | theme_gate_action | dry_run_allow | 223 | 43 | 62 | +4.04% |
 | theme_gate_reason | THEME_UNKNOWN_FALLBACK | 223 | 43 | 62 | +4.04% |
@@ -443,6 +452,144 @@
 | 274090 | 켄코아에어로스페이스 | 2026-05-19 09:00:32 | 26750 | missing | missing | max_position_size_exceeded | +23.18% | -2.43% | ORDER_GUARD_BLOCK |
 | 274090 | 켄코아에어로스페이스 | 2026-05-19 09:00:32 | 26750 | missing | missing | max_position_size_exceeded | +23.18% | -2.43% | ORDER_GUARD_BLOCK |
 | 274090 | 켄코아에어로스페이스 | 2026-05-19 09:01:08 | 26750 | missing | missing | max_position_size_exceeded | +23.18% | -2.43% | ORDER_GUARD_BLOCK |
+
+## Top Missed Opportunities
+| symbol | name | category | MFE | close | block_source | detail | sector | theme |
+|---|---|---|---:|---:|---|---|---|---|
+| 005930 | 삼성전자 | TIME_POLICY_BLOCK | +2715.00% | +2655.00% | time_policy | BLOCK_AFTER_ENTRY_CUTOFF | 전기/전자 | 반도체_생산 |
+| 439960 | 코스모로보틱스 | ORDER_GUARD_BLOCK | +25.91% | +25.91% | order_guard | position_limit | 의료/정밀기기 | missing |
+| 005500 | 삼진제약 | MISSED_OPPORTUNITY | +23.92% | +18.18% | strategy_reject | FINAL_MOMENTUM_BLOCK_WEAK_LEADER | 제약 | missing |
+| 274090 | 켄코아에어로스페이스 | ORDER_GUARD_BLOCK | +23.18% | +6.36% | order_guard | position_limit | 운송장비/부품 | missing |
+| 066430 | 아이로보틱스 | MISSED_OPPORTUNITY | +20.52% | +1.90% | strategy_reject | MISSED_OPPORTUNITY | 유통 | missing |
+| 078890 | 가온그룹 | TIME_POLICY_BLOCK | +19.02% | +12.02% | time_policy | ALLOW_CANDIDATE_CAPTURE | 전기/전자 | 셋톱박스 |
+| 356680 | 엑스게이트 | MISSED_OPPORTUNITY | +15.93% | +13.37% | strategy_reject | MISSED_OPPORTUNITY | IT 서비스 | missing |
+| 243070 | 휴온스 | TIME_POLICY_BLOCK | +14.64% | +5.52% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | missing |
+| 142280 | 녹십자엠에스 | TIME_POLICY_BLOCK | +13.78% | +8.00% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | missing |
+| 027360 | 아주IB투자 | ORDER_GUARD_BLOCK | +13.22% | -1.93% | order_guard | position_limit | 금융 | missing |
+| 456010 | 아이씨티케이 | ORDER_GUARD_BLOCK | +13.11% | +13.11% | order_guard | position_limit | 전기/전자 | missing |
+| 900300 | 오가닉티코스메틱 | TIME_POLICY_BLOCK | +12.82% | -4.27% | time_policy | ALLOW_CANDIDATE_CAPTURE | missing | missing |
+| 033160 | 엠케이전자 | MISSED_OPPORTUNITY | +12.29% | +9.56% | strategy_reject | MISSED_OPPORTUNITY | 전기/전자 | 반도체_후공정소재 |
+| 478340 | 나라스페이스테크놀로지 | ORDER_GUARD_BLOCK | +10.55% | -9.36% | order_guard | position_limit | 운송장비/부품 | missing |
+| 321370 | 센서뷰 | MISSED_OPPORTUNITY | +10.15% | -3.05% | strategy_reject | MISSED_OPPORTUNITY | 전기/전자 | missing |
+
+## Most Expensive Blocks
+| symbol | name | category | MFE | close | block_source | detail | sector | theme |
+|---|---|---|---:|---:|---|---|---|---|
+| 005930 | 삼성전자 | TIME_POLICY_BLOCK | +2715.00% | +2655.00% | time_policy | BLOCK_AFTER_ENTRY_CUTOFF | 전기/전자 | 반도체_생산 |
+| 439960 | 코스모로보틱스 | ORDER_GUARD_BLOCK | +25.91% | +25.91% | order_guard | position_limit | 의료/정밀기기 | missing |
+| 274090 | 켄코아에어로스페이스 | ORDER_GUARD_BLOCK | +23.18% | +6.36% | order_guard | position_limit | 운송장비/부품 | missing |
+| 078890 | 가온그룹 | TIME_POLICY_BLOCK | +19.02% | +12.02% | time_policy | ALLOW_CANDIDATE_CAPTURE | 전기/전자 | 셋톱박스 |
+| 005500 | 삼진제약 | ORDER_GUARD_BLOCK | +16.93% | +11.51% | order_guard | position_limit | 제약 | missing |
+| 243070 | 휴온스 | TIME_POLICY_BLOCK | +14.64% | +5.52% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | missing |
+| 142280 | 녹십자엠에스 | TIME_POLICY_BLOCK | +13.78% | +8.00% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | missing |
+| 027360 | 아주IB투자 | ORDER_GUARD_BLOCK | +13.22% | -1.93% | order_guard | position_limit | 금융 | missing |
+| 456010 | 아이씨티케이 | ORDER_GUARD_BLOCK | +13.11% | +13.11% | order_guard | position_limit | 전기/전자 | missing |
+| 900300 | 오가닉티코스메틱 | TIME_POLICY_BLOCK | +12.82% | -4.27% | time_policy | ALLOW_CANDIDATE_CAPTURE | missing | missing |
+| 478340 | 나라스페이스테크놀로지 | ORDER_GUARD_BLOCK | +10.55% | -9.36% | order_guard | position_limit | 운송장비/부품 | missing |
+| 086960 | MDS테크 | ORDER_GUARD_BLOCK | +9.22% | +1.02% | order_guard | position_limit | IT 서비스 | 소프트웨어_자동차용 |
+| 000370 | 한화손해보험 | TIME_POLICY_BLOCK | +7.90% | +2.41% | time_policy | ALLOW_CANDIDATE_CAPTURE | 보험 | 보험_손해보험 |
+| 037270 | YG PLUS | TIME_POLICY_BLOCK | +7.58% | -16.19% | time_policy | ALLOW_CANDIDATE_CAPTURE | IT 서비스 | missing |
+| 033160 | 엠케이전자 | ORDER_GUARD_BLOCK | +6.30% | +3.72% | order_guard | position_limit | 전기/전자 | 반도체_후공정소재 |
+
+## OrderGuard Review Candidates
+| symbol | name | category | MFE | close | block_source | detail | sector | theme |
+|---|---|---|---:|---:|---|---|---|---|
+| 439960 | 코스모로보틱스 | ORDER_GUARD_BLOCK | +25.91% | +25.91% | order_guard | position_limit | 의료/정밀기기 | missing |
+| 274090 | 켄코아에어로스페이스 | ORDER_GUARD_BLOCK | +23.18% | +6.36% | order_guard | position_limit | 운송장비/부품 | missing |
+| 005500 | 삼진제약 | ORDER_GUARD_BLOCK | +16.93% | +11.51% | order_guard | position_limit | 제약 | missing |
+| 027360 | 아주IB투자 | ORDER_GUARD_BLOCK | +13.22% | -1.93% | order_guard | position_limit | 금융 | missing |
+| 456010 | 아이씨티케이 | ORDER_GUARD_BLOCK | +13.11% | +13.11% | order_guard | position_limit | 전기/전자 | missing |
+| 478340 | 나라스페이스테크놀로지 | ORDER_GUARD_BLOCK | +10.55% | -9.36% | order_guard | position_limit | 운송장비/부품 | missing |
+| 086960 | MDS테크 | ORDER_GUARD_BLOCK | +9.22% | +1.02% | order_guard | position_limit | IT 서비스 | 소프트웨어_자동차용 |
+| 033160 | 엠케이전자 | ORDER_GUARD_BLOCK | +6.30% | +3.72% | order_guard | position_limit | 전기/전자 | 반도체_후공정소재 |
+| 032500 | 케이엠더블유 | ORDER_GUARD_BLOCK | +5.65% | -2.44% | order_guard | position_limit | 전기/전자 | 네트워크/광통신 |
+| 272210 | 한화시스템 | ORDER_GUARD_BLOCK | +5.36% | -3.79% | order_guard | position_limit | 전기/전자 | missing |
+| 005290 | 동진쎄미켐 | ORDER_GUARD_BLOCK | +5.04% | +0.17% | order_guard | position_limit | 화학 | 반도체_전공정소재 |
+| 088350 | 한화생명 | ORDER_GUARD_BLOCK | +4.58% | -1.53% | order_guard | position_limit | 보험 | 보험_생명보험 |
+| 003280 | 흥아해운 | ORDER_GUARD_BLOCK | +3.48% | -10.80% | order_guard | position_limit | 운송/창고 | 운송_해운 |
+| 218410 | RFHIC | ORDER_GUARD_BLOCK | +1.66% | -8.21% | order_guard | position_limit | 전기/전자 | missing |
+
+- blocked_after_buy_ready: 52
+- order_guard_recoverable: 45
+
+## TimePolicy Review Candidates
+| symbol | name | category | MFE | close | block_source | detail | sector | theme |
+|---|---|---|---:|---:|---|---|---|---|
+| 005930 | 삼성전자 | TIME_POLICY_BLOCK | +2715.00% | +2655.00% | time_policy | BLOCK_AFTER_ENTRY_CUTOFF | 전기/전자 | 반도체_생산 |
+| 078890 | 가온그룹 | TIME_POLICY_BLOCK | +19.02% | +12.02% | time_policy | ALLOW_CANDIDATE_CAPTURE | 전기/전자 | 셋톱박스 |
+| 243070 | 휴온스 | TIME_POLICY_BLOCK | +14.64% | +5.52% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | missing |
+| 142280 | 녹십자엠에스 | TIME_POLICY_BLOCK | +13.78% | +8.00% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | missing |
+| 900300 | 오가닉티코스메틱 | TIME_POLICY_BLOCK | +12.82% | -4.27% | time_policy | ALLOW_CANDIDATE_CAPTURE | missing | missing |
+| 000370 | 한화손해보험 | TIME_POLICY_BLOCK | +7.90% | +2.41% | time_policy | ALLOW_CANDIDATE_CAPTURE | 보험 | 보험_손해보험 |
+| 037270 | YG PLUS | TIME_POLICY_BLOCK | +7.58% | -16.19% | time_policy | ALLOW_CANDIDATE_CAPTURE | IT 서비스 | missing |
+| 052900 | KX하이텍 | TIME_POLICY_BLOCK | +4.98% | +3.03% | time_policy | ALLOW_CANDIDATE_CAPTURE | 화학 | missing |
+| 046970 | 우리로 | TIME_POLICY_BLOCK | +4.46% | -7.98% | time_policy | ALLOW_CANDIDATE_CAPTURE | 유통 | missing |
+| 039980 | 폴라리스AI | TIME_POLICY_BLOCK | +3.87% | -8.84% | time_policy | ALLOW_CANDIDATE_CAPTURE | IT 서비스 | missing |
+| 003280 | 흥아해운 | TIME_POLICY_BLOCK | +2.95% | -11.27% | time_policy | ALLOW_CANDIDATE_CAPTURE | 운송/창고 | 운송_해운 |
+| 217590 | 티엠씨 | TIME_POLICY_BLOCK | +2.21% | +2.21% | time_policy | ALLOW_CANDIDATE_CAPTURE | 전기/전자 | missing |
+| 100790 | 미래에셋벤처투자 | TIME_POLICY_BLOCK | +2.18% | -11.50% | time_policy | ALLOW_CANDIDATE_CAPTURE | 금융 | missing |
+| 064550 | 바이오니아 | TIME_POLICY_BLOCK | +2.08% | -6.24% | time_policy | ALLOW_CANDIDATE_CAPTURE | 제약 | 바이오_진단/백신 |
+| 015760 | 한국전력 | TIME_POLICY_BLOCK | +2.06% | +0.77% | time_policy | ALLOW_CANDIDATE_CAPTURE | 전기/가스 | missing |
+
+| time_bucket | missed_count |
+|---|---:|
+| 14:20~close | 8 |
+| 09:00~09:30 | 3 |
+| 10:30~13:00 | 3 |
+
+## TimePolicy Paper Validation Candidates
+- paper-only validation list; this is not a live entry relaxation.
+
+| symbol | name | time_bucket | paper_strategy_type | reason | MFE | close return | sector | theme |
+|---|---|---|---|---|---:|---:|---|---|
+| 005930 | 삼성전자 | 14:20~close | CLOSING_STRENGTH | BLOCK_AFTER_ENTRY_CUTOFF | +2715.00% | +2655.00% | 전기/전자 | 반도체_생산 |
+| 078890 | 가온그룹 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +19.02% | +12.02% | 전기/전자 | 셋톱박스 |
+| 243070 | 휴온스 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +14.64% | +5.52% | 제약 | missing |
+| 142280 | 녹십자엠에스 | 10:30~13:00 | MIDDAY_VWAP_RECLAIM | ALLOW_CANDIDATE_CAPTURE | +13.78% | +8.00% | 제약 | missing |
+| 900300 | 오가닉티코스메틱 | 10:30~13:00 | MIDDAY_VWAP_RECLAIM | ALLOW_CANDIDATE_CAPTURE | +12.82% | -4.27% | missing | missing |
+| 000370 | 한화손해보험 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +7.90% | +2.41% | 보험 | 보험_손해보험 |
+| 037270 | YG PLUS | 14:20~close | CLOSING_STRENGTH | ALLOW_CANDIDATE_CAPTURE | +7.58% | -16.19% | IT 서비스 | missing |
+| 052900 | KX하이텍 | 10:30~13:00 | MIDDAY_VWAP_RECLAIM | ALLOW_CANDIDATE_CAPTURE | +4.98% | +3.03% | 화학 | missing |
+| 046970 | 우리로 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +4.46% | -7.98% | 유통 | missing |
+| 039980 | 폴라리스AI | 10:30~13:00 | MIDDAY_VWAP_RECLAIM | ALLOW_CANDIDATE_CAPTURE | +3.87% | -8.84% | IT 서비스 | missing |
+| 217590 | 티엠씨 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +2.21% | +2.21% | 전기/전자 | missing |
+| 100790 | 미래에셋벤처투자 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +2.18% | -11.50% | 금융 | missing |
+| 064550 | 바이오니아 | 10:30~13:00 | MIDDAY_VWAP_RECLAIM | ALLOW_CANDIDATE_CAPTURE | +2.08% | -6.24% | 제약 | 바이오_진단/백신 |
+| 015760 | 한국전력 | 09:00~09:30 | OPENING_RECOVERY_PROBE | ALLOW_CANDIDATE_CAPTURE | +2.06% | +0.77% | 전기/가스 | missing |
+
+## Sector/Theme Concentration
+### sector_name
+| name | rows | unique_symbols | missed | order_guard | time_policy | avg_MFE | max_MFE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 전기/전자 | 178 | 26 | 85 | 58 | 30 | +25.98% | +2715.00% |
+| 운송장비/부품 | 31 | 5 | 23 | 23 | 3 | +15.46% | +23.18% |
+| 금융 | 52 | 7 | 21 | 21 | 9 | +5.95% | +13.22% |
+| 제약 | 72 | 12 | 12 | 1 | 60 | +6.59% | +23.92% |
+| IT 서비스 | 34 | 9 | 12 | 4 | 19 | +5.89% | +15.93% |
+| 의료/정밀기기 | 17 | 7 | 8 | 8 | 6 | +19.39% | +25.91% |
+| 화학 | 63 | 7 | 5 | 5 | 55 | +2.04% | +5.04% |
+| 기계/장비 | 43 | 7 | 3 | 0 | 10 | +1.52% | +6.64% |
+| 보험 | 26 | 4 | 2 | 15 | 4 | +4.17% | +7.90% |
+| 유통 | 14 | 5 | 1 | 0 | 2 | +5.15% | +20.52% |
+
+### theme_names
+| name | rows | unique_symbols | missed | order_guard | time_policy | avg_MFE | max_MFE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| (blank) | 465 | 81 | 107 | 67 | 213 | +6.29% | +25.91% |
+| 반도체_후공정소재 | 34 | 1 | 34 | 32 | 0 | +6.65% | +12.29% |
+| 네트워크/광통신 | 12 | 1 | 12 | 12 | 0 | +5.60% | +5.65% |
+| 통신장비 | 12 | 1 | 12 | 12 | 0 | +5.60% | +5.65% |
+| 셋톱박스 | 8 | 1 | 8 | 0 | 1 | +19.02% | +19.02% |
+| LCD_소재 | 5 | 1 | 5 | 5 | 0 | +5.04% | +5.04% |
+| 반도체_전공정소재 | 5 | 1 | 5 | 5 | 0 | +5.04% | +5.04% |
+| 소프트웨어_자동차용 | 4 | 1 | 4 | 4 | 0 | +9.22% | +9.22% |
+| 자동차_전장화 수혜 | 4 | 1 | 4 | 4 | 0 | +9.22% | +9.22% |
+| 보험_손해보험 | 8 | 2 | 2 | 0 | 1 | +3.40% | +7.90% |
+
+## Recommended Next Parameter Checks
+- OrderGuard: review 45 BUY-ready blocked rows before changing strategy thresholds.
+- TimePolicy: simulate a narrower relaxation around 14:20~close; 14 recoverable rows qualify.
+- Theme map: 107 missed rows still have blank theme coverage; improve the map before theme gating.
 
 ## Good Rejects
 | symbol | name | detected_at | capture_price | final_decision | final_reason | reason_code | MFE | MAE | category |
