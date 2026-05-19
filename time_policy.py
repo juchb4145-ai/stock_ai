@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 ALLOW_ENTRY = "ALLOW_ENTRY"
 ALLOW_LATE_A_GRADE_ENTRY = "ALLOW_LATE_A_GRADE_ENTRY"
+ALLOW_MIDDAY_ENTRY = "ALLOW_MIDDAY_ENTRY"
 ALLOW_MANAGE_ONLY = "ALLOW_MANAGE_ONLY"
 ALLOW_CANDIDATE_CAPTURE = "ALLOW_CANDIDATE_CAPTURE"
 ALLOW_ANALYSIS_ONLY = "ALLOW_ANALYSIS_ONLY"
@@ -475,6 +476,19 @@ class TimePolicy:
                 local_dt,
                 session=session,
             )
+        elif bool(getattr(self.config, "midday_live_entry_enabled", True)) and self._in_windows(
+            clock,
+            self.midday_paper_windows,
+        ):
+            deadline = self.entry_window_deadline(now=local_dt, context=context)
+            decision = self._decision(
+                True,
+                ALLOW_MIDDAY_ENTRY,
+                ALLOW_MIDDAY_ENTRY,
+                local_dt,
+                session=session,
+                next_allowed_time=deadline.isoformat() if deadline is not None else None,
+            )
         else:
             decision = self._decision(
                 False,
@@ -690,6 +704,10 @@ class TimePolicy:
         for start, end in self.entry_windows:
             if start <= clock <= end or (include_next and clock < start):
                 return datetime.combine(local_dt.date(), end, tzinfo=self.timezone)
+        if bool(getattr(self.config, "midday_live_entry_enabled", True)):
+            for start, end in self.midday_paper_windows:
+                if start <= clock <= end or (include_next and clock < start):
+                    return datetime.combine(local_dt.date(), end, tzinfo=self.timezone)
         return None
 
     def _entry_allowed_for_clock(
@@ -706,9 +724,16 @@ class TimePolicy:
             return False
         if clock >= self.no_new_entry_after:
             return False
-        return self._in_windows(clock, self.entry_windows) or self._late_a_grade_entry_allowed(
-            clock,
-            context,
+        return (
+            self._in_windows(clock, self.entry_windows)
+            or (
+                bool(getattr(self.config, "midday_live_entry_enabled", True))
+                and self._in_windows(clock, self.midday_paper_windows)
+            )
+            or self._late_a_grade_entry_allowed(
+                clock,
+                context,
+            )
         )
 
     def _late_a_grade_entry_allowed(

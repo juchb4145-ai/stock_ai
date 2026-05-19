@@ -223,6 +223,15 @@ class MomentumBreakoutStrategy:
         paper_decision = self._paper_strategy_decision(ctx, metrics, bullish_reversal)
         if paper_decision is not None:
             return paper_decision
+        if metrics.get("time_policy_reason_code") == "ALLOW_MIDDAY_ENTRY":
+            return MomentumDecision(
+                EntryDecision.WAIT_RECLAIM_VWAP,
+                "midday live entry is limited to VWAP reclaim setup",
+                "WAIT_MIDDAY_VWAP_RECLAIM",
+                chase_risk_score=metrics["chase_risk_score"],
+                entry_type=ENTRY_TYPE_MIDDAY_VWAP_RECLAIM,
+                metrics=metrics,
+            )
 
         if spread_rate < 0 or spread_rate > self.config.max_spread_pct:
             if not self._conditional_spread_relief(ctx, metrics, bullish_reversal):
@@ -867,6 +876,31 @@ class MomentumBreakoutStrategy:
             metrics=paper_metrics,
         )
 
+    def _live_strategy_buy(
+        self,
+        ctx: MomentumContext,
+        metrics: Dict[str, float],
+        *,
+        reason: str,
+        reason_code: str,
+        entry_type: str,
+        ratio: float,
+    ) -> MomentumDecision:
+        live_metrics = dict(metrics)
+        live_metrics["paper_only_strategy"] = 0.0
+        live_metrics["orderable_live"] = 1.0
+        live_metrics["strategy_type"] = entry_type
+        return MomentumDecision(
+            EntryDecision.BUY,
+            reason,
+            reason_code,
+            chase_risk_score=live_metrics.get("chase_risk_score", 0.0),
+            entry_ratio=ratio,
+            entry_type=entry_type,
+            position_size_multiplier=ratio,
+            metrics=live_metrics,
+        )
+
     def _midday_vwap_reclaim_decision(
         self,
         ctx: MomentumContext,
@@ -886,6 +920,16 @@ class MomentumBreakoutStrategy:
             and pulled_back
             and (float(ctx.volume_ratio or 0.0) >= self.config.min_volume_ratio or turnover_ok or volume_reaccel)
         ):
+            ratio = max(float(getattr(self.config, "midday_live_entry_ratio", 0.25) or 0.0), 0.0)
+            if bool(getattr(self.config, "midday_live_entry_enabled", True)) and ratio > 0:
+                return self._live_strategy_buy(
+                    ctx,
+                    metrics,
+                    reason="midday VWAP reclaim live",
+                    reason_code="MIDDAY_VWAP_RECLAIM_LIVE",
+                    entry_type=ENTRY_TYPE_MIDDAY_VWAP_RECLAIM,
+                    ratio=ratio,
+                )
             return self._paper_buy(
                 ctx,
                 metrics,

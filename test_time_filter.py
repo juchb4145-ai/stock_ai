@@ -6,6 +6,7 @@ from datetime import datetime
 from time_policy import (
     ALLOW_ENTRY,
     ALLOW_MANAGE_ONLY,
+    ALLOW_MIDDAY_ENTRY,
     BLOCK_AFTER_ENTRY_CUTOFF,
     BLOCK_CLOSING_AUCTION,
     BLOCK_NON_TRADING_DAY,
@@ -48,16 +49,22 @@ class TimePolicyTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.action, ALLOW_ENTRY)
 
-    def test_midday_entry_depends_on_configured_windows_and_defaults_to_block(self):
+    def test_midday_entry_allows_condition_limited_live_window(self):
         decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("10:45:00"))
 
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.action, ALLOW_MANAGE_ONLY)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.action, ALLOW_MIDDAY_ENTRY)
         self.assertIn("13:00:00", decision.next_allowed_time)
         self.assertEqual(
             TimePolicy(TradeConfig()).paper_strategy_type(now=_at("10:45:00")),
             "MIDDAY_VWAP_RECLAIM",
         )
+
+    def test_midday_entry_can_be_disabled_by_config(self):
+        decision = TimePolicy(TradeConfig(midday_live_entry_enabled=False)).evaluate_entry(now=_at("10:45:00"))
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.action, ALLOW_MANAGE_ONLY)
 
     def test_allows_secondary_entry_window(self):
         decision = TimePolicy(TradeConfig()).evaluate_entry(now=_at("13:30:00"))

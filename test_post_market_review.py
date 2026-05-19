@@ -563,6 +563,36 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertIn("n_mfe", md)
             self.assertIn("missing_mfe", md)
 
+    def test_markdown_reports_sector_theme_map_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _make_fixture(root)
+            sector_map = root / "sector_map.csv"
+            theme_map = root / "theme_map.csv"
+            sector_map.write_text("code,name,market,sector_code,sector_name,sector_index_code\n", encoding="utf-8")
+            theme_map.write_text("theme_name,code,role\n", encoding="utf-8")
+
+            result = run_post_market_review(
+                target_date=TARGET_DATE,
+                mode="paper",
+                output_dir=paths["output"],
+                condition_capture_path=paths["condition"],
+                trade_log_path=paths["trade_log"],
+                main_log_path=paths["main_log"],
+                intraday_dir=paths["intraday"],
+                sector_map_path=sector_map,
+                theme_map_path=theme_map,
+                write_json=True,
+            )
+
+            self.assertEqual(result.data_source_status["sector_map"]["status"], "header_only")
+            self.assertEqual(result.data_source_status["theme_map"]["status"], "header_only")
+            md = result.paths.markdown.read_text(encoding="utf-8")
+            self.assertIn("Data Source Status", md)
+            self.assertIn("| sector_map | header_only |", md)
+            self.assertIn("| theme_map | header_only |", md)
+            self.assertIn("fallback-only", md)
+
     def test_post_market_readme_and_docs_index_links_exist(self):
         readme = Path("reports") / "post_market" / "README.md"
         self.assertTrue(readme.exists())
@@ -838,6 +868,195 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertEqual(by_id["cid-second"].reason_code, "candidate_id_reason")
             self.assertEqual(by_id["cid-second"].join_quality, "exact_candidate_id")
             self.assertNotEqual(by_id["cid-first"].reason_code, "candidate_id_reason")
+
+    def test_ready_final_event_is_preserved_when_later_block_arrives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fields = [
+                "logged_at",
+                "event",
+                "source_event",
+                "created_at",
+                "candidate_id",
+                "symbol",
+                "symbol_name",
+                "detected_at",
+                "captured_at",
+                "captured_time",
+                "code",
+                "name",
+                "condition_name",
+                "strategy_name",
+                "capture_price",
+                "signal_source",
+                "symbol_market",
+                "primary_index_code",
+            ]
+            _write_csv(
+                root / "condition_captures.csv",
+                fields,
+                [
+                    {
+                        "logged_at": f"{TARGET_DATE} 09:00:00",
+                        "event": "condition_detected",
+                        "source_event": "condition_detected",
+                        "created_at": f"{TARGET_DATE} 09:00:00",
+                        "candidate_id": "cid-ready",
+                        "symbol": "READY1",
+                        "symbol_name": "Ready One",
+                        "detected_at": f"{TARGET_DATE} 09:00:00",
+                        "captured_at": f"{TARGET_DATE} 09:00:00",
+                        "captured_time": "090000",
+                        "code": "READY1",
+                        "name": "Ready One",
+                        "condition_name": "quant_condition",
+                        "strategy_name": "momentum-test",
+                        "capture_price": "10000",
+                        "signal_source": "HTS_CONDITION_SEARCH",
+                        "symbol_market": "KOSDAQ",
+                        "primary_index_code": "201",
+                    },
+                ],
+            )
+            events = [
+                _log_line(
+                    "momentum_entry_decision",
+                    {
+                        "event": "momentum_entry_decision",
+                        "timestamp": f"{TARGET_DATE} 09:01:00",
+                        "symbol": "READY1",
+                        "candidate_id": "cid-ready",
+                        "decision": "BUY",
+                        "reason_code": "buy_pullback_reclaim",
+                        "current_price": 10100,
+                        "market_data_available": True,
+                        "candle_cache_available": True,
+                    },
+                ),
+                _log_line(
+                    "final_entry_decision",
+                    {
+                        "event": "final_entry_decision",
+                        "timestamp": f"{TARGET_DATE} 09:01:00",
+                        "symbol": "READY1",
+                        "candidate_id": "cid-ready",
+                        "allowed": True,
+                        "status": "ready",
+                        "reason_code": "FINAL_BUY_READY",
+                        "final_reason": "ready",
+                        "current_price": 10100,
+                        "symbol_market": "KOSDAQ",
+                        "primary_index_code": "201",
+                    },
+                ),
+                _log_line(
+                    "momentum_entry_decision",
+                    {
+                        "event": "momentum_entry_decision",
+                        "timestamp": f"{TARGET_DATE} 09:02:00",
+                        "symbol": "READY1",
+                        "candidate_id": "cid-ready",
+                        "decision": "REJECT",
+                        "reason_code": "weak_volume_ratio",
+                        "current_price": 9900,
+                        "market_data_available": True,
+                        "candle_cache_available": True,
+                    },
+                ),
+                _log_line(
+                    "final_entry_decision",
+                    {
+                        "event": "final_entry_decision",
+                        "timestamp": f"{TARGET_DATE} 09:02:00",
+                        "symbol": "READY1",
+                        "candidate_id": "cid-ready",
+                        "allowed": False,
+                        "status": "blocked",
+                        "reason_code": "FINAL_MOMENTUM_WEAK_VOLUME_RATIO",
+                        "final_reason": "weak volume",
+                        "current_price": 9900,
+                    },
+                ),
+                _log_line(
+                    "recovery_watch_queued",
+                    {
+                        "event": "recovery_watch_queued",
+                        "timestamp": f"{TARGET_DATE} 09:02:01",
+                        "symbol": "READY1",
+                        "candidate_id": "cid-ready",
+                        "reason_code": "FINAL_MOMENTUM_WEAK_VOLUME_RATIO",
+                        "delay_seconds": 15,
+                        "symbol_market": "KOSDAQ",
+                    },
+                ),
+            ]
+            (root / "main.log").write_text("".join(events), encoding="utf-8")
+            _write_csv(
+                root / "trade_log.csv",
+                [
+                    "logged_at",
+                    "event",
+                    "candidate_id",
+                    "code",
+                    "name",
+                    "side",
+                    "reason_code",
+                    "reason",
+                    "blocked_by",
+                    "message",
+                ],
+                [
+                    {
+                        "logged_at": f"{TARGET_DATE} 09:01:05",
+                        "event": "buy_skip",
+                        "candidate_id": "cid-ready",
+                        "code": "READY1",
+                        "name": "Ready One",
+                        "side": "buy",
+                        "reason_code": "SHOULD_SKIP_BUY_MISSING_FIRST_POSITION_FOR_STAGE2",
+                        "reason": "should_skip_buy",
+                        "blocked_by": "position_state",
+                        "message": "stage 2 entry requires an existing first position",
+                    }
+                ],
+            )
+            _write_bars(root, "READY1", "09:00:00", [10000, 10100, 10200, 9900])
+
+            result = run_post_market_review(
+                target_date=TARGET_DATE,
+                mode="paper",
+                output_dir=root / "reports",
+                condition_capture_path=root / "condition_captures.csv",
+                trade_log_path=root / "trade_log.csv",
+                main_log_path=root / "main.log",
+                intraday_dir=root / "intraday",
+                min_missed_opportunity_pct=0.02,
+                write_json=True,
+            )
+
+            row = result.rows[0]
+            self.assertEqual(row.final_decision, "BUY")
+            self.assertEqual(row.reason_code, "FINAL_BUY_READY")
+            self.assertEqual(row.current_price, 10100)
+            self.assertEqual(row.order_guard_reason, "SHOULD_SKIP_BUY_MISSING_FIRST_POSITION_FOR_STAGE2")
+            self.assertEqual(row.review_category, "ORDER_GUARD_BLOCK")
+            self.assertEqual(row.context_fields["symbol_market"], "KOSDAQ")
+            self.assertIn("recovery_watch_queued", row.candidate_lifecycle)
+            self.assertEqual(row.recovery_watch_count, 1)
+            self.assertEqual(row.recovery_watch_reasons, "FINAL_MOMENTUM_WEAK_VOLUME_RATIO")
+            self.assertEqual(row.recovery_watch_delay_seconds, 15)
+            self.assertIn("FINAL_READY_SUPERSEDED_BY_LATER_EVENT", row.data_quality)
+
+            payload = json.loads(result.paths.json.read_text(encoding="utf-8"))
+            ready_json = payload[0]
+            self.assertEqual(ready_json["symbol_market"], "KOSDAQ")
+            self.assertEqual(ready_json["primary_index_code"], "201")
+            self.assertEqual(ready_json["recovery_watch_count"], 1)
+            self.assertEqual(ready_json["recovery_watch_reasons"], "FINAL_MOMENTUM_WEAK_VOLUME_RATIO")
+
+            md = result.paths.markdown.read_text(encoding="utf-8")
+            self.assertIn("Recovery Watch", md)
+            self.assertIn("FINAL_MOMENTUM_WEAK_VOLUME_RATIO", md)
 
     def test_unknown_candidate_id_does_not_fallback_to_same_symbol(self):
         with tempfile.TemporaryDirectory() as tmp:

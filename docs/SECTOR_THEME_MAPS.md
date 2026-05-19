@@ -101,3 +101,35 @@ prevents silent all-unknown map startup. Gate enforcement remains controlled by:
 
 - `KIWOOM_SECTOR_GATE_ENFORCEMENT_ENABLED`
 - `KIWOOM_THEME_GATE_ENFORCEMENT_ENABLED`
+
+## Build Fill-In Templates From Detection Logs
+
+If no sector/theme source export is ready yet, generate fill-in templates from
+the symbols that actually appeared in condition captures:
+
+```powershell
+.\venv64\Scripts\python.exe tools\bootstrap_sector_theme_maps.py `
+  --template-from-condition-captures data\condition_captures.csv `
+  --template-date 2026-05-18 `
+  --sector-template-out reports\sector_theme_templates\20260518_sector_map_template.csv `
+  --theme-template-out reports\sector_theme_templates\20260518_theme_map_template.csv
+```
+
+The template pre-fills code, name, market when available, first/last detected
+time, detected count, and condition names. Fill `sector_code`,
+`sector_name`, `sector_index_code`, `theme_name`, and `role`, then use the
+same bootstrap command with `--sector-source` / `--theme-source` to write the
+production maps.
+
+When promoting a filled template, keep the source check enabled so partially
+filled rows cannot be silently dropped:
+
+```powershell
+.\venv64\Scripts\python.exe tools\bootstrap_sector_theme_maps.py `
+  --sector-source reports\sector_theme_templates\20260518_sector_map_template.csv `
+  --theme-source reports\sector_theme_templates\20260518_theme_map_template.csv `
+  --sector-out data\sector_map.csv `
+  --theme-out data\theme_map.csv `
+  --fail-on-empty `
+  --fail-on-invalid-source
+```

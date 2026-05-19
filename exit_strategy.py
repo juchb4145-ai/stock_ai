@@ -342,18 +342,26 @@ def evaluate_exit(ctx: ExitContext) -> ExitDecision:
                 trailing_stop_price=trailing_stop_price,
             )
 
-    if _cfg_bool(config, "partial_take_profit_enabled", True) and r >= float(_cfg(config, "first_partial_take_profit_r", EXIT_PARTIAL_R) or EXIT_PARTIAL_R) and not pos.partial_taken:
+    fixed_take_profit = float(_cfg(config, "fixed_take_profit_pct", FIXED_TAKE_PROFIT_PCT) or FIXED_TAKE_PROFIT_PCT)
+    partial_take_profit_r = float(_cfg(config, "first_partial_take_profit_r", EXIT_PARTIAL_R) or EXIT_PARTIAL_R)
+    partial_take_profit_by_r = r >= partial_take_profit_r
+    partial_take_profit_by_fixed_pct = profit_rate >= fixed_take_profit
+    if (
+        _cfg_bool(config, "partial_take_profit_enabled", True)
+        and not pos.partial_taken
+        and (partial_take_profit_by_r or partial_take_profit_by_fixed_pct)
+    ):
+        trigger = "{:.2f}R".format(r) if partial_take_profit_by_r else "{:.2%}".format(profit_rate)
         return decision(
             action=ACTION_SELL_PARTIAL,
             exit_type=EXIT_TYPE_PARTIAL_PROFIT_TAKE,
             reason_code=REASON_TAKE_PROFIT_2R_PARTIAL,
-            detail="partial take profit at {:.2f}R ({:.2%})".format(r, profit_rate),
+            detail="partial take profit at {} ({:.2%})".format(trigger, profit_rate),
             priority=7,
             qty_ratio=float(_cfg(config, "first_partial_take_profit_ratio", EXIT_PARTIAL_RATIO) or EXIT_PARTIAL_RATIO),
             mark_partial_taken=True,
         )
 
-    fixed_take_profit = float(_cfg(config, "fixed_take_profit_pct", FIXED_TAKE_PROFIT_PCT) or FIXED_TAKE_PROFIT_PCT)
     fixed_take_profit_allowed = (
         _cfg_bool(config, "fixed_take_profit_as_fallback", True)
         and profit_rate >= fixed_take_profit

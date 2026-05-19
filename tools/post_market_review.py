@@ -33,6 +33,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--trade-log", default="data/trade_log.csv")
     parser.add_argument("--main-log", default="data/main.log")
     parser.add_argument("--intraday-dir", default="data/intraday")
+    parser.add_argument("--sector-map", default="data/sector_map.csv")
+    parser.add_argument("--theme-map", default="data/theme_map.csv")
     return parser.parse_args(argv)
 
 
@@ -59,6 +61,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             trade_log_path=args.trade_log,
             main_log_path=args.main_log,
             intraday_dir=args.intraday_dir,
+            sector_map_path=args.sector_map,
+            theme_map_path=args.theme_map,
             min_missed_opportunity_pct=args.min_missed_opportunity_pct,
             timeframe=args.timeframe,
             write_json=args.write_json,

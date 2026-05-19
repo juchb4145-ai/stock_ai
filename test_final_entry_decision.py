@@ -181,6 +181,104 @@ def _ready_buy_prediction(**overrides):
 
 
 class FinalEntryDecisionTests(unittest.TestCase):
+    def test_quant_stage2_without_position_is_allowed_as_first_lump_sum(self):
+        class Stub:
+            portfolio = PortfolioState()
+            paper_portfolio = None
+            should_skip_buy = main.Kiwoom.should_skip_buy
+            _record_buy_skip_context = main.Kiwoom._record_buy_skip_context
+
+        stub = Stub()
+
+        self.assertFalse(
+            stub.should_skip_buy("000001", stage=2, grade=main.QUANT_GRADE)
+        )
+
+    def test_final_momentum_rejects_can_be_requeued_for_recovery_watch(self):
+        class Stub:
+            should_watch_pullback_recovery = main.Kiwoom.should_watch_pullback_recovery
+            condition_recheck_delay_seconds = main.Kiwoom.condition_recheck_delay_seconds
+            _condition_eval_state = main.Kiwoom._condition_eval_state
+            normalize_code = main.Kiwoom.normalize_code
+
+            def __init__(self):
+                self.candidate_registry = None
+
+        stub = Stub()
+        prediction = {
+            "status": "blocked",
+            "reason_code": "FINAL_MOMENTUM_BLOCK_BELOW_VWAP_WEAK_FLOW",
+            "market_gate_action": "",
+        }
+
+        self.assertTrue(stub.should_watch_pullback_recovery(prediction))
+        self.assertEqual(
+            stub.condition_recheck_delay_seconds("000001", prediction),
+            main.CONDITION_RECLAIM_RECHECK_SECONDS,
+        )
+
+    def test_recovery_recheck_repeats_backoff_and_expire(self):
+        class Stub:
+            should_watch_pullback_recovery = main.Kiwoom.should_watch_pullback_recovery
+            condition_recheck_delay_seconds = main.Kiwoom.condition_recheck_delay_seconds
+            mark_condition_eval_result = main.Kiwoom.mark_condition_eval_result
+            _condition_eval_state = main.Kiwoom._condition_eval_state
+            normalize_code = main.Kiwoom.normalize_code
+
+            def __init__(self):
+                self.candidate_registry = None
+                self.pending_condition_codes = []
+
+            @staticmethod
+            def parse_float(value, default=0.0):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return default
+
+        stub = Stub()
+        prediction = {
+            "code": "000001",
+            "status": "blocked",
+            "reason_code": "FINAL_MOMENTUM_BLOCK_BELOW_VWAP_WEAK_FLOW",
+            "market_gate_action": "",
+        }
+
+        for _ in range(main.CONDITION_REPEAT_BACKOFF_THRESHOLD):
+            stub.mark_condition_eval_result("000001", prediction)
+
+        self.assertEqual(
+            stub.condition_recheck_delay_seconds("000001", prediction),
+            main.CONDITION_RECLAIM_RECHECK_SECONDS * 2,
+        )
+
+        for _ in range(main.CONDITION_REPEAT_EXPIRE_THRESHOLD - main.CONDITION_REPEAT_BACKOFF_THRESHOLD):
+            stub.mark_condition_eval_result("000001", prediction)
+
+        self.assertFalse(stub.should_watch_pullback_recovery(prediction))
+
+    def test_signal_candle_range_waits_for_next_five_minute_candle(self):
+        class Stub:
+            _seconds_until_next_five_min_candle = main.Kiwoom._seconds_until_next_five_min_candle
+
+        self.assertGreaterEqual(
+            Stub()._seconds_until_next_five_min_candle(now_ts=300.0),
+            300.0,
+        )
+
+    def test_market_risk_off_still_prevents_recovery_watch(self):
+        class Stub:
+            should_watch_pullback_recovery = main.Kiwoom.should_watch_pullback_recovery
+
+        stub = Stub()
+        prediction = {
+            "status": "blocked",
+            "reason_code": "FINAL_MOMENTUM_REJECT_SPREAD",
+            "market_gate_action": main.entry_strategy.MARKET_ACTION_BLOCK_ALL,
+        }
+
+        self.assertFalse(stub.should_watch_pullback_recovery(prediction))
+
     def test_final_paper_only_reason_is_breakout_probe_reason(self):
         self.assertTrue(
             is_breakout_probe_entry(
@@ -307,6 +405,23 @@ class FinalEntryDecisionTests(unittest.TestCase):
         self.assertTrue(final.legacy_veto_applied)
         self.assertTrue(final.decision_trace["paper_only_strategy"])
         self.assertTrue(final.decision_trace["blocked_live_breakout_probe"])
+
+    def test_midday_vwap_reclaim_live_is_not_marked_paper_only(self):
+        final = build_final_entry_decision(
+            momentum_action="BUY",
+            momentum_reason_code="MIDDAY_VWAP_RECLAIM_LIVE",
+            momentum_reason="midday live",
+            legacy_status="ready",
+            legacy_reason_code="SAFE_READY",
+            legacy_reason="ready",
+            entry_type="MIDDAY_VWAP_RECLAIM",
+            position_size_multiplier=0.25,
+        )
+
+        self.assertTrue(final.allowed)
+        self.assertEqual(final.reason_code, "FINAL_BUY_READY")
+        self.assertFalse(final.decision_trace["paper_only_strategy"])
+        self.assertFalse(final.decision_trace["blocked_live_breakout_probe"])
 
     def test_place_buy_order_logs_live_breakout_block_without_send_order(self):
         stub = _LivePlaceBuyStub()

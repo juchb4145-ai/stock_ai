@@ -24,7 +24,6 @@ _LIVE_BLOCKED_BREAKOUT_VALUES = {
     "READY_AGRADE_FIRST",
     "FINAL_PAPER_ONLY_BREAKOUT_PROBE",
     "FINAL_PAPER_ONLY_STRATEGY",
-    "MIDDAY_VWAP_RECLAIM",
     "AFTERNOON_SECOND_WAVE",
     "CLOSING_STRENGTH",
     "TREND_CONTINUATION",
@@ -128,6 +127,9 @@ class GuardDecision:
     requested_amount: int = 0
     daily_buy_count: int = 0
     daily_loss: float = 0.0
+    effective_position_limit: int = 0
+    effective_daily_exposure_limit: int = 0
+    limit_source: str = ""
     is_reentry_blocked: bool = False
     time_decision: Dict[str, object] = field(default_factory=dict)
     time_decision_id: str = ""
@@ -160,6 +162,9 @@ class RiskLimits:
     max_daily_loss: int
     max_position_size: int
     max_daily_exposure: int
+    cash_usage_ratio: float
+    max_position_cash_ratio: float
+    max_daily_exposure_ratio: float
     reentry_cooldown_seconds: int
     max_orders_per_second: int
 
@@ -173,6 +178,9 @@ class RiskLimits:
             max_daily_loss=int(config.max_daily_loss),
             max_position_size=int(config.max_position_size),
             max_daily_exposure=int(config.max_daily_exposure),
+            cash_usage_ratio=float(config.cash_usage_ratio),
+            max_position_cash_ratio=float(config.max_position_cash_ratio),
+            max_daily_exposure_ratio=float(config.max_daily_exposure_ratio),
             reentry_cooldown_seconds=int(config.reentry_cooldown_seconds),
             max_orders_per_second=int(config.max_orders_per_second),
         )
@@ -186,6 +194,7 @@ class RiskState:
     daily_buy_count: int = 0
     daily_loss: float = 0.0
     daily_exposure: int = 0
+    account_cash: int = 0
     open_positions: Set[str] = field(default_factory=set)
     pending_orders: Set[str] = field(default_factory=set)
     pending_order_ids: Set[str] = field(default_factory=set)
@@ -311,6 +320,7 @@ class PaperPortfolio:
             daily_buy_count=int(self.daily_buy_count),
             daily_loss=float(min(self.realized_pnl, 0)),
             daily_exposure=int(self.daily_buy_amount),
+            account_cash=int(self.cash + self.daily_buy_amount),
             open_positions={code for code, pos in self.positions.items() if pos.quantity > 0},
             pending_orders=set(pending_orders or set()),
             pending_order_ids=set(pending_order_ids or set()),
@@ -470,6 +480,31 @@ class OrderGuard:
             daily_loss_available=False,
         )
 
+    def _effective_position_limit(self, risk_state: RiskState) -> tuple[int, str]:
+        if self.limits.max_position_size > 0:
+            return int(self.limits.max_position_size), "absolute_config"
+        account_cash = int(risk_state.account_cash or 0)
+        if account_cash <= 0:
+            return 0, ""
+        limit = int(
+            account_cash
+            * max(float(self.limits.max_position_cash_ratio or 0.0), 0.0)
+            * max(float(self.limits.cash_usage_ratio or 0.0), 0.0)
+        )
+        return max(limit, 0), "dynamic_deposit_ratio" if limit > 0 else ""
+
+    def _effective_daily_exposure_limit(self, risk_state: RiskState) -> tuple[int, str]:
+        if self.limits.max_daily_exposure > 0:
+            return int(self.limits.max_daily_exposure), "absolute_config"
+        account_cash = int(risk_state.account_cash or 0)
+        if account_cash <= 0:
+            return 0, ""
+        limit = int(
+            account_cash
+            * max(float(self.limits.max_daily_exposure_ratio or 0.0), 0.0)
+        )
+        return max(limit, 0), "dynamic_deposit_ratio" if limit > 0 else ""
+
     def _decision(
         self,
         *,
@@ -483,6 +518,9 @@ class OrderGuard:
         throttle_seconds: float = 0.0,
         is_reentry_blocked: bool = False,
         time_decision: Optional[TimeDecision] = None,
+        effective_position_limit: int = 0,
+        effective_daily_exposure_limit: int = 0,
+        limit_source: str = "",
     ) -> GuardDecision:
         return GuardDecision(
             allowed=allowed,
@@ -497,6 +535,9 @@ class OrderGuard:
             requested_amount=int(requested_amount),
             daily_buy_count=int(risk_state.daily_buy_count),
             daily_loss=float(risk_state.daily_loss),
+            effective_position_limit=int(effective_position_limit or 0),
+            effective_daily_exposure_limit=int(effective_daily_exposure_limit or 0),
+            limit_source=str(limit_source or ""),
             is_reentry_blocked=is_reentry_blocked,
             time_decision=time_decision.to_dict() if time_decision is not None else {},
             time_decision_id=(
@@ -544,6 +585,7 @@ class OrderGuard:
             daily_buy_count=int(risk_state.daily_buy_count),
             daily_loss=float(risk_state.daily_loss),
             daily_exposure=int(risk_state.daily_exposure),
+            account_cash=int(risk_state.account_cash),
             open_positions=set(risk_state.open_positions),
             pending_orders=set(risk_state.pending_orders),
             pending_order_ids=set(risk_state.pending_order_ids),
@@ -601,6 +643,22 @@ class OrderGuard:
 
         basis_price = int(request.current_price or request.price or request.entry_price or 0)
         requested_amount = max(basis_price, 0) * max(int(request.quantity or 0), 0)
+        effective_position_limit, position_limit_source = self._effective_position_limit(risk_state)
+        effective_daily_exposure_limit, daily_exposure_limit_source = (
+            self._effective_daily_exposure_limit(risk_state)
+        )
+        limit_source = (
+            "absolute_config"
+            if "absolute_config" in {position_limit_source, daily_exposure_limit_source}
+            else "dynamic_deposit_ratio"
+            if "dynamic_deposit_ratio" in {position_limit_source, daily_exposure_limit_source}
+            else ""
+        )
+        limit_decision_kwargs = {
+            "effective_position_limit": effective_position_limit,
+            "effective_daily_exposure_limit": effective_daily_exposure_limit,
+            "limit_source": limit_source,
+        }
         if not request.is_cancel:
             if request.quantity <= 0:
                 return self._decision(
@@ -611,6 +669,7 @@ class OrderGuard:
                     risk_state=risk_state,
                     requested_amount=requested_amount,
                     blocked_by="request_validation",
+                    **limit_decision_kwargs,
                 )
             if basis_price <= 0 or requested_amount <= 0:
                 return self._decision(
@@ -621,6 +680,7 @@ class OrderGuard:
                     risk_state=risk_state,
                     requested_amount=requested_amount,
                     blocked_by="request_validation",
+                    **limit_decision_kwargs,
                 )
             if request.order_gubun != "03" and int(request.price or 0) <= 0:
                 return self._decision(
@@ -631,6 +691,7 @@ class OrderGuard:
                     risk_state=risk_state,
                     requested_amount=requested_amount,
                     blocked_by="price_validation",
+                    **limit_decision_kwargs,
                 )
             if int(request.current_price or 0) < 0 or int(request.price or 0) < 0:
                 return self._decision(
@@ -641,6 +702,7 @@ class OrderGuard:
                     risk_state=risk_state,
                     requested_amount=requested_amount,
                     blocked_by="price_validation",
+                    **limit_decision_kwargs,
                 )
             if request.code in risk_state.pending_orders:
                 return self._decision(
@@ -651,6 +713,7 @@ class OrderGuard:
                     risk_state=risk_state,
                     requested_amount=requested_amount,
                     blocked_by="duplicate_order",
+                    **limit_decision_kwargs,
                 )
         else:
             if (
@@ -745,6 +808,26 @@ class OrderGuard:
                         blocked_by="time_policy",
                         time_decision=time_decision,
                     )
+            if (
+                mode == "live"
+                and request.normalized_side == "buy"
+                and getattr(time_decision, "action", "") == "ALLOW_MIDDAY_ENTRY"
+                and (
+                    _context_value(request.context, "entry_type").upper() != "MIDDAY_VWAP_RECLAIM"
+                    or _context_value(request.context, "reason_code").upper() != "MIDDAY_VWAP_RECLAIM_LIVE"
+                )
+            ):
+                return self._decision(
+                    allowed=False,
+                    mode=mode,
+                    reason="midday_entry_strategy_not_allowed",
+                    request=request,
+                    risk_state=risk_state,
+                    requested_amount=requested_amount,
+                    blocked_by="time_policy",
+                    time_decision=time_decision,
+                    **limit_decision_kwargs,
+                )
 
         if request.normalized_side == "buy" and not request.is_cancel:
             if (
@@ -760,6 +843,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="exit_escalation",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if request.context.get("final_entry_allowed") is not True:
                 return self._decision(
@@ -771,6 +855,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="final_entry_decision",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if mode == "live" and is_analysis_only_candidate_context(request.context):
                 return self._decision(
@@ -782,6 +867,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by=LIVE_ANALYSIS_ONLY_BLOCKED_BY,
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if mode == "live" and is_live_breakout_probe_context(request.context):
                 return self._decision(
@@ -793,6 +879,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by=LIVE_BREAKOUT_BLOCKED_BY,
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if request.code in risk_state.open_positions:
                 return self._decision(
@@ -804,10 +891,11 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="duplicate_position",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if (
-                self.limits.max_position_size > 0
-                and requested_amount > self.limits.max_position_size
+                effective_position_limit > 0
+                and requested_amount > effective_position_limit
             ):
                 return self._decision(
                     allowed=False,
@@ -818,6 +906,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="position_limit",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if (
                 self.limits.max_daily_buy_count > 0
@@ -832,6 +921,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="daily_buy_limit",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if (
                 self.limits.max_daily_loss > 0
@@ -846,10 +936,11 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="daily_loss_limit",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             if (
-                self.limits.max_daily_exposure > 0
-                and risk_state.daily_exposure + requested_amount > self.limits.max_daily_exposure
+                effective_daily_exposure_limit > 0
+                and risk_state.daily_exposure + requested_amount > effective_daily_exposure_limit
             ):
                 return self._decision(
                     allowed=False,
@@ -860,6 +951,7 @@ class OrderGuard:
                     requested_amount=requested_amount,
                     blocked_by="daily_exposure_limit",
                     time_decision=time_decision,
+                    **limit_decision_kwargs,
                 )
             last_exit = float(risk_state.last_exit_at.get(request.code, 0.0) or 0.0)
             if self.limits.reentry_cooldown_seconds > 0 and last_exit > 0:
@@ -875,6 +967,7 @@ class OrderGuard:
                         blocked_by="reentry_cooldown",
                         is_reentry_blocked=True,
                         time_decision=time_decision,
+                        **limit_decision_kwargs,
                     )
 
         if request.normalized_side == "sell" and not request.is_cancel:
@@ -914,6 +1007,7 @@ class OrderGuard:
                 risk_state=risk_state,
                 requested_amount=requested_amount,
                 time_decision=time_decision,
+                **limit_decision_kwargs,
             )
 
         delay = self._throttle_seconds(time.time() if now is None else float(now))
@@ -926,4 +1020,5 @@ class OrderGuard:
             requested_amount=requested_amount,
             throttle_seconds=delay,
             time_decision=time_decision,
+            **limit_decision_kwargs,
         )

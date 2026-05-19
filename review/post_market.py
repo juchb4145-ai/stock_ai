@@ -9,6 +9,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sector_theme_maps import validate_sector_map, validate_theme_map
+
 from .structured_log import iter_structured_events
 
 
@@ -17,6 +19,8 @@ TRADE_LOG_DEFAULT = Path("data") / "trade_log.csv"
 MAIN_LOG_DEFAULT = Path("data") / "main.log"
 INTRADAY_DIR_DEFAULT = Path("data") / "intraday"
 POST_MARKET_OUTPUT_DEFAULT = Path("reports") / "post_market"
+SECTOR_MAP_DEFAULT = Path("data") / "sector_map.csv"
+THEME_MAP_DEFAULT = Path("data") / "theme_map.csv"
 
 MODE_PAPER = "paper"
 MODE_LIVE = "live"
@@ -127,6 +131,58 @@ NEW_CONDITION_FIELDS = [
     "analysis_allowed",
 ]
 
+MARKET_CONTEXT_REVIEW_FIELDS = [
+    "symbol_market",
+    "primary_index_code",
+    "primary_market_regime",
+    "primary_market_pct",
+    "primary_market_slope_1m",
+    "primary_market_slope_3m",
+    "primary_market_drawdown_from_high",
+    "kospi_regime",
+    "kospi_pct",
+    "kospi_slope_1m",
+    "kospi_slope_3m",
+    "kospi_drawdown_from_high",
+    "kosdaq_regime",
+    "kosdaq_pct",
+    "kosdaq_slope_1m",
+    "kosdaq_slope_3m",
+    "kosdaq_drawdown_from_high",
+]
+
+SECTOR_CONTEXT_REVIEW_FIELDS = [
+    "sector_code",
+    "sector_name",
+    "sector_index_code",
+    "sector_pct",
+    "sector_slope_1m",
+    "sector_slope_3m",
+    "sector_drawdown_from_high",
+    "sector_relative_strength_vs_primary",
+    "sector_ranked_count",
+]
+
+THEME_CONTEXT_REVIEW_FIELDS = [
+    "primary_theme",
+    "theme_names",
+    "theme_member_count",
+    "theme_active_count",
+    "theme_rising_count",
+    "theme_falling_count",
+    "theme_avg_return",
+    "theme_top_return",
+    "theme_top_turnover",
+    "theme_leader_code",
+    "theme_leader_return",
+]
+
+REVIEW_CONTEXT_FIELDS = (
+    MARKET_CONTEXT_REVIEW_FIELDS
+    + SECTOR_CONTEXT_REVIEW_FIELDS
+    + THEME_CONTEXT_REVIEW_FIELDS
+)
+
 REVIEW_COLUMNS = [
     "mode",
     "symbol",
@@ -137,10 +193,15 @@ REVIEW_COLUMNS = [
     "candidate_role",
     "source_event",
     "candidate_lifecycle",
+    "recovery_watch_count",
+    "recovery_watch_reasons",
+    "recovery_watch_delay_seconds",
+    "recovery_watch_last_at",
     "join_quality",
     "detected_at",
     "capture_price",
     "current_price",
+    *REVIEW_CONTEXT_FIELDS,
     "traded",
     "final_decision",
     "final_reason",
@@ -233,6 +294,7 @@ class ReviewCandidate:
     source_event: str = ""
     candidate_role: str = ""
     source_time_policy_reason: str = ""
+    context_fields: Dict[str, object] = field(default_factory=dict)
     join_methods: List[str] = field(default_factory=list)
     lifecycle_events: List[str] = field(default_factory=list)
     detected_at: Optional[datetime] = None
@@ -308,10 +370,15 @@ class ReviewRow:
     candidate_role: str
     source_event: str
     candidate_lifecycle: str
+    recovery_watch_count: int
+    recovery_watch_reasons: str
+    recovery_watch_delay_seconds: Optional[float]
+    recovery_watch_last_at: Optional[datetime]
     join_quality: str
     detected_at: Optional[datetime]
     capture_price: Optional[float]
     current_price: Optional[float]
+    context_fields: Dict[str, object]
     traded: bool
     final_decision: Optional[str]
     final_reason: str
@@ -381,7 +448,7 @@ class ReviewRow:
     review_category: str
 
     def as_dict(self) -> Dict[str, object]:
-        return {
+        out = {
             "mode": self.mode,
             "symbol": self.symbol,
             "symbol_name": self.symbol_name,
@@ -391,6 +458,10 @@ class ReviewRow:
             "candidate_role": self.candidate_role,
             "source_event": self.source_event,
             "candidate_lifecycle": self.candidate_lifecycle,
+            "recovery_watch_count": self.recovery_watch_count,
+            "recovery_watch_reasons": self.recovery_watch_reasons,
+            "recovery_watch_delay_seconds": self.recovery_watch_delay_seconds,
+            "recovery_watch_last_at": _format_dt(self.recovery_watch_last_at),
             "join_quality": self.join_quality,
             "detected_at": _format_dt(self.detected_at),
             "capture_price": self.capture_price,
@@ -463,6 +534,9 @@ class ReviewRow:
             "missed_opportunity": self.missed_opportunity,
             "review_category": self.review_category,
         }
+        for field_name in REVIEW_CONTEXT_FIELDS:
+            out[field_name] = self.context_fields.get(field_name, "")
+        return out
 
 
 @dataclass
@@ -478,6 +552,45 @@ class ReviewResult:
     date: str
     rows: List[ReviewRow]
     paths: Optional[ReviewPaths] = None
+    data_source_status: Dict[str, Dict[str, object]] = field(default_factory=dict)
+
+
+def collect_data_source_status(
+    *,
+    sector_map_path: str | Path = SECTOR_MAP_DEFAULT,
+    theme_map_path: str | Path = THEME_MAP_DEFAULT,
+) -> Dict[str, Dict[str, object]]:
+    statuses: Dict[str, Dict[str, object]] = {}
+    validators = (
+        ("sector_map", sector_map_path, validate_sector_map),
+        ("theme_map", theme_map_path, validate_theme_map),
+    )
+    for source_name, path, validator in validators:
+        try:
+            report = validator(str(path))
+            statuses[source_name] = {
+                "status": report.status(),
+                "path": report.path,
+                "exists": report.exists,
+                "data_rows": report.data_rows,
+                "valid_rows": report.valid_rows,
+                "invalid_rows": report.invalid_rows,
+                "missing_columns": list(report.missing_columns),
+                "ok": report.ok,
+            }
+        except Exception as exc:
+            statuses[source_name] = {
+                "status": "error",
+                "path": str(path),
+                "exists": Path(path).exists(),
+                "data_rows": 0,
+                "valid_rows": 0,
+                "invalid_rows": 0,
+                "missing_columns": [],
+                "ok": False,
+                "error": str(exc),
+            }
+    return statuses
 
 
 def _normalize_symbol(value: object) -> str:
@@ -622,6 +735,28 @@ def read_condition_rows(path: str | Path = CONDITION_CAPTURE_DEFAULT) -> List[Di
     return rows
 
 
+def _context_fields_from_mapping(mapping: Dict[str, object]) -> Dict[str, object]:
+    fields: Dict[str, object] = {}
+    for key in REVIEW_CONTEXT_FIELDS:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            fields[key] = value
+    return fields
+
+
+def _merge_context_fields(*sources: Dict[str, object]) -> Dict[str, object]:
+    merged: Dict[str, object] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key, value in _context_fields_from_mapping(source).items():
+            merged[key] = value
+    return merged
+
+
 def load_condition_candidates(
     *,
     target_date: str,
@@ -665,6 +800,7 @@ def load_condition_candidates(
                 source_event=source_event,
                 candidate_role=candidate_role,
                 source_time_policy_reason=source_time_policy_reason,
+                context_fields=_context_fields_from_mapping(row),
                 detected_at=detected_at,
                 capture_price=_parse_float(row.get("capture_price")),
                 source_rows=[row],
@@ -699,6 +835,7 @@ def load_condition_candidates(
                 source_event=source_event,
                 candidate_role=candidate_role,
                 source_time_policy_reason=source_time_policy_reason,
+                context_fields=_context_fields_from_mapping(row),
                 detected_at=detected_at,
                 source_rows=[],
             )
@@ -720,6 +857,10 @@ def load_condition_candidates(
             target.candidate_role = candidate_role
         if not target.source_time_policy_reason:
             target.source_time_policy_reason = source_time_policy_reason
+        target.context_fields = _merge_context_fields(
+            target.context_fields,
+            _context_fields_from_mapping(row),
+        )
         if target.capture_price is None and capture_price and capture_price > 0:
             target.capture_price = capture_price
         if target.candidate_id is None:
@@ -775,6 +916,7 @@ def attach_structured_logs(
         "candidate_expired",
         "candidate_lifecycle_summary",
         "candidate_recreated_after_ttl",
+        "recovery_watch_queued",
         "time_policy_decision",
     }
     by_candidate_id: Dict[str, List[ReviewCandidate]] = defaultdict(list)
@@ -833,6 +975,58 @@ def attach_structured_logs(
             _attach_structured_payload(target, payload, event.label, join_method)
 
 
+def attach_trade_log_events(
+    candidates: Sequence[ReviewCandidate],
+    *,
+    target_date: str,
+    trade_log_path: str | Path = TRADE_LOG_DEFAULT,
+) -> None:
+    trade_path = Path(trade_log_path)
+    if not trade_path.exists():
+        return
+    with trade_path.open("r", newline="", encoding="utf-8-sig") as f:
+        rows = [
+            dict(row)
+            for row in csv.DictReader(f)
+            if str(row.get("logged_at", "")).startswith(target_date)
+            and str(row.get("event", "")) == "buy_skip"
+        ]
+    if not rows:
+        return
+    by_candidate_id: Dict[str, List[ReviewCandidate]] = defaultdict(list)
+    by_symbol: Dict[str, List[ReviewCandidate]] = defaultdict(list)
+    for candidate in candidates:
+        if candidate.candidate_id:
+            by_candidate_id[candidate.candidate_id].append(candidate)
+        by_symbol[candidate.symbol].append(candidate)
+    for values in by_symbol.values():
+        values.sort(key=lambda c: c.detected_at or datetime.min)
+
+    for row in rows:
+        symbol = _normalize_symbol(row.get("code") or row.get("symbol"))
+        if not symbol:
+            continue
+        payload: Dict[str, object] = dict(row)
+        payload["timestamp"] = row.get("logged_at", "")
+        payload["_event_label"] = "buy_skip"
+        payload["_log_path"] = str(trade_path)
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        targets: List[ReviewCandidate] = []
+        join_method = ""
+        if candidate_id:
+            targets = list(by_candidate_id.get(candidate_id, []))
+            if targets:
+                join_method = "exact_candidate_id"
+        if not targets:
+            event_dt = _parse_datetime(row.get("logged_at"), target_date=target_date)
+            target = _find_event_target(by_symbol.get(symbol, []), event_dt, None)
+            if target is not None:
+                targets = [target]
+                join_method = "fallback_symbol_time" if event_dt else "fallback_symbol_only"
+        for target in targets:
+            _attach_structured_payload(target, payload, "buy_skip", join_method)
+
+
 def _attach_structured_payload(
     target: ReviewCandidate,
     payload: Dict[str, object],
@@ -849,6 +1043,9 @@ def _attach_structured_payload(
         target.momentum_events.append(event_payload)
     elif label == "final_entry_decision":
         target.final_events.append(event_payload)
+    elif label == "recovery_watch_queued":
+        target.lifecycle_events.append("recovery_watch_queued")
+        target.candidate_events.append(event_payload)
     elif label.startswith("candidate_"):
         lifecycle_state = str(event_payload.get("lifecycle_state") or label).strip()
         target.lifecycle_events.append(lifecycle_state or label)
@@ -874,6 +1071,10 @@ def _hydrate_candidate_from_payload(
     candidate_role = str(payload.get("candidate_role") or "").strip()
     if candidate_role and not target.candidate_role:
         target.candidate_role = candidate_role
+    target.context_fields = _merge_context_fields(
+        target.context_fields,
+        _context_fields_from_mapping(payload),
+    )
     if not target.source_time_policy_reason:
         if label == "time_policy_decision":
             target.source_time_policy_reason = str(payload.get("reason_code") or "").strip()
@@ -1224,6 +1425,8 @@ def run_post_market_review(
     trade_log_path: str | Path = TRADE_LOG_DEFAULT,
     main_log_path: str | Path = MAIN_LOG_DEFAULT,
     intraday_dir: str | Path = INTRADAY_DIR_DEFAULT,
+    sector_map_path: str | Path = SECTOR_MAP_DEFAULT,
+    theme_map_path: str | Path = THEME_MAP_DEFAULT,
     min_missed_opportunity_pct: float = 0.05,
     timeframe: str = "1m",
     write_json: bool = False,
@@ -1232,6 +1435,7 @@ def run_post_market_review(
         raise ValueError("run_post_market_review expects paper or live mode")
     candidates = load_condition_candidates(target_date=target_date, path=condition_capture_path)
     attach_structured_logs(candidates, target_date=target_date, main_log=main_log_path)
+    attach_trade_log_events(candidates, target_date=target_date, trade_log_path=trade_log_path)
     trades = load_trades(target_date=target_date, mode=mode, path=trade_log_path)
     trades_by_candidate = match_trades_to_candidates(candidates, trades)
     bars_cache: Dict[str, List[IntradayBar]] = {}
@@ -1259,12 +1463,22 @@ def run_post_market_review(
                 min_missed_opportunity_pct=min_missed_opportunity_pct,
             )
         )
+    result = ReviewResult(
+        mode=mode,
+        date=target_date,
+        rows=rows,
+        data_source_status=collect_data_source_status(
+            sector_map_path=sector_map_path,
+            theme_map_path=theme_map_path,
+        ),
+    )
     paths = write_review_outputs(
-        ReviewResult(mode=mode, date=target_date, rows=rows),
+        result,
         output_dir=output_dir,
         write_json=write_json,
     )
-    return ReviewResult(mode=mode, date=target_date, rows=rows, paths=paths)
+    result.paths = paths
+    return result
 
 
 def match_trades_to_candidates(
@@ -1325,11 +1539,21 @@ def build_review_row(
     mode: str,
     min_missed_opportunity_pct: float,
 ) -> ReviewRow:
-    momentum = _latest_event(candidate.momentum_events)
-    final = _latest_event(candidate.final_events)
+    final = _representative_final_event(candidate.final_events)
+    momentum = _matching_momentum_event(candidate.momentum_events, final) if final else _latest_event(candidate.momentum_events)
     guard = _latest_event(candidate.guard_events)
     derived_metrics = _derived_metrics_from_flow(flow)
     metrics_source = momentum or derived_metrics
+    context_fields = _merge_context_fields(candidate.context_fields, momentum, final, guard)
+    recovery_events = _recovery_watch_events(candidate)
+    latest_recovery = recovery_events[-1] if recovery_events else {}
+    recovery_reasons = sorted(
+        {
+            str(event.get("reason_code") or "").strip()
+            for event in recovery_events
+            if str(event.get("reason_code") or "").strip()
+        }
+    )
     time_policy_event = _latest_time_policy_event(
         candidate,
         prefer_eval_filter=not bool(momentum),
@@ -1340,6 +1564,7 @@ def build_review_row(
     reason_code = _first_text(
         final.get("reason_code") if final else None,
         metrics_source.get("reason_code"),
+        guard.get("reason_code") if guard else None,
         guard.get("guard_reason") if guard else None,
     )
     allowed_time_policy_reasons = {
@@ -1386,10 +1611,13 @@ def build_review_row(
     )
     order_guard_reason = _first_text(
         guard.get("guard_reason") if guard else None,
+        guard.get("reason_code") if guard else None,
         guard.get("reason") if guard else None,
     )
     decision_trace = _build_decision_trace(candidate, momentum=momentum, final=final, guard=guard)
     data_quality = list(flow.data_quality)
+    if final and candidate.final_events and final is not _latest_event(candidate.final_events):
+        data_quality.append("FINAL_READY_SUPERSEDED_BY_LATER_EVENT")
     if candidate.capture_price is None or candidate.capture_price <= 0:
         data_quality.append("MISSING_CAPTURE_PRICE")
     if candidate.strategy_name_fallback_used:
@@ -1500,10 +1728,15 @@ def build_review_row(
         candidate_role=candidate.candidate_role,
         source_event=candidate.source_event,
         candidate_lifecycle=_candidate_lifecycle_text(candidate),
+        recovery_watch_count=len(recovery_events),
+        recovery_watch_reasons=";".join(recovery_reasons),
+        recovery_watch_delay_seconds=_as_float(latest_recovery.get("delay_seconds")) if latest_recovery else None,
+        recovery_watch_last_at=_event_timestamp(latest_recovery) if latest_recovery else None,
         join_quality=_join_quality_text(candidate),
         detected_at=candidate.detected_at,
         capture_price=candidate.capture_price,
         current_price=_as_float(metrics_source.get("current_price")),
+        context_fields=context_fields,
         traded=traded,
         final_decision=final_decision,
         final_reason=final_reason,
@@ -1562,7 +1795,11 @@ def build_review_row(
         one_min_reversal=_as_bool(metrics_source.get("one_min_reversal")),
         entry_type=str(metrics_source.get("entry_type") or ""),
         position_size_multiplier=_as_float(metrics_source.get("position_size_multiplier")),
-        market_regime=_first_text(final.get("market_regime") if final else None, momentum.get("market_regime") if momentum else None),
+        market_regime=_first_text(
+            final.get("market_regime") if final else None,
+            momentum.get("market_regime") if momentum else None,
+            context_fields.get("primary_market_regime"),
+        ),
         market_gate_action=_first_text(final.get("market_gate_action") if final else None, momentum.get("market_gate_action") if momentum else None),
         market_gate_reason=_first_text(final.get("market_gate_reason") if final else None, momentum.get("market_gate_reason") if momentum else None),
         sector_regime=_first_text(final.get("sector_regime") if final else None, momentum.get("sector_regime") if momentum else None),
@@ -1606,7 +1843,67 @@ def _derived_metrics_from_flow(flow: PriceFlow) -> Dict[str, object]:
 def _latest_event(events: Sequence[Dict[str, object]]) -> Dict[str, object]:
     if not events:
         return {}
-    return events[-1]
+    return _sort_events_by_timestamp(events)[-1]
+
+
+def _event_timestamp(event: Dict[str, object]) -> Optional[datetime]:
+    return _parse_datetime(
+        event.get("timestamp")
+        or event.get("current_time")
+        or event.get("logged_at")
+        or event.get("detected_at")
+    )
+
+
+def _sort_events_by_timestamp(events: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    return sorted(
+        events,
+        key=lambda event: (_event_timestamp(event) or datetime.min, str(event.get("_log_path") or "")),
+    )
+
+
+def _is_allowed_final_event(event: Dict[str, object]) -> bool:
+    status = str(event.get("status") or "").strip().lower()
+    reason_code = str(event.get("reason_code") or "").strip().upper()
+    return event.get("allowed") is True or status == "ready" or reason_code == "FINAL_BUY_READY"
+
+
+def _representative_final_event(events: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    if not events:
+        return {}
+    ordered = _sort_events_by_timestamp(events)
+    allowed = [event for event in ordered if _is_allowed_final_event(event)]
+    if allowed:
+        return allowed[-1]
+    return ordered[-1]
+
+
+def _matching_momentum_event(
+    events: Sequence[Dict[str, object]],
+    final: Dict[str, object],
+) -> Dict[str, object]:
+    if not events:
+        return {}
+    if not final:
+        return _latest_event(events)
+    ordered = _sort_events_by_timestamp(events)
+    final_ts = _event_timestamp(final)
+    if final_ts is None:
+        return ordered[-1]
+    exact = [event for event in ordered if _event_timestamp(event) == final_ts]
+    if exact:
+        return exact[-1]
+    before = [
+        event
+        for event in ordered
+        if (_event_timestamp(event) or datetime.min) <= final_ts
+    ]
+    if before:
+        return before[-1]
+    return min(
+        ordered,
+        key=lambda event: abs(((_event_timestamp(event) or final_ts) - final_ts).total_seconds()),
+    )
 
 
 def _latest_time_policy_event(
@@ -1664,6 +1961,7 @@ def _build_decision_trace(
             "theme_gate_action",
             "theme_gate_reason",
             "turnover_rank_sector",
+            *REVIEW_CONTEXT_FIELDS,
         ):
             if key in final:
                 trace.setdefault(key, final.get(key))
@@ -1685,6 +1983,7 @@ def _build_decision_trace(
             "theme_gate_action",
             "theme_gate_reason",
             "turnover_rank_sector",
+            *REVIEW_CONTEXT_FIELDS,
         ):
             if key in momentum:
                 trace.setdefault(key, momentum.get(key))
@@ -1721,6 +2020,16 @@ def _candidate_lifecycle_text(candidate: ReviewCandidate) -> str:
     return MISSING_TEXT
 
 
+def _recovery_watch_events(candidate: ReviewCandidate) -> List[Dict[str, object]]:
+    return _sort_events_by_timestamp(
+        [
+            event
+            for event in candidate.candidate_events
+            if str(event.get("_event_label") or event.get("event") or "") == "recovery_watch_queued"
+        ]
+    )
+
+
 def _first_text(*values: object) -> str:
     for value in values:
         if value is None:
@@ -1729,6 +2038,29 @@ def _first_text(*values: object) -> str:
         if text:
             return text
     return ""
+
+
+def _row_field_value(row: ReviewRow, field: str) -> object:
+    if hasattr(row, field):
+        return getattr(row, field)
+    return row.context_fields.get(field, "")
+
+
+def _row_candidate_key(row: ReviewRow) -> str:
+    return row.candidate_id or "{}:{}".format(row.symbol, _format_dt(row.detected_at) or "")
+
+
+def _is_buy_allowed_row(row: ReviewRow) -> bool:
+    if row.traded:
+        return True
+    decision = str(row.final_decision or "").strip().upper()
+    reason_code = str(row.reason_code or "").strip().upper()
+    if decision in {"BUY", "READY"} or reason_code == "FINAL_BUY_READY":
+        return True
+    trace = row.decision_trace if isinstance(row.decision_trace, dict) else {}
+    trace_reason = str(trace.get("reason_code") or "").strip().upper()
+    trace_status = str(trace.get("status") or "").strip().upper()
+    return trace_reason == "FINAL_BUY_READY" or trace_status == "READY"
 
 
 def _as_float(value: object) -> Optional[float]:
@@ -1922,6 +2254,9 @@ def write_markdown_summary(result: ReviewResult, path: str | Path) -> None:
     lines.append(f"- mode: {result.mode}")
     lines.append(f"- generated_at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("")
+    lines.append("## Data Source Status")
+    lines.extend(_data_source_status_lines(result))
+    lines.append("")
     lines.append("## Daily Buy Gate Funnel")
     lines.extend(_daily_buy_gate_funnel_lines(rows))
     lines.append("")
@@ -1930,6 +2265,9 @@ def write_markdown_summary(result: ReviewResult, path: str | Path) -> None:
     lines.append("")
     lines.append("## Reason Counts by Unique Symbol")
     lines.extend(_reason_counts_unique_lines(non_traded))
+    lines.append("")
+    lines.append("## Recovery Watch")
+    lines.extend(_recovery_watch_lines(rows))
     lines.append("")
     lines.append("## Trade Results")
     lines.extend(_trade_table(traded))
@@ -1999,6 +2337,42 @@ def write_markdown_summary(result: ReviewResult, path: str | Path) -> None:
         f.write("\n".join(lines))
 
 
+def _data_source_status_lines(result: ReviewResult) -> List[str]:
+    statuses = result.data_source_status or {}
+    if not statuses:
+        return ["- data source validation was not collected."]
+    lines = [
+        "| source | status | path | data_rows | valid_rows | invalid_rows | missing_columns |",
+        "|---|---|---|---:|---:|---:|---|",
+    ]
+    has_unusable_map = False
+    for source_name, status in sorted(statuses.items()):
+        status_value = str(status.get("status") or "unknown")
+        ok = bool(status.get("ok"))
+        if source_name in {"sector_map", "theme_map"} and not ok:
+            has_unusable_map = True
+        missing_columns = status.get("missing_columns") or []
+        if isinstance(missing_columns, list):
+            missing_text = ",".join(str(item) for item in missing_columns if item) or "ok"
+        else:
+            missing_text = str(missing_columns or "ok")
+        lines.append(
+            "| {source} | {status} | {path} | {data_rows} | {valid_rows} | {invalid_rows} | {missing_columns} |".format(
+                source=source_name,
+                status=status_value,
+                path=_short(str(status.get("path") or "")),
+                data_rows=status.get("data_rows", 0),
+                valid_rows=status.get("valid_rows", 0),
+                invalid_rows=status.get("invalid_rows", 0),
+                missing_columns=missing_text,
+            )
+        )
+    if has_unusable_map:
+        lines.append("")
+        lines.append("- sector/theme maps are not fully usable; sector/theme gate fields may be unknown or fallback-only.")
+    return lines
+
+
 def _daily_buy_gate_funnel_lines(rows: Sequence[ReviewRow]) -> List[str]:
     unique_symbols = {row.symbol for row in rows if row.symbol}
     registered_ids = {
@@ -2014,11 +2388,7 @@ def _daily_buy_gate_funnel_lines(rows: Sequence[ReviewRow]) -> List[str]:
         or (isinstance(row.decision_trace, dict) and row.decision_trace.get("momentum_decision"))
     ]
     final_emitted = [row for row in rows if row.final_decision]
-    baseline_buy = [
-        row
-        for row in rows
-        if row.final_decision == "BUY" or bool(row.traded)
-    ]
+    baseline_buy = [row for row in rows if _is_buy_allowed_row(row)]
     relaxed_signal = _pullback_signal_rows(rows, 0.005)
     ordered = [row for row in rows if row.entry_time is not None or row.traded]
     metrics = [
@@ -2029,6 +2399,7 @@ def _daily_buy_gate_funnel_lines(rows: Sequence[ReviewRow]) -> List[str]:
         ("momentum_evaluated", len(momentum_evaluated)),
         ("final_decision_emitted", len(final_emitted)),
         ("baseline_buy_allowed", len(baseline_buy)),
+        ("baseline_buy_allowed_unique_candidates", len({_row_candidate_key(row) for row in baseline_buy})),
         ("relaxed_pullback_signal_rows", len(relaxed_signal)),
         ("order_attempted", len(ordered)),
         ("order_filled", len([row for row in ordered if row.traded])),
@@ -2042,18 +2413,21 @@ def _daily_buy_gate_funnel_lines(rows: Sequence[ReviewRow]) -> List[str]:
 
 def _market_sector_theme_gate_lines(rows: Sequence[ReviewRow]) -> List[str]:
     fields = [
+        *MARKET_CONTEXT_REVIEW_FIELDS,
         "market_regime",
         "market_gate_action",
         "market_gate_reason",
+        *SECTOR_CONTEXT_REVIEW_FIELDS,
         "sector_regime",
         "sector_gate_action",
         "sector_gate_reason",
+        *THEME_CONTEXT_REVIEW_FIELDS,
         "theme_regime",
         "theme_gate_action",
         "theme_gate_reason",
     ]
     has_gate_data = any(
-        str(getattr(row, field, "") or "").strip()
+        str(_row_field_value(row, field) or "").strip()
         for row in rows
         for field in fields
     )
@@ -2064,12 +2438,12 @@ def _market_sector_theme_gate_lines(rows: Sequence[ReviewRow]) -> List[str]:
     if not has_gate_data:
         lines.append("| gate_payload | missing | 0 | 0 | 0 | missing |")
         lines.append("")
-        lines.append("- no structured market/sector/theme gate fields found in matched 2026-05-15 logs.")
+        lines.append("- no structured market/sector/theme gate fields found in matched logs.")
         return lines
     for field in fields:
         grouped: Dict[str, List[ReviewRow]] = defaultdict(list)
         for row in rows:
-            value = str(getattr(row, field, "") or "").strip()
+            value = str(_row_field_value(row, field) or "").strip()
             if value:
                 grouped[value].append(row)
         for value, members in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
@@ -2104,6 +2478,68 @@ def _reason_counts_unique_lines(rows: Sequence[ReviewRow]) -> List[str]:
                 symbols=len({row.symbol for row in members}),
                 mfe=_fmt_pct(_mean([row.mfe_pct for row in members])),
                 missed=sum(1 for row in members if row.missed_opportunity),
+            )
+        )
+    return lines
+
+
+def _recovery_watch_lines(rows: Sequence[ReviewRow]) -> List[str]:
+    watched = [row for row in rows if int(row.recovery_watch_count or 0) > 0]
+    if not watched:
+        return ["- none"]
+    unique_candidates = {_row_candidate_key(row) for row in watched}
+    unique_symbols = {row.symbol for row in watched if row.symbol}
+    missed = [row for row in watched if row.missed_opportunity]
+    lines = [
+        f"- recovery_watch_rows: {len(watched)}",
+        f"- recovery_watch_unique_candidates: {len(unique_candidates)}",
+        f"- recovery_watch_unique_symbols: {len(unique_symbols)}",
+        f"- recovery_watch_missed_count: {len(missed)}",
+        f"- recovery_watch_avg_mfe_pct: {_fmt_pct(_mean([row.mfe_pct for row in watched]))}",
+        "",
+        "| reason | row_count | unique_symbol_count | missed_count | avg_mfe_pct |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    grouped: Dict[str, List[ReviewRow]] = defaultdict(list)
+    for row in watched:
+        reasons = [
+            reason
+            for reason in str(row.recovery_watch_reasons or row.reason_code or "").split(";")
+            if reason
+        ]
+        if not reasons:
+            reasons = [MISSING_TEXT]
+        for reason in reasons:
+            grouped[reason].append(row)
+    for reason, members in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+        lines.append(
+            "| {reason} | {rows} | {symbols} | {missed} | {mfe} |".format(
+                reason=_short(reason),
+                rows=len(members),
+                symbols=len({row.symbol for row in members if row.symbol}),
+                missed=sum(1 for row in members if row.missed_opportunity),
+                mfe=_fmt_pct(_mean([row.mfe_pct for row in members])),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "| symbol | name | detected_at | reason_code | recovery_reason | delay_sec | MFE | MAE | category |",
+            "|---|---|---|---|---|---:|---:|---:|---|",
+        ]
+    )
+    for row in sorted(watched, key=lambda item: _sort_metric(item.mfe_pct), reverse=True)[:20]:
+        lines.append(
+            "| {symbol} | {name} | {detected_at} | {reason} | {watch_reason} | {delay} | {mfe} | {mae} | {category} |".format(
+                symbol=row.symbol,
+                name=_short(row.symbol_name, 30),
+                detected_at=_format_dt(row.detected_at) or MISSING_TEXT,
+                reason=_short(row.reason_code),
+                watch_reason=_short(row.recovery_watch_reasons or MISSING_TEXT),
+                delay=_fmt_number(row.recovery_watch_delay_seconds),
+                mfe=_fmt_pct(row.mfe_pct),
+                mae=_fmt_pct(row.mae_pct),
+                category=row.review_category,
             )
         )
     return lines
@@ -2177,7 +2613,7 @@ def _data_quality_high_mfe_lines(rows: Sequence[ReviewRow]) -> List[str]:
 
 def _would_buy_comparison_lines(rows: Sequence[ReviewRow]) -> List[str]:
     policies = [
-        ("baseline", [row for row in rows if row.final_decision == "BUY" or row.traded]),
+        ("baseline", [row for row in rows if _is_buy_allowed_row(row)]),
         ("pullback_0p5_signal", _pullback_signal_rows(rows, 0.005)),
         ("pullback_0p8_signal", _pullback_signal_rows(rows, 0.008)),
         ("pullback_1p0_signal", _pullback_signal_rows(rows, 0.010)),
@@ -2242,7 +2678,7 @@ def _reconciliation_lines(rows: Sequence[ReviewRow]) -> List[str]:
     unique_symbols = len({row.symbol for row in rows if row.symbol})
     candidate_ids = len({row.candidate_id for row in rows if row.candidate_id})
     relaxed_05 = len(_pullback_signal_rows(rows, 0.005))
-    baseline = sum(1 for row in rows if row.final_decision == "BUY" or row.traded)
+    baseline = sum(1 for row in rows if _is_buy_allowed_row(row))
     return [
         f"- post_market raw detected rows: {raw_rows}",
         f"- post_market unique symbols: {unique_symbols}",

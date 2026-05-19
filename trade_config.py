@@ -99,6 +99,7 @@ class TradeConfig:
     late_a_grade_position_size_multiplier: float = 0.25
     cash_usage_ratio: float = 0.98
     max_position_cash_ratio: float = 0.10
+    max_daily_exposure_ratio: float = 0.30
     default_stop_loss_pct: float = 0.015
     default_take_profit_pct: float = 0.020
     replay_stop_loss_pct: Optional[float] = None
@@ -192,9 +193,9 @@ class TradeConfig:
     max_positions: int = 3
     max_daily_buy_count: int = 20
     max_daily_loss: int = 300_000
-    max_daily_exposure: int = 3_000_000
+    max_daily_exposure: int = 0
     min_order_cash: int = 50_000
-    max_position_size: int = 1_000_000
+    max_position_size: int = 0
     reentry_cooldown_seconds: int = 6 * 60 * 60
     order_request_interval_seconds: float = 0.25
     max_orders_per_second: int = 5
@@ -241,6 +242,8 @@ class TradeConfig:
     candidate_capture_end: str = "14:50:00"
     entry_windows: str = "09:03:00-10:30:00,13:00:00-14:20:00"
     midday_paper_window: str = "10:30:00-13:00:00"
+    midday_live_entry_enabled: bool = True
+    midday_live_entry_ratio: float = 0.25
     afternoon_entry_window: str = "13:00:00-14:20:00"
     closing_paper_window: str = "14:20:00-14:50:00"
     no_new_entry_after: str = "14:20:00"
@@ -366,6 +369,10 @@ class TradeConfig:
             max_position_cash_ratio=_env_float(
                 "KIWOOM_MAX_POSITION_CASH_RATIO",
                 cls.max_position_cash_ratio,
+            ),
+            max_daily_exposure_ratio=_env_float(
+                "KIWOOM_MAX_DAILY_EXPOSURE_RATIO",
+                cls.max_daily_exposure_ratio,
             ),
             default_stop_loss_pct=_env_float(
                 "KIWOOM_DEFAULT_STOP_LOSS_PCT",
@@ -918,6 +925,14 @@ class TradeConfig:
             midday_paper_window=_env_str(
                 "KIWOOM_MIDDAY_PAPER_WINDOW",
                 cls.midday_paper_window,
+            ),
+            midday_live_entry_enabled=_env_bool(
+                "KIWOOM_MIDDAY_LIVE_ENTRY_ENABLED",
+                cls.midday_live_entry_enabled,
+            ),
+            midday_live_entry_ratio=_env_float(
+                "KIWOOM_MIDDAY_LIVE_ENTRY_RATIO",
+                cls.midday_live_entry_ratio,
             ),
             afternoon_entry_window=_env_str(
                 "KIWOOM_AFTERNOON_ENTRY_WINDOW",

@@ -51,6 +51,7 @@ class _SellStub:
     normalize_code = main.Kiwoom.normalize_code
     parse_int = main.Kiwoom.parse_int
     _exit_log_fields = main.Kiwoom._exit_log_fields
+    _sell_intent_is_partial = main.Kiwoom._sell_intent_is_partial
     _mark_exit_escalation = main.Kiwoom._mark_exit_escalation
     queue_sell_intent = main.Kiwoom.queue_sell_intent
     process_pending_sell_intents = main.Kiwoom.process_pending_sell_intents
@@ -170,6 +171,99 @@ class SellExitPolicyTests(unittest.TestCase):
         self.assertEqual(intent["sell_retry_count"], 1)
         self.assertEqual(intent["sell_order_result"], "sell_order_failed")
         self.assertEqual(intent["exit_reason_code"], xs.REASON_HARD_STOP_FIXED_PCT)
+
+    def test_partial_take_does_not_mark_partial_taken_before_order_success(self):
+        stub = _SellStub(submit_result=-1)
+        position = stub.portfolio.get("005930")
+
+        stub.place_sell_order(
+            "005930",
+            0,
+            "03",
+            "partial take",
+            desired_quantity=4,
+            exit_meta={
+                "action": xs.ACTION_SELL_PARTIAL,
+                "exit_action": xs.ACTION_SELL_PARTIAL,
+                "qty_ratio": 0.5,
+                "mark_partial_taken": True,
+                "exit_type": xs.EXIT_TYPE_PARTIAL_PROFIT_TAKE,
+                "exit_reason_code": xs.REASON_TAKE_PROFIT_2R_PARTIAL,
+            },
+        )
+
+        self.assertFalse(position.partial_taken)
+        intent = stub.pending_sell_intents["005930"]
+        self.assertEqual(intent["desired_quantity"], 4)
+        self.assertEqual(intent["retry_preserved_quantity"], 4)
+
+    def test_partial_take_dry_run_success_marks_partial_taken(self):
+        stub = _SellStub(submit_result=0)
+        position = stub.portfolio.get("005930")
+
+        stub.place_sell_order(
+            "005930",
+            0,
+            "03",
+            "partial take",
+            desired_quantity=4,
+            exit_meta={
+                "action": xs.ACTION_SELL_PARTIAL,
+                "exit_action": xs.ACTION_SELL_PARTIAL,
+                "qty_ratio": 0.5,
+                "mark_partial_taken": True,
+                "exit_type": xs.EXIT_TYPE_PARTIAL_PROFIT_TAKE,
+                "exit_reason_code": xs.REASON_TAKE_PROFIT_2R_PARTIAL,
+            },
+        )
+
+        self.assertTrue(position.partial_taken)
+        self.assertEqual(stub.trade_logs[-1][1]["partial_taken_after"], True)
+
+    def test_partial_take_retry_preserves_desired_quantity(self):
+        stub = _SellStub(submit_result=-1)
+        stub.score_exit_timing = lambda code, current_price: {
+            "action": xs.ACTION_HOLD,
+            "qty_ratio": 0.0,
+            "reason": "hold",
+        }
+        stub.pending_sell_intents["005930"] = {
+            "reason": "partial take",
+            "order_price": 0,
+            "order_gubun": "03",
+            "queued_at": time.time() - 10,
+            "last_try_at": 0,
+            "sell_retry_count": 0,
+            "desired_quantity": 4,
+            "exit_action": xs.ACTION_SELL_PARTIAL,
+            "mark_partial_taken": True,
+            "exit_type": xs.EXIT_TYPE_PARTIAL_PROFIT_TAKE,
+            "exit_reason_code": xs.REASON_TAKE_PROFIT_2R_PARTIAL,
+        }
+
+        stub.process_pending_sell_intents()
+
+        self.assertEqual(stub.submitted_requests[-1].quantity, 4)
+        self.assertEqual(stub.pending_sell_intents["005930"]["desired_quantity"], 4)
+
+    def test_full_exit_overrides_pending_partial_take_intent(self):
+        stub = _SellStub(submit_result=0)
+        stub.pending_sell_intents["005930"] = {
+            "reason": "partial take",
+            "order_price": 0,
+            "order_gubun": "03",
+            "queued_at": time.time() - 10,
+            "last_try_at": 0,
+            "sell_retry_count": 0,
+            "desired_quantity": 4,
+            "exit_action": xs.ACTION_SELL_PARTIAL,
+            "mark_partial_taken": True,
+        }
+
+        stub.process_pending_sell_intents()
+
+        self.assertEqual(stub.submitted_requests[-1].quantity, 10)
+        self.assertNotIn("005930", stub.pending_sell_intents)
 
     def test_second_retry_escalates_and_blocks_new_buys(self):
         stub = _SellStub(submit_result=-1)

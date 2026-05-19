@@ -104,7 +104,7 @@ class OrderGuardTests(unittest.TestCase):
 
     def test_dry_run_routes_to_paper_without_live_order(self):
         config = TradeConfig(dry_run=True, paper_portfolio_enabled=True)
-        paper = PaperPortfolio(initial_cash=1_000_000)
+        paper = PaperPortfolio(initial_cash=2_000_000)
         guard = OrderGuard(config, paper)
 
         decision = guard.validate(_buy_request(), now=ALLOWED_TS)
@@ -186,7 +186,7 @@ class OrderGuardTests(unittest.TestCase):
 
     def test_dry_run_keeps_breakout_probe_for_analysis(self):
         config = TradeConfig(dry_run=True, paper_portfolio_enabled=True)
-        paper = PaperPortfolio(initial_cash=1_000_000)
+        paper = PaperPortfolio(initial_cash=2_000_000)
         guard = OrderGuard(config, paper)
         request = _buy_request()
         request.context.update(
@@ -205,7 +205,7 @@ class OrderGuardTests(unittest.TestCase):
 
     def test_paper_only_strategy_can_record_during_midday_time_block(self):
         config = TradeConfig(dry_run=True, paper_portfolio_enabled=True)
-        guard = OrderGuard(config, PaperPortfolio(initial_cash=1_000_000))
+        guard = OrderGuard(config, PaperPortfolio(initial_cash=2_000_000))
         request = _buy_request()
         request.context.update(
             {
@@ -221,6 +221,38 @@ class OrderGuardTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertFalse(decision.live)
         self.assertTrue(decision.paper)
+
+    def test_midday_vwap_reclaim_live_buy_passes_time_policy_and_risk_limits(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+        )
+        guard = OrderGuard(config)
+        request = _buy_request()
+        request.context.update(
+            {
+                "reason_code": "MIDDAY_VWAP_RECLAIM_LIVE",
+                "momentum_reason_code": "MIDDAY_VWAP_RECLAIM_LIVE",
+                "entry_type": "MIDDAY_VWAP_RECLAIM",
+                "decision_trace": {"paper_only_strategy": False},
+            }
+        )
+
+        decision = guard.validate(
+            request,
+            now=MIDDAY_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                account_cash=2_000_000,
+            ),
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertTrue(decision.live)
+        self.assertEqual(decision.effective_position_limit, 196_000)
 
     def test_live_blocks_paper_only_strategy_after_cutoff(self):
         config = TradeConfig(
@@ -331,6 +363,63 @@ class OrderGuardTests(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "max_position_size_exceeded")
+        self.assertEqual(decision.effective_position_limit, 50_000)
+        self.assertEqual(decision.limit_source, "absolute_config")
+
+    def test_dynamic_position_limit_allows_ten_percent_cash_order(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+            max_position_size=0,
+            max_daily_exposure=0,
+            max_position_cash_ratio=0.10,
+            cash_usage_ratio=0.98,
+            max_daily_exposure_ratio=0.30,
+        )
+        guard = OrderGuard(config)
+
+        decision = guard.validate(
+            _buy_request(quantity=440),
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                account_cash=45_000_000,
+            ),
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.effective_position_limit, 4_410_000)
+        self.assertEqual(decision.effective_daily_exposure_limit, 13_500_000)
+        self.assertEqual(decision.limit_source, "dynamic_deposit_ratio")
+
+    def test_absolute_position_limit_overrides_dynamic_position_limit(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+            max_position_size=1_000_000,
+            max_daily_exposure=0,
+        )
+        guard = OrderGuard(config)
+
+        decision = guard.validate(
+            _buy_request(quantity=440),
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                account_cash=45_000_000,
+            ),
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "max_position_size_exceeded")
+        self.assertEqual(decision.effective_position_limit, 1_000_000)
+        self.assertEqual(decision.limit_source, "absolute_config")
 
     def test_paper_blocks_reentry_during_cooldown(self):
         config = TradeConfig(
@@ -519,6 +608,47 @@ class OrderGuardTests(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "daily_exposure_limit")
+
+    def test_dynamic_daily_exposure_allows_three_ten_percent_orders_only(self):
+        config = TradeConfig(
+            dry_run=False,
+            live_trading_enabled=True,
+            paper_portfolio_enabled=False,
+            max_position_size=0,
+            max_daily_exposure=0,
+            max_position_cash_ratio=0.10,
+            cash_usage_ratio=0.98,
+            max_daily_exposure_ratio=0.30,
+        )
+        guard = OrderGuard(config)
+
+        third_order = guard.validate(
+            _buy_request(quantity=440),
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                daily_exposure=8_800_000,
+                account_cash=45_000_000,
+            ),
+        )
+        fourth_order = guard.validate(
+            _buy_request(quantity=440),
+            now=ALLOWED_TS,
+            risk_state=RiskState(
+                mode="live",
+                account_state_available=True,
+                daily_loss_available=True,
+                daily_exposure=13_200_000,
+                account_cash=45_000_000,
+            ),
+        )
+
+        self.assertTrue(third_order.allowed)
+        self.assertFalse(fourth_order.allowed)
+        self.assertEqual(fourth_order.reason, "daily_exposure_limit")
+        self.assertEqual(fourth_order.effective_daily_exposure_limit, 13_500_000)
 
     def test_time_policy_blocks_live_buy(self):
         config = TradeConfig(dry_run=False, live_trading_enabled=True)

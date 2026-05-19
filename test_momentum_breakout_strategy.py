@@ -130,7 +130,7 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
 
         self.assertEqual(decision.action, EntryDecision.BLOCK_CHASE)
 
-    def test_midday_vwap_reclaim_is_paper_only_buy(self):
+    def test_midday_vwap_reclaim_is_live_sized_buy(self):
         strategy = MomentumBreakoutStrategy(TradeConfig(candidate_expiry_seconds=10_000_000_000))
 
         decision = strategy.evaluate(
@@ -149,8 +149,36 @@ class MomentumBreakoutStrategyTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.action, EntryDecision.BUY)
-        self.assertEqual(decision.reason_code, "MIDDAY_VWAP_RECLAIM_PAPER_ONLY")
+        self.assertEqual(decision.reason_code, "MIDDAY_VWAP_RECLAIM_LIVE")
         self.assertEqual(decision.entry_type, "MIDDAY_VWAP_RECLAIM")
+        self.assertEqual(decision.position_size_multiplier, 0.25)
+        self.assertEqual(decision.metrics["orderable_live"], 1.0)
+
+    def test_midday_vwap_reclaim_can_fall_back_to_paper_only_when_disabled(self):
+        strategy = MomentumBreakoutStrategy(
+            TradeConfig(
+                candidate_expiry_seconds=10_000_000_000,
+                midday_live_entry_enabled=False,
+            )
+        )
+
+        decision = strategy.evaluate(
+            _ctx(
+                now_ts=_ts("10:45:00"),
+                current_price=10_200,
+                intraday_vwap=10_100,
+                high_since_capture=10_600,
+                turnover_speed_per_min=350_000_000,
+                volume_ratio=0.8,
+                volume_ratio_1m=1.0,
+                volume_ratio_5m=0.7,
+                short_ma=10_050,
+                chejan_strength=130.0,
+            )
+        )
+
+        self.assertEqual(decision.action, EntryDecision.BUY)
+        self.assertEqual(decision.reason_code, "MIDDAY_VWAP_RECLAIM_PAPER_ONLY")
         self.assertEqual(decision.metrics["orderable_live"], 0.0)
 
     def test_afternoon_second_wave_is_evaluated_as_paper_strategy(self):

@@ -205,6 +205,23 @@ class StructuredExitTests(unittest.TestCase):
         self.assertTrue(d.mark_partial_taken)
         self.assertEqual(d.exit_reason_code, xs.REASON_TAKE_PROFIT_2R_PARTIAL)
 
+    def test_fixed_two_percent_profit_triggers_first_partial_take(self):
+        pos = base_position(entry_price=10_000, partial_taken=False)
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_200))
+
+        self.assertEqual(d.action, xs.ACTION_SELL_PARTIAL)
+        self.assertAlmostEqual(d.qty_ratio, 0.5)
+        self.assertTrue(d.mark_partial_taken)
+
+    def test_fixed_two_percent_after_partial_taken_sells_all(self):
+        pos = base_position(entry_price=10_000, partial_taken=True)
+
+        d = xs.evaluate_exit(ctx(position=pos, current_price=10_200))
+
+        self.assertEqual(d.action, xs.ACTION_SELL_ALL)
+        self.assertEqual(d.exit_reason_code, xs.REASON_TAKE_PROFIT_FIXED_PCT)
+
     def test_trailing_high_pullback(self):
         pos = base_position(entry_price=10_000, partial_taken=True)
         pos.highest_price = 10_405
