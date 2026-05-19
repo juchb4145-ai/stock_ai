@@ -9,7 +9,12 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sector_theme_maps import validate_sector_map, validate_theme_map
+from sector_theme_maps import (
+    load_sector_rows,
+    load_theme_rows,
+    validate_sector_map,
+    validate_theme_map,
+)
 
 from .structured_log import iter_structured_events
 
@@ -555,6 +560,13 @@ class ReviewResult:
     data_source_status: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
+@dataclass
+class StaticReviewContext:
+    sector_by_symbol: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    themes_by_symbol: Dict[str, List[Dict[str, str]]] = field(default_factory=dict)
+    theme_member_counts: Dict[str, int] = field(default_factory=dict)
+
+
 def collect_data_source_status(
     *,
     sector_map_path: str | Path = SECTOR_MAP_DEFAULT,
@@ -591,6 +603,91 @@ def collect_data_source_status(
                 "error": str(exc),
             }
     return statuses
+
+
+def load_static_review_context(
+    sector_map_path: str | Path = SECTOR_MAP_DEFAULT,
+    theme_map_path: str | Path = THEME_MAP_DEFAULT,
+) -> StaticReviewContext:
+    """Load static sector/theme identity maps for post-market row enrichment.
+
+    This deliberately enriches identity fields only. Regime/action/reason fields
+    come from live structured logs and are not recomputed here.
+    """
+    context = StaticReviewContext()
+    if validate_sector_map(str(sector_map_path)).ok:
+        try:
+            for row in load_sector_rows(str(sector_map_path)):
+                symbol = _normalize_symbol(row.get("code"))
+                if not symbol:
+                    continue
+                context.sector_by_symbol[symbol] = {
+                    "sector_code": str(row.get("sector_code") or "").strip(),
+                    "sector_name": _clean_static_label(row.get("sector_name")),
+                    "sector_index_code": str(row.get("sector_index_code") or "").strip(),
+                }
+        except Exception:
+            context.sector_by_symbol.clear()
+    if validate_theme_map(str(theme_map_path)).ok:
+        try:
+            for row in load_theme_rows(str(theme_map_path)):
+                symbol = _normalize_symbol(row.get("code"))
+                theme_name = _clean_static_label(row.get("theme_name"))
+                if not symbol or not theme_name:
+                    continue
+                item = {
+                    "theme_name": theme_name,
+                    "code": symbol,
+                    "role": str(row.get("role") or "member").strip() or "member",
+                }
+                context.themes_by_symbol.setdefault(symbol, []).append(item)
+                context.theme_member_counts[theme_name] = context.theme_member_counts.get(theme_name, 0) + 1
+        except Exception:
+            context.themes_by_symbol.clear()
+            context.theme_member_counts.clear()
+    return context
+
+
+def static_context_for_symbol(symbol: str, static_context: StaticReviewContext) -> Dict[str, object]:
+    normalized = _normalize_symbol(symbol)
+    out: Dict[str, object] = {}
+    sector = static_context.sector_by_symbol.get(normalized)
+    if sector:
+        out.update({key: value for key, value in sector.items() if str(value or "").strip()})
+    themes = static_context.themes_by_symbol.get(normalized, [])
+    if themes:
+        theme_names = [theme["theme_name"] for theme in themes if theme.get("theme_name")]
+        primary = next((theme for theme in themes if str(theme.get("role") or "").lower() == "leader"), themes[0])
+        primary_theme = str(primary.get("theme_name") or "").strip()
+        if theme_names:
+            out["theme_names"] = ";".join(theme_names)
+        if primary_theme:
+            out["primary_theme"] = primary_theme
+            out["theme_member_count"] = static_context.theme_member_counts.get(primary_theme, len(themes))
+    return out
+
+
+def merge_missing_context_fields(existing: Dict[str, object], static_fields: Dict[str, object]) -> Dict[str, object]:
+    merged = dict(existing or {})
+    for key, value in (static_fields or {}).items():
+        if _is_missing_context_value(key, merged.get(key)):
+            merged[key] = value
+    return merged
+
+
+def _clean_static_label(value: object) -> str:
+    return str(value or "").strip().rstrip("|").strip()
+
+
+def _is_missing_context_value(key: str, value: object) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    if key == "theme_member_count" and text in {"0", "0.0"}:
+        return True
+    return False
 
 
 def _normalize_symbol(value: object) -> str:
@@ -1436,6 +1533,15 @@ def run_post_market_review(
     candidates = load_condition_candidates(target_date=target_date, path=condition_capture_path)
     attach_structured_logs(candidates, target_date=target_date, main_log=main_log_path)
     attach_trade_log_events(candidates, target_date=target_date, trade_log_path=trade_log_path)
+    static_context = load_static_review_context(
+        sector_map_path=sector_map_path,
+        theme_map_path=theme_map_path,
+    )
+    for candidate in candidates:
+        candidate.context_fields = merge_missing_context_fields(
+            candidate.context_fields,
+            static_context_for_symbol(candidate.symbol, static_context),
+        )
     trades = load_trades(target_date=target_date, mode=mode, path=trade_log_path)
     trades_by_candidate = match_trades_to_candidates(candidates, trades)
     bars_cache: Dict[str, List[IntradayBar]] = {}

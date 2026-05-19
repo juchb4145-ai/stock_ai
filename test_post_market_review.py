@@ -592,6 +592,187 @@ class PostMarketReviewTests(unittest.TestCase):
             self.assertIn("| sector_map | header_only |", md)
             self.assertIn("| theme_map | header_only |", md)
             self.assertIn("fallback-only", md)
+            self.assertTrue(all(not row.context_fields.get("sector_name") for row in result.rows))
+
+    def test_static_sector_theme_maps_enrich_review_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            condition_path = root / "condition_captures.csv"
+            _write_csv(
+                condition_path,
+                [
+                    "logged_at",
+                    "event",
+                    "detected_at",
+                    "code",
+                    "name",
+                    "condition_name",
+                    "strategy_name",
+                    "capture_price",
+                ],
+                [
+                    {
+                        "logged_at": f"{TARGET_DATE} 09:00:00",
+                        "event": "condition_detected",
+                        "detected_at": f"{TARGET_DATE} 09:00:00",
+                        "code": "005930",
+                        "name": "Samsung",
+                        "condition_name": "quant",
+                        "strategy_name": "static-map-test",
+                        "capture_price": "10000",
+                    }
+                ],
+            )
+            _write_bars(root, "005930", "09:00:00", [10000, 10100, 10200])
+            (root / "main.log").write_text("", encoding="utf-8")
+            _write_csv(root / "trade_log.csv", ["logged_at", "event", "code"], [])
+            sector_map = root / "sector_map.csv"
+            theme_map = root / "theme_map.csv"
+            _write_csv(
+                sector_map,
+                ["code", "name", "market", "sector_code", "sector_name", "sector_index_code"],
+                [
+                    {
+                        "code": "005930",
+                        "name": "Samsung",
+                        "market": "KOSPI",
+                        "sector_code": "101",
+                        "sector_name": "반도체| ",
+                        "sector_index_code": "IDX101",
+                    }
+                ],
+            )
+            _write_csv(
+                theme_map,
+                ["theme_name", "code", "role"],
+                [
+                    {"theme_name": "AI", "code": "005930", "role": "member"},
+                    {"theme_name": "반도체", "code": "005930", "role": "leader"},
+                    {"theme_name": "반도체", "code": "000660", "role": "member"},
+                ],
+            )
+
+            result = run_post_market_review(
+                target_date=TARGET_DATE,
+                mode="paper",
+                output_dir=root / "reports",
+                condition_capture_path=condition_path,
+                trade_log_path=root / "trade_log.csv",
+                main_log_path=root / "main.log",
+                intraday_dir=root / "intraday",
+                sector_map_path=sector_map,
+                theme_map_path=theme_map,
+                write_json=True,
+            )
+
+            row = result.rows[0]
+            self.assertEqual(row.context_fields["sector_code"], "101")
+            self.assertEqual(row.context_fields["sector_name"], "반도체")
+            self.assertEqual(row.context_fields["sector_index_code"], "IDX101")
+            self.assertEqual(row.context_fields["theme_names"], "AI;반도체")
+            self.assertEqual(row.context_fields["primary_theme"], "반도체")
+            self.assertEqual(row.context_fields["theme_member_count"], 2)
+            payload = json.loads(result.paths.json.read_text(encoding="utf-8"))
+            self.assertEqual(payload[0]["sector_name"], "반도체")
+            self.assertEqual(payload[0]["primary_theme"], "반도체")
+            self.assertEqual(payload[0]["theme_member_count"], 2)
+
+    def test_static_maps_do_not_overwrite_logged_context_or_gate_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            condition_path = root / "condition_captures.csv"
+            _write_csv(
+                condition_path,
+                [
+                    "logged_at",
+                    "event",
+                    "detected_at",
+                    "code",
+                    "name",
+                    "condition_name",
+                    "strategy_name",
+                    "capture_price",
+                ],
+                [
+                    {
+                        "logged_at": f"{TARGET_DATE} 09:00:00",
+                        "event": "condition_detected",
+                        "detected_at": f"{TARGET_DATE} 09:00:00",
+                        "code": "000660",
+                        "name": "SK Hynix",
+                        "condition_name": "quant",
+                        "strategy_name": "static-map-test",
+                        "capture_price": "10000",
+                    }
+                ],
+            )
+            _write_bars(root, "000660", "09:00:00", [10000, 10100, 10200])
+            (root / "main.log").write_text(
+                _log_line(
+                    "momentum_entry_decision",
+                    {
+                        "event": "momentum_entry_decision",
+                        "timestamp": f"{TARGET_DATE} 09:00:10",
+                        "symbol": "000660",
+                        "decision": "REJECT",
+                        "reason_code": "weak_volume_ratio",
+                        "sector_name": "Logged Sector",
+                        "sector_code": "LOG",
+                        "sector_regime": "risk_off",
+                        "sector_gate_reason": "KEEP_SECTOR_GATE",
+                        "theme_names": "LoggedTheme",
+                        "primary_theme": "LoggedPrimary",
+                        "theme_member_count": 7,
+                        "theme_regime": "neutral",
+                        "theme_gate_reason": "KEEP_THEME_GATE",
+                    },
+                ),
+                encoding="utf-8",
+            )
+            _write_csv(root / "trade_log.csv", ["logged_at", "event", "code"], [])
+            sector_map = root / "sector_map.csv"
+            theme_map = root / "theme_map.csv"
+            _write_csv(
+                sector_map,
+                ["code", "name", "market", "sector_code", "sector_name", "sector_index_code"],
+                [
+                    {
+                        "code": "000660",
+                        "name": "SK Hynix",
+                        "market": "KOSPI",
+                        "sector_code": "101",
+                        "sector_name": "반도체",
+                        "sector_index_code": "IDX101",
+                    }
+                ],
+            )
+            _write_csv(
+                theme_map,
+                ["theme_name", "code", "role"],
+                [{"theme_name": "반도체", "code": "000660", "role": "leader"}],
+            )
+
+            result = run_post_market_review(
+                target_date=TARGET_DATE,
+                mode="paper",
+                output_dir=root / "reports",
+                condition_capture_path=condition_path,
+                trade_log_path=root / "trade_log.csv",
+                main_log_path=root / "main.log",
+                intraday_dir=root / "intraday",
+                sector_map_path=sector_map,
+                theme_map_path=theme_map,
+                write_json=True,
+            )
+
+            row = result.rows[0]
+            self.assertEqual(row.context_fields["sector_name"], "Logged Sector")
+            self.assertEqual(row.context_fields["sector_code"], "LOG")
+            self.assertEqual(row.context_fields["theme_names"], "LoggedTheme")
+            self.assertEqual(row.context_fields["primary_theme"], "LoggedPrimary")
+            self.assertEqual(row.context_fields["theme_member_count"], 7)
+            self.assertEqual(row.sector_gate_reason, "KEEP_SECTOR_GATE")
+            self.assertEqual(row.theme_gate_reason, "KEEP_THEME_GATE")
 
     def test_post_market_readme_and_docs_index_links_exist(self):
         readme = Path("reports") / "post_market" / "README.md"
